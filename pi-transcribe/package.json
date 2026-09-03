@@ -1,0 +1,20 @@
+{
+  "name": "pi-transcribe",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "One-command audio/video transcription via the wormsoft API (pi /transcribe command).",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx tests/test.mts",
+    "test:watch": "tsx watch tests/test.mts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3"
+  },
+  "pi": {
+    "extension": "./src/index.ts"
+  }
+}

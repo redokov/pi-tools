@@ -1,0 +1,136 @@
+# Состояние (state)
+
+Файл: **`~/.pi/agent/pi-billing-window.json`** (создаётся при первом `session_start`).
+Lockfile: **`~/.pi/agent/pi-billing-window.lock`**.
+
+## 1. Схема
+
+```ts
+type State = {
+  provider: string;             // "wormsoft"
+  windowStartedAt: number;      // ms epoch — момент первого вызова в окне
+  windowMs: number;             // 7200000 (2 часа)
+  lastResetAt: number;          // ms epoch — последний реальный reset (>= windowStartedAt)
+  resetCount: number;           // >= 0
+  callsInWindow: number;        // >= 0
+  firstCallEmittedAt?: number;  // ms epoch первого вызова, сброшен при reset
+};
+```
+
+## 2. Жизненный цикл полей
+
+| Поле | Когда создаётся | Когда меняется | Когда обнуляется |
+|---|---|---|---|
+| `provider` | при создании initial state | никогда | никогда |
+| `windowStartedAt` | initial state = `Date.now()` | reset → `Date.now()`, `/settimer` → пересчёт | при reset |
+| `windowMs` | initial state = `2h` | только вручную в коде (или при миграции) | никогда |
+| `lastResetAt` | initial state = `0` | reset → `Date.now()`, `/settimer` → `Date.now()` | никогда (только растёт) |
+| `resetCount` | initial state = `0` | reset → `+1`, `/settimer` → `+1`, `/billing-reset` → `+1` | никогда (только растёт) |
+| `callsInWindow` | initial state = `0` | каждый успешный вызов к wormsoft → `+1` | reset → `0` |
+| `firstCallEmittedAt` | на первом вызове в окне = `Date.now()` | никогда | reset → `undefined` |
+
+## 3. Атомарность записи
+
+`writeStateSync(state)`:
+1. `fs.mkdirSync(dirname, { recursive: true })` — гарантирует каталог.
+2. `fs.writeFileSync(tmp = stateFile + ".tmp." + pid, ...)` — пишем во временный файл.
+3. `fs.renameSync(tmp, stateFile)` — атомарный rename.
+
+Это защищает от полупустого файла, если процесс упадёт между шагами 2 и 3.
+
+## 4. Синхронизация между процессами
+
+`withLock(fn)`:
+1. Создаёт lock-файл, если его нет (`fs.writeFileSync(lockFile, "{}")`).
+2. `lockfile.lock(lockFile, { retries: 8 })` — `proper-lockfile` сериализует доступ (по умолчанию ждёт до ~1 с, потом retry).
+3. Выполняет `fn()`.
+4. `lockfile.unlock(lockFile)` — в `finally`, с подавлением ошибки unlock.
+
+Внутри `mutateState(transform)`:
+1. Берёт лок.
+2. Читает текущий state через `readStateSync()`.
+3. Вызывает `transform(current)` → возвращает `{ next, result? }`.
+4. Если `next !== null` — пишет через `writeStateSync`.
+5. Возвращает `result`.
+
+## 5. Сценарии гонок
+
+### 5.1. Два процесса, окно истекло
+
+| Время | Процесс A | Процесс B |
+|---|---|---|
+| t0 | `checkAndReset` берёт лок, видит `elapsed >= windowMs`, пишет reset | ждёт лок |
+| t0+ε | эмитит `billing:window_reset`, отпускает лок | получает лок |
+| t0+ε+δ | — | видит свежий `lastResetAt`, `elapsed < DEDUP_WINDOW_MS` → тихо выходит |
+
+**Итог:** ровно один `emit`, корректный state.
+
+### 5.2. Один процесс перезапускается во время записи
+
+| Время | Процесс A |
+|---|---|
+| t0 | `writeFileSync(tmp, …)` |
+| t1 | SIGKILL — процесс умер до `renameSync` |
+| t2 | tmp-файл остаётся на диске |
+| t3 | Новый запуск. `readStateSync()` читает прежний `stateFile`, мутация идёт поверх. tmp-файл перезаписывается при следующей записи. |
+
+**Итог:** консистентное состояние, мусорный tmp-файл будет перезаписан в ближайшем цикле. Можно периодически чистить `*.tmp.*` при старте (не реализовано — крайне редкий кейс).
+
+### 5.3. Параллельный первый вызов после reset
+
+| Время | Процесс A | Процесс B |
+|---|---|---|
+| t0 | `after_provider_response` → mutateState, `firstCallEmittedAt === undefined` → ставит timestamp | ждёт лок |
+| t0+ε | отпускает лок | mutateState, видит `firstCallEmittedAt === <timestamp>` → не трогает поле |
+| t0+ε+δ | эмитит `llm:first_call` с timestamp A | (не эмитит — `firstCallJustEmitted === false`) |
+
+**Итог:** ровно один `emit` от первого процесса.
+
+### 5.4. `/settimer` одновременно с авто-reset
+
+| Время | Команда `/settimer 0` | Ticker |
+|---|---|---|
+| t0 | mutateState, `windowStartedAt = now` (откат через `now - (windowMs - 0)` даёт `windowStartedAt = now - windowMs`, то есть окно сразу «истекшее») | — |
+| t0+ε | checkAndReset → видит, что окно истекло, но `lastResetAt` уже свежий от mutateState → дедуп срабатывает, без emit | checkAndReset → видит тот же state → тоже дедуп |
+
+**Итог:** один emit, корректный state.
+
+## 6. Что читать при отладке
+
+```bash
+cat ~/.pi/agent/pi-billing-window.json
+```
+
+```json
+{
+  "provider": "wormsoft",
+  "windowStartedAt": 1725000000000,
+  "windowMs": 7200000,
+  "lastResetAt": 1724999000000,
+  "resetCount": 17,
+  "callsInWindow": 23,
+  "firstCallEmittedAt": 1725000000500
+}
+```
+
+Подсчитать «сколько осталось»:
+```js
+const s = JSON.parse(require("fs").readFileSync(process.env.USERPROFILE + "/.pi/agent/pi-billing-window.json", "utf8"));
+const remain = s.windowStartedAt + s.windowMs - Date.now();
+console.log(`${Math.ceil(remain/60000)} мин до reset, calls=${s.callsInWindow}`);
+```
+
+Подсчитать «сколько уже использовано» (если известен лимит):
+```js
+// лимит = 5M токенов / 2ч. callsInWindow — это только число вызовов, не токены.
+```
+
+## 7. Очистка
+
+Если хотите начать «с чистого листа»:
+```bash
+rm ~/.pi/agent/pi-billing-window.json
+rm ~/.pi/agent/pi-billing-window.lock
+```
+
+При следующем `session_start` расширение создаст новый initial state с `resetCount = 0`.

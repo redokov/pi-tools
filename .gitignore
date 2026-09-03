@@ -1,0 +1,76 @@
+# Monorepo root .gitignore for pi-tools
+
+# Dependencies
+node_modules/
+pi-billing-window/node_modules/
+pi-remote/node_modules/
+pi-transcribe/node_modules/
+
+# Build outputs
+dist/
+build/
+out/
+pi-billing-window/dist/
+pi-billing-window/build/
+pi-billing-window/out/
+pi-remote/dist/
+pi-remote/build/
+pi-remote/out/
+pi-transcribe/dist/
+pi-transcribe/build/
+pi-transcribe/out/
+
+# Logs
+*.log
+server.log
+pi-billing-window/*.log
+pi-remote/*.log
+pi-transcribe/*.log
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+pi-billing-window/.env
+pi-billing-window/.env.local
+pi-remote/.env
+pi-remote/.env.local
+pi-transcribe/.env
+pi-transcribe/.env.local
+
+# Temporary and backup files
+*.tmp.*
+*.bak.*
+*.swp
+*~
+pi-billing-window/*.tmp.*
+pi-billing-window/*.bak.*
+pi-remote/*.tmp.*
+pi-remote/*.bak.*
+pi-transcribe/*.tmp.*
+pi-transcribe/*.bak.*
+
+# macOS
+.DS_Store
+pi-billing-window/.DS_Store
+pi-remote/.DS_Store
+pi-transcribe/.DS_Store
+
+# IDE
+.vscode/
+.idea/
+pi-billing-window/.vscode/
+pi-billing-window/.idea/
+pi-remote/.vscode/
+pi-remote/.idea/
+pi-transcribe/.vscode/
+pi-transcribe/.idea/
+
+# Tokens and secrets
+NOTIFY_TOKEN.txt
+pi-billing-window/NOTIFY_TOKEN.txt
+pi-remote/NOTIFY_TOKEN.txt
+pi-transcribe/NOTIFY_TOKEN.txt
+*.pem
+*.key
+*.cert

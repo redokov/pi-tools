@@ -1,0 +1,13 @@
+{
+  "name": "pi-remote",
+  "version": "1.0.0",
+  "description": "Web-based remote terminal for pi sessions via Tailscale",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0",
+    "ws": "^8.18.0"
+  }
+}

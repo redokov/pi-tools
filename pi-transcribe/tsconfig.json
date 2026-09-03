@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "types": ["node"],
+    "paths": {
+      "@earendil-works/pi-coding-agent": ["../../Users/r.edokov/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent"]
+    }
+  },
+  "include": ["src/**/*.ts", "tests/**/*.mts"]
+}

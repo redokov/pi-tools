@@ -1,0 +1,27 @@
+{
+  "name": "pi-billing-window",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Tracks the 2-hour billing window for the wormsoft provider, emits events to other pi extensions.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx tests/test.mts",
+    "test:watch": "tsx watch tests/test.mts"
+  },
+  "dependencies": {
+    "proper-lockfile": "^4.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  },
+  "pi": {
+    "extension": "./src/index.ts"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
