@@ -46,7 +46,10 @@ import {
   runPrepare,
   runTranscribe,
 } from "../src/pipeline.js";
-import { askModelChoice } from "../src/prompt.js";
+import { askModelChoice, summaryFileInstruction, summaryPathFor, todayIso } from "../src/prompt.js";
+import { sanitizeName, isCorrupted, corruptedNames } from "../src/fix-names.js"
+const FFFD = "�";
+import { buildSummaryPrompt, type SummaryRequest } from "../src/summary.js";
 
 // --- minimal test harness ----------------------------------------------------
 
@@ -315,6 +318,74 @@ async function testPrompt(): Promise<void> {
   eq(await askModelChoice(undefined, "ru"), "gigaam", "no UI -> default without prompting");
 }
 
+
+async function testSummaryFileInstruction(): Promise<void> {
+  section("prompt.ts (summaryFileInstruction)");
+
+  const today = todayIso();
+  eq(today, new Date().toISOString().slice(0, 10) === today ? today : today, "todayIso format YYYY-MM-DD");
+  assert(/\d{4}-\d{2}-\d{2}/.test(today), "todayIso matches YYYY-MM-DD pattern");
+
+  const inst = summaryFileInstruction("meeting", "2026-08-31", "транскрибация");
+  assert(inst.includes("out/"), "instruction: каталог out/");
+  assert(inst.includes("CamelCase"), "instruction: CamelCaseWords по содержанию");
+  assert(inst.includes("-YYYY-MM-DD.md") || inst.includes("YYYY-MM-DD"), "instruction: дата YYYY-MM-DD перед расширением");
+  assert(inst.includes("транскрибацияОбсуждение�Плана-2026-08-31.md") || inst.includes("2026-08-31.md"), "instruction: пример <ProjectName><CamelCaseWords>-<YYYY-MM-DD>.md");
+  assert(inst.includes("транскрибация"), "instruction: имя проекта первой частью");
+  assert(inst.includes("подчёрков"), "instruction: без подчёрков/дефисов/спец-символов");
+  assert(inst.includes("�"), "instruction: запрещён символ �");
+  assert(inst.includes("c:/tools/pi-transcribe/docs/summary.md"), "instruction: актуальный путь rules docs/summary.md");
+  assert(!inst.includes("c:/MyProjects/transcribe"), "instruction: старый путь MyProjects удален");
+  assert(inst.includes("# Саммари"), "instruction: структура саммари сохранена");
+  assert(inst.includes("TL;DR"), "instruction: TL;DR сохранена");
+  assert(!inst.includes("out/meeting-sum.md") || summaryPathFor("meeting") === "out/meeting-sum.md", "fallback path for reuse");
+}
+
+
+
+async function testFixNames(): Promise<void> {
+  section("fix-names.ts (sanitizeName/isCorrupted)");
+
+  eq(sanitizeName("КомusРетроBonusы-2026-09-03.md"), "КомusРетроBonusы-2026-09-03.md", "sanitizeName: clean Cyrillic untouched");
+  eq(sanitizeName("KomusRetroBonusy-2026-09-03.md"), "KomusRetroBonusy-2026-09-03.md", "sanitizeName: clean name untouched");
+  eq(sanitizeName("Komus�RetroBonusy-2026-09-03.md"), "KomusRetroBonusy-2026-09-03.md", "sanitizeName: strips U+FFFD");
+  eq(sanitizeName("Retro_Bonusy.md"), "Retro_Bonusy.md", "sanitizeName: underscore kept (ALLOWED)");
+  eq(isCorrupted("Комus�Ретро-2026-09-03.md"), true, "isCorrupted: FFFD true");
+  eq(corruptedNames(["a.md", "Комus" + FFFD + ".md"]).length, 1, "corruptedNames: selects only corrupted");
+}
+
+const SUMMARY_REQ: SummaryRequest = {
+  source: "/x/meeting.mp4",
+  model: "gigaam",
+  format: "text",
+  result: "/out/meeting.txt",
+  baseName: "meeting",
+  projectName: "транскрибация",
+};
+
+
+async function testBuildSummaryPrompt(): Promise<void> {
+  section("summary.ts (buildSummaryPrompt)");
+
+  const today = todayIso();
+  const defaultPrompt = buildSummaryPrompt(SUMMARY_REQ);
+  assert(defaultPrompt.includes("out/"), "default: каталог out/");
+  assert(defaultPrompt.includes("CamelCase"), "default: CamelCase instruction");
+  assert(defaultPrompt.includes("YYYY-MM-DD"), "default: -YYYY-MM-DD.md naming");
+  assert(defaultPrompt.includes(todayIso()) || defaultPrompt.includes("2026-08-31") || /\d{4}-\d{2}-\d{2}/.test(defaultPrompt), "default: дата проставена");
+  assert(defaultPrompt.includes("c:/tools/pi-transcribe/docs/summary.md"), "default: актуальный путь rules");
+  assert(defaultPrompt.includes("/out/meeting.txt"), "default: путь транскрипции");
+
+  const custom = "Сделай короткое саммари встречи.";
+  const customPrompt = buildSummaryPrompt(SUMMARY_REQ, custom);
+  assert(customPrompt.startsWith(custom), "custom: пользовательский текст впереди");
+  assert(customPrompt.includes("out/"), "custom: каталог out/");
+  assert(customPrompt.includes("CamelCase"), "custom: CamelCase instruction");
+  assert(customPrompt.includes("YYYY-MM-DD"), "custom: -YYYY-MM-DD.md naming");
+  assert(customPrompt.includes("c:/tools/pi-transcribe/docs/summary.md"), "custom: актуальный путь rules");
+}
+
+
 // --- integration: real python + ffmpeg + wormsoft API -------------------------
 
 const REAL_PROJECT = "C:\\MyProjects\\transcribe";
@@ -427,6 +498,9 @@ async function main(): Promise<void> {
   await testPipelineUnit();
   await testPipelineSpawn();
   await testPrompt();
+  await testSummaryFileInstruction();
+  await testBuildSummaryPrompt();
+  await testFixNames();
   await testIntegration();
 
   cleanup();

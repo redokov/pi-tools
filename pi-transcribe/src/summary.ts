@@ -6,7 +6,7 @@
  */
 
 import { displayPath } from "./paths.js";
-import { summaryFileInstruction } from "./prompt.js";
+import { summaryFileInstruction, todayIso } from "./prompt.js";
 
 export interface SummaryRequest {
   /** The source media path (absolute). */
@@ -19,15 +19,17 @@ export interface SummaryRequest {
   result: string;
   /**
    * Source media stem (e.g. "meeting.mp4" -> "meeting"). Used to build the
-   * mandatory summary file path out/<basename>-sum.md.
+   * date YYYY-MM-DD (passed to summaryFileInstruction).
    */
   baseName: string;
+  /** Name of the pi project folder (Russian CamelCase). First part of the summary file name. */
+  projectName: string;
 }
 
 /**
  * Build the user message that asks the agent to summarize the transcript.
  * The agent reads the full file itself — the message only points at it and
- * requires saving the summary to out/<basename>-sum.md.
+ * requires saving the summary to out/<CamelCaseWords>-<YYYY-MM-DD>.md.
  */
 export function buildSummaryPrompt(
   req: SummaryRequest,
@@ -42,7 +44,7 @@ export function buildSummaryPrompt(
       customPrompt.trim() +
       `\n\nФайл транскрипции: ${req.result}\n` +
       `Модель: ${req.model}, формат: ${req.format}.\n` +
-      summaryFileInstruction(req.baseName)
+      summaryFileInstruction(req.baseName, req.projectName, todayIso())
     );
   }
   return (
@@ -51,7 +53,7 @@ export function buildSummaryPrompt(
     `Прочитай файл и подготовь саммари: 1) краткое резюме (3–5 пунктов), ` +
     `2) ключевые решения/выводы, 3) список действий, если они есть. ` +
     `Отвечай на русском. ` +
-    summaryFileInstruction(req.baseName)
+    summaryFileInstruction(req.baseName, req.projectName, todayIso())
   );
 }
 

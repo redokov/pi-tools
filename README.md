@@ -303,3 +303,18 @@ pi
 
 Внутренние инструменты. MIT-style (уточните у владельца при публикации).
 Вопросы и баги — в трекер `pi-tools` или напрямую авторам расширений.
+
+## Cyrillic/encoding practices
+
+
+При работе с Cyrillic- именами файлов ( транскрибация pi-transcribe):
+
+
+- **Python на Windows**: используйте `python -X utf8` или env `PYTHONUTF8=1` для всех скриптов с Cyrillic — default cp1251 мутирует Cyrillic в � (U+FFFD).
+- **Type fresh**: при typing Cyrillic filenames в write/edit — type fresh, не copy из поврежденных tool-call.
+- **Listing**: перечисление filenames через python (`os.listdir()`), bash `ls` formatting unreliable.
+- **Byte verification**: для critical файлов — bash (`od`, `grep`) проверка bytes.
+- **Cleanup**: command `/transcribe-fixnames` в pi-transcribe — удаляет U+FFFD и поврежденные Cyrillic из имен файлов out/.
+
+
+Имя саммаризованного файла: `out/<ProjectName><CamelCaseWords>-<YYYY-MM-DD>.md` ( правила: `pi-transcribe/docs/summary.md`).
