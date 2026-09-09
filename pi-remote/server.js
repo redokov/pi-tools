@@ -7,6 +7,10 @@
 // Notify flow: pi-billing-window POSTs to /api/notify with X-Notify-Token = PI_REMOTE_NOTIFY_TOKEN;
 // the server validates the token, then broadcasts {type:'notify', notify:{...}} to every WS client.
 // The index page keeps a notify-only WS connection (room __notify_index__) and shows toasts.
+//
+// Auth: single admin, password from PI_REMOTE_PASSWORD (.env or real env; fail-closed without it).
+// Session cookie pi_session (HttpOnly, SameSite=Lax, sliding TTL, default 720h). Login rate-limited.
+// /api/notify stays on its own X-Notify-Token (machine-to-machine, no cookie).
 
 const http = require('http');
 const fs = require('fs');
@@ -16,6 +20,32 @@ const crypto = require('crypto');
 const pty = require('node-pty');
 const { WebSocketServer } = require('ws');
 
+// ---------- .env (mini parser, no deps) ----------
+// KEY=VALUE lines, '#' comments, trimmed values, optional matching quotes.
+// A real process.env entry always overrides the file. .env values are never logged.
+function parseEnvFile(file) {
+  const out = {};
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch { return out; }
+  for (const line of text.split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s || s.startsWith('#')) continue;
+    const eq = s.indexOf('=');
+    if (eq <= 0) continue;
+    const key = s.slice(0, eq).trim();
+    let val = s.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    out[key] = val;
+  }
+  return out;
+}
+const fileEnv = parseEnvFile(path.join(__dirname, '.env'));
+for (const k of Object.keys(fileEnv)) {
+  if (process.env[k] === undefined) process.env[k] = fileEnv[k];
+}
+
 const PORT = parseInt(process.argv[2] || process.env.PORT || '7681', 10);
 const DEFAULT_SHELL_CMD = process.argv[3] || (process.env.APPDATA
   ? process.env.APPDATA + '\\npm\\pi.cmd'
@@ -24,6 +54,18 @@ const PROJECTS_ROOT = process.argv[4] || 'C:\\MyProjects';
 const IDLE_TIMEOUT_MS = (parseInt(process.argv[5], 10) || 120) * 1000;
 const NOTIFY_TOKEN = process.env.PI_REMOTE_NOTIFY_TOKEN || '';
 const NOTIFY_ROOM_NAME = '__notify_index__';
+const PASSWORD = process.env.PI_REMOTE_PASSWORD || '';
+const SESSION_TTL_HOURS = Math.max(1, parseFloat(process.env.PI_REMOTE_SESSION_TTL_HOURS || '720') || 720);
+const SESSION_TTL_MS = SESSION_TTL_HOURS * 3600 * 1000;
+
+// fail-closed: no password -> refuse to start (rely on nothing but a set password)
+if (!PASSWORD) {
+  console.error('[FATAL] PI_REMOTE_PASSWORD is not set.');
+  console.error('        Create a .env file next to server.js (see .env.example) or set the');
+  console.error('        PI_REMOTE_PASSWORD environment variable. The server refuses to start');
+  console.error('        without a password.');
+  process.exit(1);
+}
 
 function shortId() { return crypto.randomBytes(3).toString('hex'); }
 function nowIso() { return new Date().toISOString(); }
@@ -114,11 +156,90 @@ function destroyRoom(name) {
 // Stored in the same rooms Map so /api/notify broadcast reaches it.
 rooms.set(NOTIFY_ROOM_NAME, { name: NOTIFY_ROOM_NAME, cwd: '', cmd: '', proc: null, clients: new Set(), createdAt: Date.now(), lastOutput: Date.now(), outputBuf: '', alive: true });
 
+// ---------- sessions / auth ----------
+
+const SESSION_COOKIE = 'pi_session';
+const sessions = new Map();        // token -> { createdAt, lastSeen }
+const loginAttempts = new Map();   // ip -> { fails, blockedUntil, lastFail }
+
+function parseCookies(header) {
+  const out = {};
+  if (typeof header === 'string') {
+    for (const part of header.split(';')) {
+      const eq = part.indexOf('=');
+      if (eq > 0) out[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
+    }
+  }
+  return out;
+}
+
+// Secure only over https (x-forwarded-proto or a TLS socket); over plain HTTP inside
+// Tailscale the Secure flag would make the browser drop the cookie.
+function isSecureRequest(req) {
+  const proto = req.headers['x-forwarded-proto'];
+  return (typeof proto === 'string' && proto.split(',')[0].trim() === 'https') || !!req.socket.encrypted;
+}
+
+function sessionCookieHeader(token, maxAgeSec, secure) {
+  let c = `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}`;
+  if (secure) c += '; Secure';
+  return c;
+}
+
+function createSession() {
+  const token = crypto.randomBytes(32).toString('hex');
+  sessions.set(token, { createdAt: Date.now(), lastSeen: Date.now() });
+  return token;
+}
+
+// Sliding TTL: every successful check pushes lastSeen forward.
+function checkAuth(req) {
+  const token = parseCookies(req.headers.cookie)[SESSION_COOKIE];
+  if (!token) return null;
+  const s = sessions.get(token);
+  if (!s) return null;
+  if (Date.now() - s.lastSeen > SESSION_TTL_MS) { sessions.delete(token); return null; }
+  s.lastSeen = Date.now();
+  return { token, session: s };
+}
+
+// constant-time password compare (sha256 both sides to equal length)
+function checkPassword(provided) {
+  const a = crypto.createHash('sha256').update(String(provided), 'utf8').digest();
+  const b = crypto.createHash('sha256').update(PASSWORD, 'utf8').digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+// open-redirect guard: only same-site absolute paths survive
+function sanitizeNext(p) {
+  if (typeof p !== 'string' || p.length === 0 || p[0] !== '/' || p[1] === '/') return '/';
+  if (/^[a-z][a-z0-9+.-]*:/i.test(p)) return '/';
+  return p;
+}
+
+function redirect(res, to) {
+  res.writeHead(302, { Location: to, 'Cache-Control': 'no-store' });
+  res.end();
+}
+
+// rate limit for POST /api/login: 5 failed attempts per IP -> 60s block
+function loginLimiter(ip) {
+  let lim = loginAttempts.get(ip);
+  if (!lim) { lim = { fails: 0, blockedUntil: 0, lastFail: 0 }; loginAttempts.set(ip, lim); }
+  return lim;
+}
+
+setInterval(() => { // hourly: drop expired sessions and stale rate-limit entries
+  const now = Date.now();
+  for (const [token, s] of sessions) if (now - s.lastSeen > SESSION_TTL_MS) sessions.delete(token);
+  for (const [ip, a] of loginAttempts) if (a.blockedUntil < now && now - a.lastFail > 60000) loginAttempts.delete(ip);
+}, 3600000).unref();
+
 // ---------- HTTP ----------
 
 function json(res, obj, code = 200) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store' });
   res.end(body);
 }
 
@@ -134,14 +255,77 @@ function readJsonBody(req) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
+  // ---------- auth ----------
+  const auth = checkAuth(req);
+
+  // GET /login -> password form (already authenticated -> straight to next)
+  if (url.pathname === '/login' && req.method === 'GET') {
+    const next = sanitizeNext(url.searchParams.get('next'));
+    if (auth) return redirect(res, next);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(LOGIN_HTML);
+    return;
+  }
+
+  // POST /api/login { password, next? } -> session cookie
+  if (url.pathname === '/api/login' && req.method === 'POST') {
+    const ip = req.socket.remoteAddress || 'unknown';
+    const lim = loginLimiter(ip);
+    if (lim.blockedUntil > Date.now()) return json(res, { error: 'too many attempts, try again later' }, 429);
+    let body;
+    try { body = await readJsonBody(req); } catch { return json(res, { error: 'bad json' }, 400); }
+    if (!checkPassword(body.password)) {
+      lim.fails++; lim.lastFail = Date.now();
+      if (lim.fails >= 5) { lim.blockedUntil = Date.now() + 60000; lim.fails = 0; }
+      return json(res, { error: 'invalid password' }, 401);
+    }
+    loginAttempts.delete(ip);
+    const token = createSession();
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+      'Set-Cookie': sessionCookieHeader(token, Math.floor(SESSION_TTL_MS / 1000), isSecureRequest(req)),
+    });
+    res.end(JSON.stringify({ ok: true, next: sanitizeNext(body.next) }));
+    return;
+  }
+
+  // POST /api/logout -> drop the session and the cookie
+  if (url.pathname === '/api/logout' && req.method === 'POST') {
+    if (auth) sessions.delete(auth.token);
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+      'Set-Cookie': sessionCookieHeader('', 0, isSecureRequest(req)),
+    });
+    res.end('{"ok":true}');
+    return;
+  }
+
+  // everything below requires a session, EXCEPT: /health (GET) and /api/notify (POST,
+  // machine-to-machine on its own X-Notify-Token -- no browser cookie there)
+  if (!auth) {
+    const publicHealth = url.pathname === '/health' && req.method === 'GET';
+    const publicNotify = url.pathname === '/api/notify' && req.method === 'POST';
+    if (!publicHealth && !publicNotify) {
+      const isPage = url.pathname === '/' || url.pathname.startsWith('/room/');
+      if (isPage) return redirect(res, '/login?next=' + encodeURIComponent(url.pathname + url.search));
+      return json(res, { error: 'unauthorized' }, 401);
+    }
+  }
+
   // /health
   if (url.pathname === '/health' && req.method === 'GET') {
     return json(res, { ok: true, uptime: process.uptime(), rooms: rooms.size });
   }
 
-  // / -> index with room list + "new room" form
+  // / -> index with room list + "new room" form (cookie TTL refresh -> sliding session)
   if (url.pathname === '/' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Set-Cookie': sessionCookieHeader(auth.token, Math.floor(SESSION_TTL_MS / 1000), isSecureRequest(req)),
+    });
     res.end(INDEX_HTML);
     return;
   }
@@ -152,7 +336,11 @@ const server = http.createServer(async (req, res) => {
     const name = decodeURIComponent(url.pathname.slice(6));
     const room = rooms.get(name);
     const cwd = room ? room.cwd : '';
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Set-Cookie': sessionCookieHeader(auth.token, Math.floor(SESSION_TTL_MS / 1000), isSecureRequest(req)),
+    });
     res.end(terminalPageHtml(name, cwd));
     return;
   }
@@ -283,7 +471,20 @@ const server = http.createServer(async (req, res) => {
 
 // ---------- WebSocket ----------
 
-const wss = new WebSocketServer({ server });
+// noServer + manual upgrade: the session cookie is checked BEFORE the WS handshake,
+// so an unauthenticated client never gets a socket (plain 401, connection destroyed).
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  let u;
+  try { u = new URL(req.url, 'http://localhost'); } catch { u = null; }
+  if (!u || u.pathname !== '/ws' || !checkAuth(req)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+});
 
 wss.on('connection', (ws, req) => {
   const u = new URL(req.url, 'http://localhost');
@@ -343,6 +544,57 @@ wss.on('connection', (ws, req) => {
 
 // ---------- HTML templates ----------
 
+const LOGIN_HTML = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pi Remote — Login</title>
+<style>
+  body { background: #1e1e1e; color: #ddd; font-family: 'Segoe UI', system-ui, sans-serif; margin: 0; padding: 20px; display: flex; flex-direction: column; min-height: 100vh; box-sizing: border-box; }
+  .box { background: #2d2d2d; border-radius: 8px; padding: 24px; max-width: 360px; margin: auto; width: 100%; box-sizing: border-box; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .sub { color: #888; font-size: 0.85rem; margin-bottom: 20px; }
+  input { background: #1e1e1e; color: #ddd; border: 1px solid #555; padding: 10px 12px; border-radius: 4px; width: 100%; box-sizing: border-box; font-size: 1rem; }
+  input:focus { outline: 1px solid #4a8; }
+  button { background: #2a5; color: #fff; border: none; padding: 10px 20px; border-radius: 4px; font-size: 1rem; cursor: pointer; margin-top: 14px; width: 100%; }
+  button:hover { background: #3b6; }
+  button:disabled { background: #445; cursor: default; }
+  #err { color: #f77; margin-top: 10px; font-size: 0.85rem; min-height: 1.2em; }
+</style>
+</head><body>
+<div class="box">
+  <h1>Pi Remote</h1>
+  <div class="sub">enter the admin password</div>
+  <form id="loginForm" onsubmit="return submitLogin(event)">
+    <input id="pw" type="password" name="password" placeholder="Password" autocomplete="current-password" autofocus>
+    <button id="loginBtn" type="submit">Sign in</button>
+    <div id="err"></div>
+  </form>
+</div>
+<script>
+function nextPath() {
+  var p = '';
+  try { p = new URLSearchParams(location.search).get('next') || ''; } catch (e) {}
+  if (p && p[0] === '/' && p[1] !== '/' && !/^[a-z][a-z0-9+.-]*:/i.test(p)) return p; // same-site path only
+  return '/';
+}
+function submitLogin(e) {
+  e.preventDefault();
+  var pw = document.getElementById('pw').value;
+  var errEl = document.getElementById('err');
+  var btn = document.getElementById('loginBtn');
+  errEl.textContent = '';
+  btn.disabled = true;
+  fetch('/api/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ password: pw, next: nextPath() }) })
+    .then(function (r) { return r.json().then(function (d) { return { s: r.status, d: d }; }); })
+    .then(function (r) {
+      if (r.s !== 200) { errEl.textContent = r.d.error || 'Login failed'; btn.disabled = false; return; }
+      window.location.href = r.d.next || '/';
+    })
+    .catch(function (err) { errEl.textContent = 'Network error: ' + err.message; btn.disabled = false; });
+  return false;
+}
+</script>
+</body></html>`;
+
 const INDEX_HTML = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pi Remote</title>
@@ -361,9 +613,11 @@ const INDEX_HTML = `<!DOCTYPE html>
   .new button { background: #2a5; color: #fff; border: none; padding: 8px 20px; border-radius: 4px; font-size: 1rem; cursor: pointer; }
   .new button:hover { background: #3b6; }
   #err { color: #f77; margin-top: 8px; font-size: 0.85rem; }
+  #logoutBtn { float: right; background: #333; color: #999; border: 1px solid #555; padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 0.75rem; }
+  #logoutBtn:hover { color: #ccc; background: #444; }
 </style>
 </head><body>
-<h1>Pi Remote</h1>
+<h1>Pi Remote <button id="logoutBtn" onclick="logout()" title="Sign out">Logout</button></h1>
 <div class="sub">sessions on this server</div>
 <div id="rooms" class="cards"></div>
 <div class="new">
@@ -375,10 +629,18 @@ const INDEX_HTML = `<!DOCTYPE html>
   <div id="err"></div>
 </div>
 <script>
+async function logout() {
+  try { await fetch('/api/logout', { method: 'POST' }); } catch (e) {}
+  window.location.href = '/login';
+}
+function redirectToLogin() {
+  window.location.href = '/login?next=' + encodeURIComponent(location.pathname);
+}
 async function deleteRoom(name) {
   if (!confirm('Terminate session "' + name + '"? The PTY process will be killed.')) return;
   try {
     const r = await fetch('/api/rooms/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (r.status === 401) { redirectToLogin(); return; }
     if (!r.ok) {
       document.getElementById('err').textContent = 'Failed to terminate "' + name + '" (HTTP ' + r.status + ')';
       return;
@@ -390,7 +652,9 @@ async function deleteRoom(name) {
   load();
 }
 async function load() {
-  const r = await fetch('/api/rooms'); const d = await r.json();
+  const r = await fetch('/api/rooms');
+  if (r.status === 401) { redirectToLogin(); return; }
+  const d = await r.json();
   const box = document.getElementById('rooms');
   box.innerHTML = '';
   for (const room of d.rooms) {
@@ -422,7 +686,9 @@ function autoNameFromCwd(cwd) {
   return out;
 }
 async function loadProjects() {
-  const r = await fetch('/api/projects'); const d = await r.json();
+  const r = await fetch('/api/projects');
+  if (r.status === 401) { redirectToLogin(); return; }
+  const d = await r.json();
   const sel = document.getElementById('cwd');
   sel.innerHTML = '';
   const all = document.createElement('option'); all.value = ''; all.textContent = d.root + '\\...';
@@ -444,6 +710,7 @@ async function createRoom() {
   if (!name) { errEl.textContent = 'Name required'; return; }
   if (!cwd) { errEl.textContent = 'Working directory required'; return; }
   const r = await fetch('/api/rooms', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name, cwd }) });
+  if (r.status === 401) { redirectToLogin(); return; }
   const d = await r.json();
   if (r.status === 409) { // room already exists -- open it, don't show an error
     window.location.href = '/room/' + encodeURIComponent(name.toLowerCase().replace(/[^a-z0-9_-]+/g, '_').slice(0, 40));
@@ -730,6 +997,18 @@ function fitWhenReady(cb) {
   })();
 }
 function logMsg(m) { msgEl.textContent = m; setTimeout(function(){ if (msgEl.textContent === m) msgEl.textContent = ''; }, 3000); }
+// Auth-loss detection: a rejected WS upgrade reaches the browser as 1006 (the refusal
+// happens before the handshake), so we probe the HTTP API to tell "session expired"
+// apart from "server down" and bounce to /login only when the cookie is really gone.
+function redirectToLogin() {
+  window.location.href = '/login?next=' + encodeURIComponent(location.pathname);
+}
+function probeAuth() {
+  return fetch('/api/rooms/' + encodeURIComponent(roomName)).then(function (r) {
+    if (r.status === 401) { redirectToLogin(); return 'unauthorized'; }
+    return 'ok';
+  }).catch(function () { return 'network-error'; });
+}
 function connect() {
   if (ws && ws.readyState <= 1) return;
   ws = new WebSocket(proto + '//' + location.host + '/ws?room=' + encodeURIComponent(roomName));
@@ -779,14 +1058,21 @@ function connect() {
     }
   };
   ws.onclose = function (e) {
+    if (e.code === 1008) { // explicit auth rejection from the server
+      redirectToLogin();
+      return;
+    }
     logMsg('connection closed (code ' + e.code + '), retrying...');
-    setTimeout(connect, 2000);
+    probeAuth().then(function (probe) {
+      if (probe !== 'unauthorized') setTimeout(connect, 2000);
+    });
   };
   ws.onerror = function () { logMsg('ws error, retrying...'); };
 }
 async function restartRoom() {
   logMsg('restarting...');
   var r = await fetch('/api/rooms/' + encodeURIComponent(roomName), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'restart' }) });
+  if (r.status === 401) { redirectToLogin(); return; }
   var d = await r.json();
   if (!r.ok) { logMsg('restart failed: ' + (d.error || r.status)); return; }
   logMsg('restarted, reconnecting...');
@@ -801,7 +1087,10 @@ async function restartRoom() {
 async function deleteRoom() {
   if (!confirm('Terminate session "' + roomName + '"? The PTY process will be killed.')) return;
   if (ws) { ws.onclose = null; try { ws.close(); } catch (e) {} ws = null; }
-  try { await fetch('/api/rooms/' + encodeURIComponent(roomName), { method: 'DELETE' }); } catch (e) {}
+  try {
+    const r = await fetch('/api/rooms/' + encodeURIComponent(roomName), { method: 'DELETE' });
+    if (r.status === 401) { redirectToLogin(); return; }
+  } catch (e) {}
   window.location.href = '/';
 }
 function reconnect() {
@@ -837,6 +1126,7 @@ server.listen(PORT, '0.0.0.0', () => {
   } catch {}
   console.log(`  Projects root: ${PROJECTS_ROOT}`);
   console.log(`  Shell: ${DEFAULT_SHELL_CMD}`);
+  console.log(`  Session TTL: ${SESSION_TTL_HOURS}h (sliding)`);
   if (!NOTIFY_TOKEN) console.log(`  [!] PI_REMOTE_NOTIFY_TOKEN not set -- notify endpoint open without auth\n`);
   console.log(`  Press Ctrl+C to stop\n`);
 });

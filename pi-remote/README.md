@@ -39,7 +39,7 @@
 2. **PTY живёт на ноуте**, не в браузере. Закрытие телефона не убивает сессию.
 3. **Несколько комнат** = несколько параллельных PTY (по одному на проект).
 4. **Комнаты живут до явного удаления** — PTY-сессия не уничтожается автоматически при отключении клиентов или завершении процесса. Комнату можно удалить через DELETE /api/rooms/:name или перезапустить кнопкой "Restart pi". Если PTY завершился, комната остаётся доступной для переподключения и рестарта.
-5. **Без аутентификации** — полагаемся на приватность Tailscale-сети. Никаких логинов.
+5. **Аутентификация — один админ с паролем** — пароль задаётся в `.env` (`PI_REMOTE_PASSWORD`); без него сервер не стартует (fail-closed). Сессия — долгоживущая cookie (по умолчанию 30 дней, скользящий TTL), так что с телефона не надо логиниться каждую неделю. Подробнее — п. 5.9.
 
 ## 3. Технологический стек
 
@@ -57,8 +57,10 @@
 
 ```
 C:\Tools\pi-remote\
-├── server.js          # основной сервер: HTTP + WebSocket
+├── server.js          # основной сервер: HTTP + WebSocket + аутентификация
 ├── start.bat          # запуск через cmd (даёт настоящую консоль)
+├── .env               # ПАРОЛЬ и настройки (в git/backup не класть)
+├── .env.example       # шаблон .env (без секретов)
 ├── package.json
 ├── node_modules\      # node-pty, ws
 ├── static\
@@ -153,8 +155,11 @@ proc.onExit(({ exitCode }) => {
 
 | Метод | Путь | Что делает |
 |---|---|---|
-| GET | `/` | Главная страница — список комнат + форма создания |
-| GET | `/room/:name` | Терминальная страница (xterm.js) |
+| GET | `/` | Главная страница — список комнат + форма создания (требует сессию) |
+| GET | `/login` | Страница входа (поле пароля) |
+| POST | `/api/login` | Проверить пароль, выдать сессионную cookie `{password, next}` |
+| POST | `/api/logout` | Удалить сессию и погасить cookie |
+| GET | `/room/:name` | Терминальная страница (xterm.js) (требует сессию) |
 | GET | `/api/rooms` | Список активных комнат (JSON) |
 | POST | `/api/rooms` | Создать комнату: `{name, cwd, cmd}` |
 | GET | `/api/rooms/:name` | Инфо о комнате |
@@ -162,7 +167,57 @@ proc.onExit(({ exitCode }) => {
 | DELETE | `/api/rooms/:name` | Убить комнату |
 | GET | `/api/projects` | Список подпапок в `PROJECTS_ROOT` (для UI) |
 | GET | `/static/*` | Локальные статические файлы (xterm.js) |
-| GET | `/health` | Healthcheck |
+| GET | `/health` | Healthcheck (без аутентификации) |
+
+### 5.9. Аутентификация
+
+Один пользователь — администратор с паролем. Много пользователей / смена пароля из UI /
+HTTPS-терминация / CSRF-токены — вне объёма (пароль хранится в `.env` в открытом виде осознанно).
+
+**Как задать пароль.** Файл `.env` рядом с `server.js` (шаблон — `.env.example`):
+
+```
+PI_REMOTE_PASSWORD=<секрет>
+# опционально:
+PI_REMOTE_SESSION_TTL_HOURS=720   # время жизни сессии, часы (по умолчанию 720 = 30 дней)
+PI_REMOTE_NOTIFY_TOKEN=<токен>     # токен для /api/notify
+```
+
+Мини-парсер `.env` (строки `KEY=VALUE`, `#`-комментарии, trim) встроен в `server.js`, без
+зависимостей. **Переменные реального окружения перекрывают файл.** Значения из `.env` никогда
+не логируются. Сгенерировать пароль:
+`node -e "console.log(require('crypto').randomBytes(9).toString('hex'))"`
+
+**Поведение без пароля — fail-closed.** Если `PI_REMOTE_PASSWORD` не задан ни в env, ни в
+`.env` (в т.ч. пустой), сервер печатает понятную ошибку и завершается с кодом 1.
+
+**Флоу.** Неаутентифицированный запрос на страницу (`/`, `/room/*`) → редирект 302 на
+`/login?next=<оригинальный путь>`; после ввода пароля — редирект обратно на `?next=`
+(валидация: только пути, начинающиеся с одного `/`, без схемы — защита от open redirect).
+API без сессии → `401 {"error":"unauthorized"}`. WebSocket-апгрейд без сессии отклоняется
+ДО handshake (plain 401, соединение рвётся). Фронтенд при 401 от fetch и при потере сессии
+на WS сам уводит браузер на `/login`.
+
+**Сессии.** `Map<token, session>` в памяти сервера; токен — `crypto.randomBytes(32)` в hex.
+Cookie `pi_session`: `HttpOnly`, `Path=/`, `SameSite=Lax`, `Max-Age = TTL`; флаг `Secure`
+добавляется только если запрос пришёл по https (`x-forwarded-proto` или TLS-сокет) — по
+голому HTTP внутри Tailscale Secure сломал бы cookie. TTL скользящий (каждый визит
+продлевает и серверную сессию, и cookie), чистка протухших — раз в час. Перезапуск
+сервера инвалидирует все сессии (приемлемо: логин заново один раз).
+
+**Безопасность.** Сравнение пароля — `crypto.timingSafeEqual` по sha256-хэшам обеих сторон
+(constant-time). Rate limit на `POST /api/login`: 5 неудач с одного IP → блок на 60 секунд
+(429 `too many attempts`). Ответы страниц и API — `Cache-Control: no-store`.
+
+**Что НЕ защищено паролем (исключения):** `GET /health` и `POST /api/notify` — последний
+остаётся на своём machine-to-machine токене `X-Notify-Token` (`PI_REMOTE_NOTIFY_TOKEN`),
+cookie там не участвует; pi-billing-window продолжает работать как раньше.
+
+**Logout.** Кнопка `Logout` на главной странице → `POST /api/logout` (сессия удаляется,
+cookie гасится) → редирект на `/login`.
+
+E2E: `test-e2e-auth.cjs` (fail-closed, 302/401, cookie, WS-upgrade, logout, notify,
+rate limit); mobile/delete/rooms-тесты логинятся через CDP-форму.
 
 ### 5.5. Жизненный цикл комнаты
 
@@ -443,7 +498,11 @@ node server.js 7681 /usr/local/bin/aider /Users/me/Projects
 
 1. **node-pty prebuilds ломают backslash** в путях (см. п. 7). `server.js` уже нормализует `cmd`/`cwd` в forward slashes — ничего менять не нужно, но **не отключайте** эту нормализацию, если хотите запустить `pi.cmd` с путём `C:\\...`.
 2. **Запуск через `.bat` + `start`**, иначе `AttachConsole failed`.
-3. **Токен для `/api/notify`** — если `pi-billing-window` шлёт уведомления, нужно передать токен:
+3. **Пароль обязателен (fail-closed)** — создайте `.env` рядом с `server.js`
+   (`copy .env.example .env` + впишите `PI_REMOTE_PASSWORD`). Без пароля сервер завершится
+   с кодом 1. Сервер сам читает `.env` — лаунчеры менять не нужно.
+4. **Токен для `/api/notify`** — можно тоже задать в `.env`; либо по старому сценарию, если
+   pi-billing-window шлёт уведомления, передать токен в запуске:
    ```bat
    @echo off
    setlocal
@@ -468,26 +527,61 @@ start "pi-remote" C:\Tools\pi-remote\start.bat
 ### 9.3. Проверка после запуска
 
 ```bash
-# Сервер поднялся
+# Сервер поднялся (health — без аутентификации)
+curl -s http://localhost:7681/health
+# {"ok":true,...}
+
+# Без пароля — страницы редиректят на логин, API отдаёт 401
+curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" http://localhost:7681/
+# 302 http://localhost:7681/login?next=%2F
 curl -s http://localhost:7681/api/rooms
+# {"error":"unauthorized"}
+
+# Логин (сессия в cookie — дальше ходим с ней)
+curl -s -c /tmp/pi-cookie.txt -X POST http://localhost:7681/api/login \
+  -H "Content-Type: application/json" -d '{"password":"<ПАРОЛЬ>"}'
+# {"ok":true,"next":"/"}
+curl -s -b /tmp/pi-cookie.txt http://localhost:7681/api/rooms
 # {"rooms":[]}
 
-# Локальный xterm.js отдаётся
-curl -sI http://localhost:7681/static/xterm.js | head -3
+# Локальный xterm.js отдаётся (с cookie)
+curl -s -b /tmp/pi-cookie.txt -I http://localhost:7681/static/xterm.js | head -3
 # HTTP/1.1 200 OK
 # Content-Type: application/javascript; charset=utf-8
 # Cache-Control: no-store
 
-# Создать комнату через браузер или API
-# curl -s -X POST http://localhost:7681/api/rooms -H "Content-Type: application/json" -d '{"name":"test","cwd":"C:\\MyProjects"}'
+# Создать комнату через браузер или API (с cookie)
+# curl -s -b /tmp/pi-cookie.txt -X POST http://localhost:7681/api/rooms -H "Content-Type: application/json" -d '{"name":"test","cwd":"C:\\MyProjects"}'
 # (на Windows через curl из bash — лучше делать через браузер, см. п. 9.4)
 ```
 
 ### 9.4. E2E-проверка через Chrome DevTools Protocol
 
-Если есть доступ к CDP (порт 9222 или attach к существующему Chrome):
+Все основные сценарии автоматизированы (vanilla Node + raw CDP, без playwright):
+
+```bat
+cd /d C:\Tools\pi-remote
+node test-e2e-auth.cjs     :: аутентификация: fail-closed, 302/401, cookie, WS-upgrade, logout, notify, rate limit
+node test-e2e-delete.cjs   :: удаление комнат (UI index + room, свой тест-сервер на 7981)
+node test-e2e-mobile.cjs   :: мобильный UI T1–T5 (свой тест-сервер на 7981)
+node test-e2e-rooms.cjs    :: создание комнат/auto-name/restart (живой сервер на 7681;
+                           :: SKIP + exit 0, если сервер не запущен или без аутентификации)
+```
+
+auth/delete/mobile спавнят собственные тест-серверы (порт 7981/7983) со своим паролем в env —
+продакшн-инстанс не затрагивается. rooms ходит на живой сервер и логинится паролем из `.env`
+(пароль не логируется). Если нужен ручной прогон через CDP (порт 9222 или attach к Chrome) —
+не забудьте сначала войти (см. п. 9.3, `/api/login` + cookie):
 
 ```js
+// 0. Логин (иначе / редиректит на /login, а API отдаёт 401)
+await page.evaluate(async () => {
+  const r = await fetch('/api/login', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: '<ПАРОЛЬ>' }) });
+  return r.json();
+});
+
 // 1. Открыть главную
 await page.goto('http://localhost:7681/');
 
@@ -524,11 +618,11 @@ console.assert(tail.includes('H'), 'ввод не дошёл до PTY');
 
 После запуска вывод:
 ```
-  Pi Remote v2 listening on:
-    http://localhost:7681
-    http://100.x.y.z:7681    <-- Tailscale (use from phone)
-  Projects root: /Users/me/Projects
-  Shell: /usr/local/bin/aider
+  [+] HTTP+WS listening on http://0.0.0.0:7681
+      http://100.x.y.z:7681    <-- Tailscale (use from phone)
+    Projects root: C:\MyProjects
+    Shell: C:\Users\me\AppData\Roaming\npm\pi.cmd
+    Session TTL: 720h (sliding)
 
   Press Ctrl+C to stop
 ```

@@ -2,6 +2,11 @@
 // E2E tests for pi-remote: room creation, auto-name, Start click, restart.
 // Vanilla Node + ws + CDP (no puppeteer/playwright).
 //
+// NOTE (auth): runs against a LIVE server (default port 7681) that now requires a
+// session cookie. The test logs in via CDP using the password from PI_REMOTE_PASSWORD
+// or from the .env file next to server.js (the password is never logged). If the
+// server is not reachable, the test prints SKIP and exits 0 (does not block CI).
+//
 // Spawns a headless Chrome with --remote-debugging-port, drives it via raw CDP
 // (WebSocket), navigates to the pi-remote server, and asserts:
 //   1. Auto-name: selecting a project populates #name with a transliterated name.
@@ -42,6 +47,29 @@ function fail(step, reason) {
 function ok(step, msg) { console.log(`OK: ${step}${msg ? ' ' + msg : ''}`); }
 
 // ---------- HTTP helpers (plain node) ----------
+let apiCookie = '';
+function authHeaders() { return apiCookie ? { Cookie: apiCookie } : {}; }
+
+// password for the live server: env var first, then .env (never logged)
+function readEnvPassword() {
+  if (process.env.PI_REMOTE_PASSWORD) return process.env.PI_REMOTE_PASSWORD;
+  try {
+    const t = fs.readFileSync(path.join(__dirname, '.env'), 'utf8');
+    for (const line of t.split(/\r?\n/)) {
+      const m = line.match(/^\s*PI_REMOTE_PASSWORD\s*=\s*(.*?)\s*$/);
+      if (m) return m[1].replace(/^["']|["']$/g, '');
+    }
+  } catch {}
+  return '';
+}
+
+async function httpLogin(pw) {
+  const r = await httpJson(BASE + '/api/login', { method: 'POST', body: JSON.stringify({ password: pw, next: '/' }) });
+  if (r.status !== 200) throw new Error('http login failed: ' + r.status);
+  const sc = r.headers['set-cookie'] || [];
+  apiCookie = (Array.isArray(sc) ? sc : [sc]).map(c => c.split(';')[0]).join('; ');
+}
+
 function httpJson(url, opts = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
@@ -53,8 +81,8 @@ function httpJson(url, opts = {}) {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, body: JSON.parse(data || '{}') }); }
-        catch { resolve({ status: res.statusCode, body: data }); }
+        try { resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(data || '{}') }); }
+        catch { resolve({ status: res.statusCode, headers: res.headers, body: data }); }
       });
     });
     req.on('error', reject);
@@ -325,14 +353,46 @@ async function testRestart(roomInfo) {
   fs.writeFileSync(path.join(SHOTS_DIR, 'e2e-restart.png'), Buffer.from(shot.data, 'base64'));
   log('Screenshot saved: e2e-restart.png');
   // Cleanup: delete the e2e room and folder
-  try { await httpJson(`${BASE}/api/rooms/${encodeURIComponent(roomName)}`, { method: 'DELETE' }); } catch {}
+  try { await httpJson(`${BASE}/api/rooms/${encodeURIComponent(roomName)}`, { method: 'DELETE', headers: authHeaders() }); } catch {}
   try { fs.rmSync(uniqDir, { recursive: true, force: true }); } catch {}
 }
 
+// Login through the real login page in the CDP browser (auth is required on the live server).
+async function cdpLogin(pw) {
+  await cdpNavigate(BASE + '/');
+  await waitUntil(async () => await cdpEval(`location.pathname === '/login' && !!document.getElementById('pw')`), 10000, 'login form');
+  await cdpEval(`document.getElementById('pw').value = ${JSON.stringify(pw)}; true`);
+  await cdpEval(`document.getElementById('loginBtn').click(); true`);
+  await waitUntil(async () => await cdpEval(`location.pathname === '/' && !!document.querySelector('.new')`), 10000, 'redirect to index after login');
+  ok('login', 'CDP login form submitted, redirected back to the index');
+}
+
 async function main() {
+  // live server pre-check: skip (exit 0) when it is not running
+  try {
+    const h = await httpJson(BASE + '/health');
+    if (h.status !== 200 || !h.body.ok) throw new Error('health: ' + h.status);
+  } catch (e) {
+    console.log('SKIP: no live pi-remote server on port ' + PORT + ' (' + (e.message || e) + ')');
+    process.exit(0);
+  }
+  // auth pre-check: the running server must be the auth-enabled build (302 to /login)
+  const page = await httpJson(BASE + '/');
+  if (page.status !== 302) {
+    console.log('SKIP: live server on port ' + PORT + ' does not redirect to /login (pre-auth build still running; restart it to test auth)');
+    process.exit(0);
+  }
+  const password = readEnvPassword();
+  if (!password) {
+    console.log('SKIP: PI_REMOTE_PASSWORD not found (env or .env) -- cannot log in to the live server');
+    process.exit(0);
+  }
+  await httpLogin(password);
+  log('http login ok, session cookie captured');
   log('Starting headless Chrome via CDP...');
   await startChrome();
   log('Chrome ready on CDP port ' + cdpPort);
+  await cdpLogin(password);
   try {
     await testAutoName();
     const roomInfo = await testStart();

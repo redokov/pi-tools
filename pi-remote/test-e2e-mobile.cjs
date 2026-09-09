@@ -18,6 +18,10 @@
 //       ws.send bytes with the TZ table; xterm focus must not be lost; localStorage state.
 //   T5: regression: xterm created, a typed key reaches the PTY and is rendered in .xterm-rows.
 //
+// Auth: the test server is spawned with PI_REMOTE_PASSWORD in env; the test logs in
+// via a plain HTTP login (cookie for the API helpers) and via the CDP browser
+// (login form UI, same pattern as test-e2e-delete.cjs).
+//
 // Artifacts: e2e-mobile-*.png screenshots in the project root.
 // Usage: node test-e2e-mobile.cjs [port]
 // Exit code 0 on success, 1 on any failure.
@@ -31,6 +35,7 @@ const os = require('os');
 const PORT = parseInt(process.argv[2] || process.env.PI_REMOTE_MOBILE_PORT || '7981', 10);
 const BASE = `http://localhost:${PORT}`;
 const ROOM = 'e2emob';
+const PASSWORD = 'mobile-e2e-password';
 const CHROME = process.platform === 'win32'
   ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
   : (process.env.CHROME_PATH || '/usr/bin/google-chrome');
@@ -85,8 +90,8 @@ function httpJson(url, opts = {}) {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, body: JSON.parse(data || '{}') }); }
-        catch { resolve({ status: res.statusCode, body: data }); }
+        try { resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(data || '{}') }); }
+        catch { resolve({ status: res.statusCode, headers: res.headers, body: data }); }
       });
     });
     req.on('error', reject);
@@ -165,7 +170,7 @@ function startServer() {
     log('spawning test server on port ' + PORT + ' (production on 7681 is not touched)');
     serverProc = spawn(process.execPath, [
       path.join(__dirname, 'server.js'), String(PORT), 'cmd.exe', 'C:\\MyProjects', '3600',
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    ], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PI_REMOTE_PASSWORD: PASSWORD } });
     let out = '';
     serverProc.stdout.on('data', c => { out += c; if (out.length > 20000) out = out.slice(-20000); serverLogTail = out; });
     serverProc.stderr.on('data', c => { out += c; if (out.length > 20000) out = out.slice(-20000); serverLogTail = out; });
@@ -643,19 +648,44 @@ async function t5() {
   ok('T5', 'H went over WS, echoed by the PTY, rendered in .xterm-rows');
 }
 
+// ---------- auth helpers ----------
+let apiCookie = '';
+function authHeaders() { return apiCookie ? { Cookie: apiCookie } : {}; }
+
+async function httpLogin() {
+  const r = await httpJson(BASE + '/api/login', { method: 'POST', body: JSON.stringify({ password: PASSWORD, next: '/' }) });
+  if (r.status !== 200) throw new Error('http login failed: ' + r.status + ' ' + JSON.stringify(r.body));
+  const sc = r.headers['set-cookie'] || [];
+  apiCookie = (Array.isArray(sc) ? sc : [sc]).map(c => c.split(';')[0]).join('; ');
+  log('http login ok, session cookie captured');
+}
+
+// Login through the real login page in the CDP browser (covers the /login form UI).
+async function cdpLogin() {
+  await cdpNavigate(BASE + '/');
+  await waitUntil(async () => await cdpEval(`location.pathname === '/login' && !!document.getElementById('pw')`), 10000, 'login form');
+  await cdpEval(`document.getElementById('pw').value = ${JSON.stringify(PASSWORD)}; true`);
+  await cdpEval(`document.getElementById('loginBtn').click(); true`);
+  await waitUntil(async () => await cdpEval(`location.pathname === '/' && !!document.querySelector('.new')`), 10000, 'redirect to index after login');
+  ok('login', 'CDP login form submitted, redirected back to the index');
+}
+
 // ---------- main ----------
 async function main() {
   let code = 1;
   try {
     await startServer();
+    await httpLogin();
     const cr = await httpJson(BASE + '/api/rooms', {
       method: 'POST',
+      headers: authHeaders(),
       body: JSON.stringify({ name: ROOM, cwd: 'C:\\MyProjects', cmd: 'cmd.exe' }),
     });
     if (cr.status !== 200) throw new Error('room creation failed: ' + JSON.stringify(cr.body));
     log('room "' + ROOM + '" created (cmd.exe)');
     await startChrome();
     log('Chrome ready on CDP port ' + cdpPort + ', mobile emulation 390x844 DSF3');
+    await cdpLogin();
     await cdpSend('Page.addScriptToEvaluateOnNewDocument', { source: WS_HOOK });
     await setMetrics(PORTRAIT);
     await cdpSend('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
@@ -679,7 +709,7 @@ async function main() {
     code = 1;
   }
   // cleanup: delete the room first (kills the PTY), then chrome, then the test server
-  try { await httpJson(BASE + '/api/rooms/' + ROOM, { method: 'DELETE' }); } catch {}
+  try { await httpJson(BASE + '/api/rooms/' + ROOM, { method: 'DELETE', headers: authHeaders() }); } catch {}
   stopChrome();
   killServer();
   process.exit(code);

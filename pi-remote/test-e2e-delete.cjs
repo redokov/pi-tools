@@ -4,6 +4,8 @@
 //     (confirm-guarded; confirm-cancel keeps the room, confirm-ok destroys it)
 //   - room page: "Delete" button in the toolbar -> destroys the room and navigates to '/',
 //     a WS client attached to the room receives the 'exit' message (PTY killed)
+// Auth: the test server is spawned with PI_REMOTE_PASSWORD in env; the test logs in
+// via CDP (covers the login form UI) AND via a plain HTTP login (cookie for the API helpers).
 // Pattern: test-e2e-mobile.cjs -- vanilla Node + raw CDP headless Chrome, no new deps.
 // The test spawns ITS OWN server on a TEST port (default 7981); the production instance
 // on 7681 (if running) is never touched.
@@ -20,6 +22,7 @@ const os = require('os');
 const PORT = parseInt(process.argv[2] || process.env.PI_REMOTE_DELETE_PORT || '7981', 10);
 const BASE = `http://localhost:${PORT}`;
 const ROOM = 'delui';
+const PASSWORD = 'delete-e2e-password';
 const CHROME = process.platform === 'win32'
   ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
   : (process.env.CHROME_PATH || '/usr/bin/google-chrome');
@@ -48,8 +51,8 @@ function httpJson(url, opts = {}) {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, body: JSON.parse(data || '{}') }); }
-        catch { resolve({ status: res.statusCode, body: data }); }
+        try { resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(data || '{}') }); }
+        catch { resolve({ status: res.statusCode, headers: res.headers, body: data }); }
       });
     });
     req.on('error', reject);
@@ -126,7 +129,7 @@ function startServer() {
     log('spawning test server on port ' + PORT + ' (production on 7681 is not touched)');
     serverProc = spawn(process.execPath, [
       path.join(__dirname, 'server.js'), String(PORT), 'cmd.exe', 'C:\\MyProjects', '3600',
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    ], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PI_REMOTE_PASSWORD: PASSWORD } });
     let out = '';
     serverProc.stdout.on('data', c => { out += c; if (out.length > 20000) out = out.slice(-20000); serverLogTail = out; });
     serverProc.stderr.on('data', c => { out += c; if (out.length > 20000) out = out.slice(-20000); serverLogTail = out; });
@@ -155,16 +158,40 @@ function killServer() {
 }
 
 async function roomExists() {
-  const r = await httpJson(BASE + '/api/rooms/' + ROOM);
+  const r = await httpJson(BASE + '/api/rooms/' + ROOM, { headers: authHeaders() });
   return r.status === 200;
 }
 
 async function createRoom() {
   const cr = await httpJson(BASE + '/api/rooms', {
     method: 'POST',
+    headers: authHeaders(),
     body: JSON.stringify({ name: ROOM, cwd: 'C:\\MyProjects', cmd: 'cmd.exe' }),
   });
   if (cr.status !== 200) throw new Error('room creation failed: ' + JSON.stringify(cr.body));
+}
+
+// ---------- auth helpers ----------
+let apiCookie = '';
+function authHeaders() { return apiCookie ? { Cookie: apiCookie } : {}; }
+
+async function httpLogin() {
+  const r = await httpJson(BASE + '/api/login', { method: 'POST', body: JSON.stringify({ password: PASSWORD, next: '/' }) });
+  if (r.status !== 200) throw new Error('http login failed: ' + r.status + ' ' + JSON.stringify(r.body));
+  const sc = r.headers['set-cookie'] || [];
+  apiCookie = (Array.isArray(sc) ? sc : [sc]).map(c => c.split(';')[0]).join('; ');
+  log('http login ok, session cookie captured');
+}
+
+// Login through the real login page in the CDP browser (covers the /login form UI):
+// open /, get redirected to /login, type the password, submit, land back on the index.
+async function cdpLogin() {
+  await cdpNavigate(BASE + '/');
+  await waitUntil(async () => await cdpEval(`location.pathname === '/login' && !!document.getElementById('pw')`), 10000, 'login form');
+  await cdpEval(`document.getElementById('pw').value = ${JSON.stringify(PASSWORD)}; true`);
+  await cdpEval(`document.getElementById('loginBtn').click(); true`);
+  await waitUntil(async () => await cdpEval(`location.pathname === '/' && !!document.querySelector('.new')`), 10000, 'redirect to index after login');
+  ok('login', 'CDP login form submitted, redirected back to the index');
 }
 
 // ---------- Chrome lifecycle ----------
@@ -272,7 +299,7 @@ async function d2() {
   await createRoom();
   // attach a plain WS client to the room BEFORE the UI delete: it must receive 'exit'
   const WebSocket = require('ws').WebSocket || require('ws');
-  const roomWs = new WebSocket(`ws://127.0.0.1:${PORT}/ws?room=${ROOM}`);
+  const roomWs = new WebSocket(`ws://127.0.0.1:${PORT}/ws?room=${ROOM}`, { headers: authHeaders() });
   await new Promise((resolve, reject) => {
     roomWs.on('open', resolve);
     roomWs.on('error', reject);
@@ -320,9 +347,11 @@ async function main() {
   let code = 1;
   try {
     await startServer();
+    await httpLogin();
     await createRoom();
     await startChrome();
     log('Chrome ready on CDP port ' + cdpPort);
+    await cdpLogin();
     await d1();
     await d2();
     console.log('ALL OK');
@@ -332,7 +361,7 @@ async function main() {
     if (serverLogTail) console.error('--- server log tail ---\n' + serverLogTail.slice(-1500));
     code = 1;
   }
-  try { await httpJson(BASE + '/api/rooms/' + ROOM, { method: 'DELETE' }); } catch {}
+  try { await httpJson(BASE + '/api/rooms/' + ROOM, { method: 'DELETE', headers: authHeaders() }); } catch {}
   stopChrome();
   killServer();
   process.exit(code);
