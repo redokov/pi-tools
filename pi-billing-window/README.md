@@ -195,7 +195,6 @@ New-Item -ItemType SymbolicLink `
 
 ## 8. Дальнейшие шаги (roadmap)
 
-- [ ] Событие `billing:window_close` (за 30/60 секунд до reset) — для тонких предупреждений.
 - [ ] История `callsInWindow` по минутам (CSV/MD-дамп) — для последующего анализа.
 
 ---
