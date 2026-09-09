@@ -8,3 +8,10 @@ dist/
 build/
 .vscode/
 .idea/
+
+# debug artifacts (keep on disk, not in git)
+remote-stdout.txt
+e2e-*.png
+notify-mock.cjs
+notify-test.cjs
+NOTIFY_TOKEN.txt
