@@ -23,9 +23,10 @@
 ## 2. Архитектура
 
 ```
-index.ts ──── оркестратор: хуки (session_start, after_provider_response,
-             session_shutdown) + команды (/billing-status, /billing-tick,
-             /billing-reset, /settimer)
+index.ts ──── оркестратор: хуки (session_start, model_select,
+             after_provider_response, session_shutdown) + команды
+             (/billing-status, /billing-tick, /billing-reset,
+             /settimer, /cont-after-reset)
   │
   ├── state.ts  ──── JSON-файл + proper-lockfile для межпроцессной
   │                  синхронизации state. mutateState() / readStateSync()
@@ -33,8 +34,11 @@ index.ts ──── оркестратор: хуки (session_start, after_pro
   ├── ticker.ts ──── setInterval(TICK_MS=5min) → checkAndReset(emit).
   │                  Дедуп через lastResetAt (<10 мин → повторно не шлём).
   │
+  ├── arms.ts   ──── per-разговор флаги /cont-after-reset (отдельный
+  │                  JSON-файл + lock). Poller 10 с + grace 60 с.
+  │
   ├── ui.ts ──────── setStatus("billing-window", "[осталось: H:MM м.]"),
-  │                  только для ctx.mode === "tui".
+  │                  только для ctx.mode === "tui". Обновление каждые 30 с.
   │
   ├── parser.ts ──── parseDuration("1h30m"/"60"/"90m") для /settimer.
   │
@@ -82,6 +86,7 @@ type State = {
 | `/billing-tick` | Принудительный `checkAndReset()` прямо сейчас (без ожидания 5 минут) + превью payload событий. |
 | `/billing-reset` | Ручной сброс: `resetCount++`, `callsInWindow = 0`, новый `windowStartedAt = now`, эмитит `billing:window_reset`. |
 | `/settimer <duration>` | Установить **оставшееся** время до reset (синхронизация с личным кабинетом wormsoft). Форматы: `60` (минуты), `90m`, `2h`, `1h30m`. `0` = немедленный reset. Ограничено 2 ч. |
+| `/cont-after-reset [off]` | Автопродолжение после сброса (одноразово) — см. раздел 8a. |
 
 ---
 
@@ -100,7 +105,8 @@ C:\Tools\pi-billing-window\
 │   ├── parser.ts          # parseDuration / formatDuration
 │   └── notifier.ts        # HTTP POST в pi-remote
 ├── tests/
-│   └── test.mts           # unit-тесты (state, ticker, ui, parser, notifier)
+│   ├── test.mts           # unit-тесты (state, ticker, ui, parser, notifier)
+│   └── arms.test.mts      # unit-тесты флагов /cont-after-reset
 ├── docs/
 │   ├── ARCHITECTURE.md    # подробный разбор модулей и потоков
 │   ├── EVENTBUS.md        # контракт шины событий и подписчики
@@ -134,6 +140,7 @@ npx tsc -p tsconfig.json
 
 ```powershell
 npx tsx tests/test.mts
+npx tsx tests/arms.test.mts
 ```
 
 Покрытие (тесты лежат в `tests/test.mts`):
@@ -142,6 +149,9 @@ npx tsx tests/test.mts
 - `ui.ts` — `renderStatusBar`, `forceUpdate`, `startStatusUpdater` (с подменой setInterval), режим `mode !== "tui"`
 - `parser.ts` — все форматы (`60`, `90m`, `2h`, `1h30m`), ошибки (отрицательные, дробные, секунды, дни, мусор), `formatDuration`
 - `notifier.ts` — успех, не-2xx, таймаут, сетевая ошибка, отсутствие url и token
+
+Покрытие `tests/arms.test.mts`:
+- `arms.ts` — взвод/снятие/идемпотентность, TTL и prune, перенос флага при `/new` (`carryArmTo`), переключение ключа без переноса (`switchKey`), `resetReadyToFire` (граница grace, срабатывание только после взвода), атомарность записи
 
 ### 6.4. Установка / переустановка в pi
 
@@ -185,11 +195,45 @@ New-Item -ItemType SymbolicLink `
 
 ## 8. Дальнейшие шаги (roadmap)
 
-- [ ] Поддержка нескольких провайдеров (массив в `State`, фильтр по списку).
 - [ ] Событие `billing:window_close` (за 30/60 секунд до reset) — для тонких предупреждений.
 - [ ] История `callsInWindow` по минутам (CSV/MD-дамп) — для последующего анализа.
-- [ ] Опциональный лог в `~/.pi/agent/pi-billing-window.log` (ротация по размеру).
-- [ ] Команда `/billing-history` — показать последние N сбросов и их длительность.
+
+---
+
+## 8a. Автопродолжение после сброса (`/cont-after-reset`)
+
+Когда сессия была прервана (вручную или из-за исчерпания токенов wormsoft в
+текущем окне), можно поручить окну автоматически возобновить работу, когда
+2-часовое окно сбросится:
+
+- `/cont-after-reset` — взвести флаг для этой сессии (в таймере в футере
+  появляется `[cont-after-reset]`). Одноразовый: сработает на ближайшем
+  сбросе, после чего сгорит.
+- `/cont-after-reset off` — снять флаг вручную.
+
+Как работает:
+- окно запоминает значение `lastResetAt` на момент взвода;
+- сброс окна (автоматический, `/billing-reset` или `/settimer 0`) виден всем
+  окнам через общий state-файл — взведённое окно замечает его и ждёт ~1 мин
+  (grace), чтобы wormsoft успел вернуть токены;
+- затем, если агент не стримит, в чат отправляется одно слово `продолжи`
+  (`pi.sendUserMessage`), задача возобновляется. Если агент занят — ждём и
+  пробуем снова;
+- продолжается только взведённое окно. Остальные окна сброс просто отражают
+  в счётчике.
+
+Ограничения:
+- срок годности флага — 2 ч 10 мин от взвода (если сброса за это время не
+  было, флаг сгорает);
+- `/new` переносит взведённый флаг в новый разговор окна; `/resume` к другой
+  сессии — нет (флаг остаётся у своего разговора и сработает, когда вы к нему
+  вернётесь);
+- флаг хранится в `~/.pi/agent/pi-billing-window-arms.json` (по ключу файла
+  сессии) и переживает перезапуск окна.
+
+Заметка: расширение `wormsoft-rate-limit` удалено — его роль (детекция 429 и
+собственный авто-`продолжи` по `+2ч`) не работала корректно и заменена этой
+функцией, привязанной к реальному сбросу окна.
 
 ---
 

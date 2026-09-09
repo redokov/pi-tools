@@ -44,6 +44,17 @@ import {
 } from "./ui.js";
 import { parseDuration, formatDuration } from "./parser.js";
 import { sendNotify } from "./notifier.js";
+import {
+  switchKey as armsSwitchKey,
+  carryArmTo as armsCarryArmTo,
+  arm as armsArm,
+  disarm as armsDisarm,
+  isArmed as armsIsArmed,
+  getArm as armsGetArm,
+  resetReadyToFire,
+  RESET_GRACE_MS,
+  type Arm as ArmsArm,
+} from "./arms.js";
 
 const PROVIDER = "wormsoft";
 const WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -78,6 +89,20 @@ let tickerStarted = false;
 let currentCtx: ExtensionContext | null = null;
 
 /**
+ * The shared EventBus captured from `pi.events` in the factory. All
+ * cross-extension communication goes through this bus. `null` until the
+ * factory runs.
+ *
+ * NOTE: the bus lives on the ExtensionAPI (pi.events), NOT on ExtensionContext
+ * (ctx) -- so we must not read it from ctx. The factory is re-invoked for
+ * every session with a fresh `pi`, which keeps this pointing at the live bus.
+ */
+let eventBus: {
+  emit: (channel: string, data: unknown) => void;
+  on: (channel: string, handler: (data: unknown) => void) => () => void;
+} | null = null;
+
+/**
  * Unsubscriber returned by pi.events.on("billing:window_reset", ...) so we
  * can detach the listener on session_shutdown. Null when not subscribed.
  */
@@ -103,6 +128,157 @@ let unsubscribeWindowResetNotify: (() => void) | null = null;
  */
 let stopStatusFn: (() => void) | null = null;
 
+/**
+ * The live ExtensionAPI (`pi`) captured in the factory. Used to send
+ * "продолжи" via pi.sendUserMessage on a cont-after-reset trigger. The
+ * factory re-runs per session with a fresh pi, so this stays current.
+ */
+let piApi: ExtensionAPI | null = null;
+
+/**
+ * Periodic poller that drives cont-after-reset detection while the current
+ * conversation is armed. Deliberately NOT cleared on session_shutdown so the
+ * armed flag survives /new (module state persists across /new).
+ */
+let armedPollTimer: NodeJS.Timeout | null = null;
+
+/**
+ * One-shot timer that forces checkAndReset() at the true 2h boundary while a
+ * conversation is armed, so the reset (and thus the "продолжи") does not have
+ * to wait up to the 5-minute tick.
+ */
+let boundaryResetTimer: NodeJS.Timeout | null = null;
+
+/** How often the armed poller wakes up. */
+const ARMED_POLL_MS = 10_000;
+
+// --- cont-after-reset helpers -------------------------------------------------
+
+/** A stable per-process identity for the conversation we are showing. */
+function sessionKeyOf(ctx: ExtensionContext | null): string {
+  const f = ctx?.sessionManager?.getSessionFile?.();
+  return typeof f === "string" && f.length > 0 ? f : `ephemeral:${process.pid}`;
+}
+
+/** Force a footer refresh so the armed indicator appears/disappears promptly. */
+function refreshMarker(): void {
+  if (currentCtx?.mode === "tui") {
+    try {
+      forceUpdateStatus(currentCtx);
+    } catch {}
+  }
+}
+
+function clearBoundaryResetTimer(): void {
+  if (boundaryResetTimer) {
+    clearTimeout(boundaryResetTimer);
+    boundaryResetTimer = null;
+  }
+}
+
+function stopArmedPoller(): void {
+  if (armedPollTimer) {
+    clearInterval(armedPollTimer);
+    armedPollTimer = null;
+  }
+  clearBoundaryResetTimer();
+}
+
+/**
+ * Ensure the armed poller is running (used after arming / adoption).
+ */
+function ensureArmedPoller(): void {
+  if (!armedPollTimer) {
+    armedPollTimer = setInterval(() => {
+      void evaluateArmedReset();
+    }, ARMED_POLL_MS);
+  }
+  void evaluateArmedReset();
+}
+
+/**
+ * While a conversation is armed: (1) fire "продолжи" once a reset since the
+ * arming has passed, and the 60 s grace has elapsed; (2) otherwise schedule a
+ * one-shot force-reset at the true window boundary so the trigger lands near
+ * the real zero (not up to 5 min late). Stops itself when the arm is gone or
+ * expired.
+ */
+async function evaluateArmedReset(): Promise<void> {
+  const arm = armsGetArm();
+  if (!arm) {
+    // Expired or removed.
+    stopArmedPoller();
+    refreshMarker();
+    return;
+  }
+  const st = readStateSync();
+  if (!st) return;
+  const now = Date.now();
+
+  // A reset has happened since arming. Fire once the grace period has elapsed.
+  if (resetReadyToFire(arm, st, now)) {
+    await fireContinue(arm);
+    return;
+  }
+
+  // No reset yet (or reset too recent to act on). If the window already reads
+  // expired but lastResetAt has not advanced (another process owns the lazy
+  // tick), force a boundary reset soon.
+  if (st.lastResetAt <= arm.lastResetAtAtArm) {
+    const msToBoundary = st.windowStartedAt + st.windowMs - now;
+    if (msToBoundary <= 0) {
+      void checkAndReset(buildEmitFn()).then(() => {
+        void evaluateArmedReset();
+      });
+    } else if (!boundaryResetTimer) {
+      boundaryResetTimer = setTimeout(() => {
+        boundaryResetTimer = null;
+        void checkAndReset(buildEmitFn()).then(() => {
+          void evaluateArmedReset();
+        });
+      }, msToBoundary + 500);
+    }
+  }
+}
+
+/**
+ * Send the one-word "продолжи" so the interrupted agent resumes. Guards:
+ *  - only when the agent is idle (spec: "if the agent is streaming, do
+ *    nothing" -- we keep the arm and retry on the next poll);
+ *  - only after the grace period (handled by the caller).
+ * One-shot: clears the arm right after a successful send.
+ */
+async function fireContinue(_arm: ArmsArm): Promise<void> {
+  let idle = true;
+  try {
+    idle = currentCtx?.isIdle?.() ?? true;
+  } catch {
+    idle = true;
+  }
+  if (!idle) {
+    // Streaming -- spec says do nothing. Keep the arm; next poll retries.
+    return;
+  }
+
+  const p = piApi;
+  if (!p) return;
+
+  try {
+    await p.sendUserMessage("продолжи");
+    // Sent successfully: consume the one-shot flag and stop the poller.
+    stopArmedPoller();
+    await armsDisarm();
+    console.log("[pi-billing-window] cont-after-reset: 'продолжи' отправлен");
+  } catch (err) {
+    // Failed to send (e.g. bus busy). Keep the arm and poller; retry next poll.
+    console.warn(
+      "[pi-billing-window] cont-after-reset: не удалось отправить:",
+      err,
+    );
+  }
+  refreshMarker();
+}
+
 // --- Emit plumbing ------------------------------------------------------------
 
 /**
@@ -117,9 +293,7 @@ let stopStatusFn: (() => void) | null = null;
  */
 function buildEmitFn(): EmitFn {
   return (event: string, payload: unknown) => {
-    const bus = (currentCtx as any)?.events as
-      | { emit: (channel: string, data: unknown) => void }
-      | undefined;
+    const bus = eventBus;
     if (!bus) return;
     try {
       bus.emit(event, payload);
@@ -210,10 +384,7 @@ const handleWindowResetForNotify = (payload: unknown): void => {
  * detached in session_shutdown.
  */
 function subscribeToBillingEvents(): void {
-  if (!currentCtx) return;
-  const bus = (currentCtx as any).events as
-    | { on: (channel: string, handler: (data: unknown) => void) => () => void }
-    | undefined;
+  const bus = eventBus;
   if (!bus) return;
 
   // Always detach any previous subscription first (defensive against reload
@@ -282,7 +453,7 @@ function unsubscribeFromBillingEvents(): void {
  * tickerStarted guard and the state file itself.
  */
 async function onSessionStart(
-  _event: unknown,
+  event: unknown,
   ctx: ExtensionContext,
 ): Promise<void> {
   currentCtx = ctx;
@@ -291,20 +462,12 @@ async function onSessionStart(
   // a reset happens (also useful for future "about to reset" hooks).
   subscribeToBillingEvents();
 
-  // Initialize state if it doesn't exist. We do this BEFORE the expired
-  // check so the file is always present after session_start.
-  const existing = readStateSync();
-  if (existing === null) {
-    await mutateState(() => ({ next: makeInitialState() }));
-  } else if (Date.now() - existing.windowStartedAt >= existing.windowMs) {
-    // Window already expired while pi was off. Let the ticker machinery
-    // reset it -- this also fires billing:window_reset which our listener
-    // will pick up and turn into a notify().
-    await checkAndReset(buildEmitFn());
-  }
-
-  // Start the periodic ticker. ensureTickerStarted() is a no-op on
-  // subsequent reloads.
+  // Start the periodic ticker and the status-bar updater FIRST, before any
+  // state I/O. If the state bootstrap below throws (e.g. a lock timeout while
+  // another pi window holds the lock), pi swallows handler errors -- without
+  // this ordering the countdown and reset ticker would never start in this
+  // session until /reload. With timers up first, a bootstrap failure degrades
+  // to just a warning and everything keeps running.
   ensureTickerStarted();
 
   // Start the status-bar updater (live countdown) in TUI mode only.
@@ -318,10 +481,54 @@ async function onSessionStart(
   stopStatusFn = startStatusUpdater(ctx);
 
   // Push the current status immediately so the footer reflects the
-  // persisted window state right after startup -- otherwise we'd have
-  // to wait up to DEFAULT_INTERVAL_MS (5 min) for the first tick, or
-  // until the first LLM call.
+  // persisted window state right after startup.
   forceUpdateStatus(ctx);
+
+  // Initialize state / reset an expired window. Non-fatal: if this throws,
+  // the timers above are already running, so the countdown and reset
+  // detection keep working even in this degraded case.
+  try {
+    const existing = readStateSync();
+    if (existing === null) {
+      await mutateState(() => ({ next: makeInitialState() }));
+    } else if (Date.now() - existing.windowStartedAt >= existing.windowMs) {
+      // Window already expired while pi was off. Let the ticker machinery
+      // reset it -- this also fires billing:window_reset which our listener
+      // will pick up and turn into a notify().
+      await checkAndReset(buildEmitFn());
+    }
+    // Refresh the status bar after a possible reset so the fresh countdown
+    // is visible right away.
+    forceUpdateStatus(ctx);
+  } catch (err) {
+    console.warn(
+      "pi-billing-window: state init on session_start failed:",
+      err,
+    );
+  }
+
+  // cont-after-reset: (re)bind this window to its conversation's armed flag.
+  // On /new the armed record is carried to the fresh conversation (spec: keep
+  // the flag after /new). On /resume, /fork, /reload or startup we merely
+  // re-point at the current conversation; an arm stays with the conversation
+  // that created it and is re-adopted only if we come back to it. A process
+  // restart re-adopts the record persisted under its conversation file.
+  try {
+    const key = sessionKeyOf(ctx);
+    const reason = (event as { reason?: string } | null)?.reason;
+    if (reason === "new") {
+      await armsCarryArmTo(key);
+    } else {
+      armsSwitchKey(key);
+    }
+    if (armsIsArmed()) {
+      ensureArmedPoller();
+    } else {
+      refreshMarker();
+    }
+  } catch (err) {
+    console.warn("pi-billing-window: arms session init failed:", err);
+  }
 }
 
 /**
@@ -397,6 +604,24 @@ async function onAfterProviderResponse(
   // is idempotent and dedups via lastResetAt, so calling it here is safe and
   // handles the edge case without waiting up to TICK_MS for the next tick.
   await checkAndReset(emit);
+}
+
+/**
+ * pi.on("model_select"): the footer countdown is only visible while the active
+ * model belongs to the wormsoft provider (ui.ts visibility rule). A model
+ * switch (Ctrl+P, /model, or session restore) changes the provider WITHOUT
+ * any LLM call, so the status bar must be refreshed here -- otherwise the
+ * countdown would stay hidden (or stale) for up to the status interval after
+ * the switch. We pass the new model's provider explicitly so the check is not
+ * dependent on ctx.model already being updated at handler time.
+ */
+function onModelSelect(
+  event: { model?: { provider?: string } },
+  ctx: ExtensionContext,
+): void {
+  // Keep the live ctx fresh so emit/notify find a valid bus context.
+  currentCtx = ctx;
+  forceUpdateStatus(ctx, undefined, event?.model?.provider);
 }
 
 /**
@@ -505,10 +730,8 @@ function registerBillingReset(pi: ExtensionAPI): void {
       }
 
       // Broadcast our manual reset through the bus so other extensions
-      // (e.g. wormsoft-rate-limit) can react just like to a normal reset.
-      const bus = (ctx as any).events as
-        | { emit: (channel: string, data: unknown) => void }
-        | undefined;
+      // can react just like to a normal reset.
+      const bus = eventBus;
       const fresh = readStateSync();
       if (bus && fresh) {
         try {
@@ -554,44 +777,80 @@ function registerSettimer(pi: ExtensionAPI): void {
       let durationMs = Math.max(0, parsed.totalMs);
       const windowMs = WINDOW_MS;
       if (durationMs > windowMs) durationMs = windowMs;
-
-      // Pick a windowStartedAt that puts "durationMs" of life left in the
-      // current window: started = now - (windowMs - durationMs).
-      const targetStartedAt = Date.now() - (windowMs - durationMs);
       const now = Date.now();
 
-      await mutateState((cur) => {
-        if (cur === null) {
+      if (durationMs === 0) {
+        // Immediate reset: open a fresh window right now and broadcast the
+        // reset event (mirrors /billing-reset). Going through checkAndReset()
+        // here would be blocked by its own dedup (lastResetAt is recent), so
+        // we reset directly instead.
+        await mutateState((cur) => {
+          if (cur === null) {
+            return {
+              next: {
+                provider: PROVIDER,
+                windowStartedAt: now,
+                windowMs,
+                lastResetAt: now,
+                resetCount: 1,
+                callsInWindow: 0,
+                firstCallEmittedAt: undefined,
+              },
+            };
+          }
           return {
             next: {
-              provider: PROVIDER,
-              windowStartedAt: targetStartedAt,
-              windowMs,
+              ...cur,
+              windowStartedAt: now,
               lastResetAt: now,
-              resetCount: 1,
+              resetCount: cur.resetCount + 1,
               callsInWindow: 0,
               firstCallEmittedAt: undefined,
             },
           };
+        });
+        const fresh = readStateSync();
+        if (eventBus && fresh) {
+          try {
+            eventBus.emit("billing:window_reset", fresh);
+          } catch {}
         }
-        return {
-          next: {
-            ...cur,
-            windowStartedAt: targetStartedAt,
-            lastResetAt: now,
-            resetCount: cur.resetCount + 1,
-            callsInWindow: 0,
-            firstCallEmittedAt: undefined,
-          },
-        };
-      });
-
-      // checkAndReset will fire the window_reset event if duration=0 or the
-      // adjusted window has already expired.
-      await checkAndReset(buildEmitFn());
+      } else {
+        // Sync the countdown to the given remaining time: pick a
+        // windowStartedAt that leaves durationMs of life in the window.
+        // We deliberately do NOT touch lastResetAt here, so a future
+        // auto-reset is not suppressed by checkAndReset()'s dedup logic.
+        const targetStartedAt = now - (windowMs - durationMs);
+        await mutateState((cur) => {
+          if (cur === null) {
+            return {
+              next: {
+                provider: PROVIDER,
+                windowStartedAt: targetStartedAt,
+                windowMs,
+                lastResetAt: 0,
+                resetCount: 1,
+                callsInWindow: 0,
+                firstCallEmittedAt: undefined,
+              },
+            };
+          }
+          return {
+            next: {
+              ...cur,
+              windowStartedAt: targetStartedAt,
+              resetCount: cur.resetCount + 1,
+              callsInWindow: 0,
+              firstCallEmittedAt: undefined,
+            },
+          };
+        });
+      }
 
       ctx.ui.notify(
-        `Таймер установлен: ${formatDuration(durationMs)} до reset`,
+        durationMs === 0
+          ? "Таймер: окно сброшено (свежие 2 часа)"
+          : `Таймер установлен: ${formatDuration(durationMs)} до reset`,
         "info",
       );
 
@@ -602,10 +861,93 @@ function registerSettimer(pi: ExtensionAPI): void {
   });
 }
 
+/**
+ * /cont-after-reset -- arm (default) or disarm ("off") the automatic
+ * "continue after reset" for THIS conversation. When armed, the footer timer
+ * shows " [cont-after-reset]"; on the next window reset (after ~1 min) the
+ * agent gets a single "продолжи" and resumes the interrupted task. One-shot;
+ * expires ~2h10m after arming if no reset comes.
+ */
+function registerContAfterReset(pi: ExtensionAPI): void {
+  pi.registerCommand("cont-after-reset", {
+    description:
+      "Взвести/снять автопродолжение после сброса окна лимита. Без аргумента — взвести, 'off' — снять.",
+    handler: async (args, ctx) => {
+      currentCtx = ctx;
+      try {
+        const key = sessionKeyOf(ctx);
+        armsSwitchKey(key);
+
+        const arg = String(args ?? "").trim().toLowerCase();
+        const wantOff =
+          arg === "off" || arg === "0" || arg === "нет" || arg === "выкл";
+
+        if (wantOff) {
+          const removed = await armsDisarm();
+          stopArmedPoller();
+          ctx.ui.notify(
+            removed
+              ? "cont-after-reset: флаг снят"
+              : "cont-after-reset: флаг не был взведён",
+            "info",
+          );
+          refreshMarker();
+          return;
+        }
+
+        const st = readStateSync();
+        const existing = armsGetArm();
+        const cur = existing ?? (await armsArm(st?.lastResetAt ?? 0));
+        if (!cur) {
+          ctx.ui.notify(
+            "cont-after-reset: не удалось взвести флаг",
+            "error",
+          );
+          return;
+        }
+        ensureArmedPoller();
+        const now = Date.now();
+        const expMins = Math.max(0, Math.ceil((cur.expiresAt - now) / 60_000));
+
+        // Estimate the actual fire moment: window boundary + ~1 min grace.
+        const st2 = readStateSync();
+        let fireMins: number | null = null;
+        if (st2) {
+          const remaining = Math.max(
+            0,
+            st2.windowStartedAt + st2.windowMs - now,
+          );
+          fireMins = Math.max(1, Math.ceil((remaining + RESET_GRACE_MS) / 60_000));
+        }
+
+        const fireText =
+          fireMins === null
+            ? "сработает при сбросе окна"
+            : `сработает при сбросе окна (через ~${fireMins} мин)`;
+        ctx.ui.notify(
+          `cont-after-reset: взведён, ${fireText}. Срок годности флага: до ${new Date(cur.expiresAt).toLocaleTimeString()} (${expMins} мин) — если сброса не будет, флаг сгорит.`,
+          "info",
+        );
+        refreshMarker();
+      } catch (err) {
+        console.warn("pi-billing-window: /cont-after-reset failed:", err);
+      }
+    },
+  });
+}
+
 // --- Extension entrypoint -----------------------------------------------------
 
 export default function (pi: ExtensionAPI): void {
+  // Capture the shared EventBus once per session. The factory is re-invoked
+  // for each session with a fresh `pi`, so eventBus always points at the
+  // live bus for the running session.
+  eventBus = pi.events;
+  // Keep a live ExtensionAPI reference for pi.sendUserMessage (cont-after-reset).
+  piApi = pi;
+
   pi.on("session_start", onSessionStart);
+  pi.on("model_select", onModelSelect);
   pi.on("after_provider_response", onAfterProviderResponse);
   pi.on("session_shutdown", onSessionShutdown);
 
@@ -613,6 +955,7 @@ export default function (pi: ExtensionAPI): void {
   registerBillingTick(pi);
   registerBillingReset(pi);
   registerSettimer(pi);
+  registerContAfterReset(pi);
 
   // Touch renderStatusBar so the import is retained for downstream tools
   // and linters that flag unused imports. The function is also exposed for

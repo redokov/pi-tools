@@ -2,7 +2,7 @@
  * ui.ts -- status bar widget for billing window.
  *
  * Persistent widget in the TUI footer showing a live countdown of the
- * 2-hour billing window. Updates every intervalMs (default 5 min) via
+ * 2-hour billing window. Updates every intervalMs (default 30 s) via
  * ctx.ui.setStatus(key, text).
  *
  * Module-level state (currentInterval, currentCtx, currentKey) is shared so
@@ -12,9 +12,12 @@
  */
 
 import { readStateSync } from "./state.js";
+import { isArmed as isContAfterResetArmed } from "./arms.js";
 
 const DEFAULT_KEY = "billing-window";
-const DEFAULT_INTERVAL_MS = 300_000;
+// 30 s: README/TZ promise a ~30 s refresh, and a 5-min cadence reads as a
+// "frozen" countdown to the user. Cheap enough (one tiny file read per tick).
+const DEFAULT_INTERVAL_MS = 30_000;
 
 let currentInterval: NodeJS.Timeout | null = null;
 let currentCtx: any = null;
@@ -61,11 +64,16 @@ function computeRemainingMs(): number | null {
  * belongs to the wormsoft provider. For any other provider (or when no
  * model is selected) the line is cleared via setStatus(key, undefined).
  */
-function applyStatus(ctx: any, key: string): void {
+function applyStatus(ctx: any, key: string, provider?: string): void {
   if (!ctx || !ctx.ui || typeof ctx.ui.setStatus !== "function") return;
 
-  const provider = ctx.model?.provider;
-  if (provider !== "wormsoft") {
+  // Visibility rule: the status line is only shown when the active model
+  // belongs to the wormsoft provider. `provider` may be passed explicitly
+  // (e.g. from model_select, where ctx.model may not be refreshed yet);
+  // otherwise it is read from the current model. For any other provider (or
+  // when no model is selected) the line is cleared via setStatus(key, undefined).
+  const effectiveProvider = provider ?? ctx.model?.provider;
+  if (effectiveProvider !== "wormsoft") {
     ctx.ui.setStatus(key, undefined);
     return;
   }
@@ -74,7 +82,11 @@ function applyStatus(ctx: any, key: string): void {
   if (remaining === null) {
     ctx.ui.setStatus(key, undefined);
   } else {
-    ctx.ui.setStatus(key, renderStatusBar(remaining));
+    // If this conversation has an active cont-after-reset flag, surface it in
+    // the timer widget so the user can see it is armed.
+    const base = renderStatusBar(remaining);
+    const text = isContAfterResetArmed() ? `${base} [cont-after-reset]` : base;
+    ctx.ui.setStatus(key, text);
   }
 }
 
@@ -82,8 +94,12 @@ function applyStatus(ctx: any, key: string): void {
  * One-shot status push. Useful for commands like /billing-status that want
  * to refresh the footer immediately without waiting for the next tick.
  */
-export function forceUpdate(ctx: any, key: string = DEFAULT_KEY): void {
-  applyStatus(ctx, key);
+export function forceUpdate(
+  ctx: any,
+  key: string = DEFAULT_KEY,
+  provider?: string,
+): void {
+  applyStatus(ctx, key, provider);
 }
 
 /**

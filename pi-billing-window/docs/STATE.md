@@ -120,6 +120,14 @@ const remain = s.windowStartedAt + s.windowMs - Date.now();
 console.log(`${Math.ceil(remain/60000)} мин до reset, calls=${s.callsInWindow}`);
 ```
 
+Проверить взведённые флаги `/cont-after-reset`:
+```js
+const a = JSON.parse(require("fs").readFileSync(process.env.USERPROFILE + "/.pi/agent/pi-billing-window-arms.json", "utf8"));
+for (const [key, arm] of Object.entries(a)) {
+  console.log(key, `armedAt=${new Date(arm.armedAt).toLocaleTimeString()}`, `expires=${new Date(arm.expiresAt).toLocaleTimeString()}`);
+}
+```
+
 Подсчитать «сколько уже использовано» (если известен лимит):
 ```js
 // лимит = 5M токенов / 2ч. callsInWindow — это только число вызовов, не токены.
@@ -134,3 +142,49 @@ rm ~/.pi/agent/pi-billing-window.lock
 ```
 
 При следующем `session_start` расширение создаст новый initial state с `resetCount = 0`.
+
+## 8. Файл флагов автопродолжения (`pi-billing-window-arms.json`)
+
+Файл: **`~/.pi/agent/pi-billing-window-arms.json`** (создаётся при первом взводе `/cont-after-reset`).
+Lockfile: **`~/.pi/agent/pi-billing-window-arms.lock`** (тот же паттерн `proper-lockfile`, что и у state).
+
+### 8.1. Схема
+
+```ts
+type Arm = {
+  armedAt: number;         // ms epoch — момент взвода
+  lastResetAtAtArm: number; // state.lastResetAt на момент взвода;
+                           // срабатывает только сброс, продвинувший lastResetAt дальше
+  expiresAt: number;       // ms epoch = armedAt + ARMS_TTL_MS (2 ч 10 мин)
+};
+
+type ArmMap = Record<string, Arm>; // ключ = файл сессии (или "ephemeral:<pid>")
+```
+
+Пример:
+```json
+{
+  "C:\\Users\\r.edokov\\.pi\\agent\\sessions\\abc-123.jsonl": {
+    "armedAt": 1725000000000,
+    "lastResetAtAtArm": 1724999000000,
+    "expiresAt": 1725007860000
+  }
+}
+```
+
+### 8.2. Жизненный цикл записи
+
+| Событие | Что происходит с записью |
+|---|---|
+| `/cont-after-reset` | Создаётся под ключом текущей сессии (идемпотентно: активную запись не перезаписывает). |
+| Сброс окна + 60 с grace, агент idle | Отправлено `продолжи` → запись удалена (one-shot). |
+| `/cont-after-reset off` | Удалена. |
+| TTL истёк (`expiresAt <= now`) | Игнорируется при чтении; физически вычищается (`pruneExpired`) при следующей записи в файл. |
+| `/new` | **Переносится** на ключ нового разговора (`carryArmTo`). |
+| `/resume` / `/fork` / `/reload` / рестарт процесса | Остаётся на ключе своего разговора; процесс читает запись только когда показывает этот разговор (`switchKey` без переноса). |
+
+### 8.3. Отличия от state-файла
+
+- **Запись и сброс не связаны**: arms-файл не мутирует тикером/tick'ами — только командой и срабатыванием.
+- **Один процесс — одна запись в фокусе**: process держит `currentKey`; чужие записи не трогаются.
+- **Побочные эффекты сброса окна на arms не влияют**: авто-reset, `/billing-reset` и `/settimer 0` пишут только state — флаг в arms видит это через рост `state.lastResetAt` и срабатывает. `/settimer` с `duration > 0` окно только передвигает (`lastResetAt` не трогает) — поэтому флаг от него **не срабатывает** и не сбрасывается.

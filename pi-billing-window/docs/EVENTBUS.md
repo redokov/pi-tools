@@ -27,7 +27,9 @@
 
 ### 1.2. `billing:window_reset`
 
-**Источник:** `src/ticker.ts::checkAndReset` (по истечении окна), `src/index.ts::registerBillingReset` (`/billing-reset`), `src/index.ts::registerSettimer` (`/settimer 0` или когда целевое окно уже истекло).
+**Источник:** `src/ticker.ts::checkAndReset` (по истечении окна), `src/index.ts::registerBillingReset` (`/billing-reset`), `src/index.ts::registerSettimer` (`/settimer 0` — прямой emit в обход дедупа).
+
+> Событие также триггерит срабатывание флага `/cont-after-reset` — но **не через шину**: arms-механизм читает `state.lastResetAt` напрямую из state-файла (см. [`STATE.md`](./STATE.md) §8.3). Так задумано: флаг должен сработать и в тех окнах, которые не подписаны на шину.
 
 **Payload:** полный `State` (см. [`STATE.md`](./STATE.md)):
 ```ts
@@ -47,7 +49,7 @@
 - Дедуп: если с момента предыдущего reset прошло < `DEDUP_WINDOW_MS (10 мин)`, повторный emit не производится.
 
 **Когда слушать:**
-- Расширения, ограничивающие частоту запросов (`wormsoft-rate-limit`).
+- Расширения, ограничивающие частоту запросов или ведущие собственный учёт расхода.
 - Расширения, показывающие пользователю «лимит обновлён» (тосты, баннеры).
 - Бэкенд-аналитика, считающая агрегированный расход.
 
@@ -73,12 +75,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI): void {
-  pi.on("session_start", async (_evt, ctx) => {
-    const bus = (ctx as any).events as {
-      on: (channel: string, handler: (data: unknown) => void) => () => void;
-    };
-    if (!bus) return;
+  // Шина живёт на ExtensionAPI (pi.events), а не на ctx — захватите её
+  // в фабрике расширения, как это делает сам pi-billing-window.
+  const bus = pi.events as
+    | { on: (channel: string, handler: (data: unknown) => void) => () => void }
+    | undefined;
+  if (!bus) return;
 
+  pi.on("session_start", async (_evt, ctx) => {
     const off = bus.on("billing:window_reset", async (raw) => {
       const state = raw as {
         provider: string;
@@ -89,6 +93,7 @@ export default function (pi: ExtensionAPI): void {
       myRateLimiter.reset(state.provider);
     });
     // off() — на session_shutdown
+    // (замыкание: сохраните off в переменной, доступной в session_shutdown)
   });
 }
 ```
@@ -102,6 +107,8 @@ export default function (pi: ExtensionAPI): void {
 | `handleWindowReset` | `src/index.ts` | `ctx.ui.notify` в TUI-режиме (текст: «wormsoft: 2-часовой лимит сброшен…»). |
 | `handleWindowResetForNotify` | `src/index.ts` | HTTP POST в `pi-remote` (`/api/notify`) для браузерных клиентов. |
 | `handleAboutToReset` | `src/index.ts` | Пока no-op (заглушка, чтобы канал точно был «подключен»). |
+
+> Механизм `/cont-after-reset` слушает шину **намеренно не использует** — он детектирует сброс по `state.lastResetAt` из общего state-файла, чтобы работать во всех окнах pi независимо от порядка загрузки расширений (см. §1.2 и [`ARCHITECTURE.md`](./ARCHITECTURE.md) §5).
 
 ## 4. Контракт стабильности
 
