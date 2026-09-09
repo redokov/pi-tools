@@ -42,6 +42,10 @@ index.ts ──── оркестратор: хуки (session_start, model_sel
   │
   ├── parser.ts ──── parseDuration("1h30m"/"60"/"90m") для /settimer.
   │
+  ├── history.ts ─── append-only CSV-история (вызовы с usage токенов, сбросы)
+  │                  в ~/.pi/agent/pi-billing-window-history.csv (общий на
+  │                  все окна). Отчёт: scripts/billing_report.py.
+  │
   └── notifier.ts ── fire-and-forget POST на pi-remote /api/notify,
                      никогда не бросает.
 ```
@@ -103,10 +107,14 @@ C:\Tools\pi-billing-window\
 │   ├── ticker.ts          # 5-минутный цикл проверки окна
 │   ├── ui.ts              # setStatus-виджет в TUI footer
 │   ├── parser.ts          # parseDuration / formatDuration
+│   ├── history.ts         # append-only CSV-история вызовов/сбросов
 │   └── notifier.ts        # HTTP POST в pi-remote
+├── scripts/
+│   └── billing_report.py  # MD-отчёт из history.csv (по проектам/суммарно)
 ├── tests/
 │   ├── test.mts           # unit-тесты (state, ticker, ui, parser, notifier)
-│   └── arms.test.mts      # unit-тесты флагов /cont-after-reset
+│   ├── arms.test.mts      # unit-тесты флагов /cont-after-reset
+│   └── history.test.mts   # unit-тесты CSV-истории
 ├── docs/
 │   ├── ARCHITECTURE.md    # подробный разбор модулей и потоков
 │   ├── EVENTBUS.md        # контракт шины событий и подписчики
@@ -141,6 +149,7 @@ npx tsc -p tsconfig.json
 ```powershell
 npx tsx tests/test.mts
 npx tsx tests/arms.test.mts
+npx tsx tests/history.test.mts
 ```
 
 Покрытие (тесты лежат в `tests/test.mts`):
@@ -152,6 +161,9 @@ npx tsx tests/arms.test.mts
 
 Покрытие `tests/arms.test.mts`:
 - `arms.ts` — взвод/снятие/идемпотентность, TTL и prune, перенос флага при `/new` (`carryArmTo`), переключение ключа без переноса (`switchKey`), `resetReadyToFire` (граница grace, срабатывание только после взвода), атомарность записи
+
+Покрытие `tests/history.test.mts`:
+- `history.ts` — создание файла (BOM + заголовок ровно один раз), append строк, RFC 4180-эскейп (запятые/кавычки/переносы), `isoLocal` (локальный offset), 5 параллельных аппендов без потери строк (лок), ретеншн-трим (граница 30 дней, идемпотентность), отказоустойчивость (невалидный путь → false/0 без throw), `resetPaths`
 
 ### 6.4. Установка / переустановка в pi
 
@@ -195,7 +207,7 @@ New-Item -ItemType SymbolicLink `
 
 ## 8. Дальнейшие шаги (roadmap)
 
-- [ ] История `callsInWindow` по минутам (CSV/MD-дамп) — для последующего анализа.
+- [x] История `callsInWindow` по минутам (CSV/MD-дамп) — реализовано, см. §8b.
 
 ---
 
@@ -233,6 +245,31 @@ New-Item -ItemType SymbolicLink `
 Заметка: расширение `wormsoft-rate-limit` удалено — его роль (детекция 429 и
 собственный авто-`продолжи` по `+2ч`) не работала корректно и заменена этой
 функцией, привязанной к реальному сбросу окна.
+
+---
+
+## 8b. История вызовов (`history.csv`) и отчёт
+
+Каждое значимое событие дописывается строкой в **общий** файл `~/.pi/agent/pi-billing-window-history.csv` (один на все окна pi: лимит wormsoft аккаунтный, поэтому аналитика и по проектам, и суммарная):
+
+| Событие | kind |
+|---|---|
+| Успешный вызов wormsoft | `call` — с usage последнего ответа (input/output/cache-токены), если провайдер их отдаёт |
+| Авто-reset | `window_reset` (note=`auto`) |
+| `/billing-reset` | `manual_reset` |
+| `/settimer` | `window_reset` (note=`settimer 0`) или `settimer` (note=`sync …`) |
+
+Проект — колонка `project` (полный cwd сессии), агент в той же папке различается колонкой `session`. Запись под локом (безопасно для нескольких процессов), UTF-8 + BOM (кириллица в Excel), ретеншн 30 дней (трим на старте сессии). Сбой истории никогда не влияет на счёт/сбросы/уведомления.
+
+Отчёт (MD): по требованию, из каталога разработки:
+
+```bash
+python scripts/billing_report.py                              # всё за 30 дней
+python scripts/billing_report.py --project Комус --days 7     # один проект (хвост пути, регистронезависимо)
+python scripts/billing_report.py --days 0 --out report.md     # в файл
+```
+
+Скрипт восстанавливает окна по инкрементам `reset_count` и показывает: суммарный burn, окна каждого проекта (старт, вызовы, токены, «сколько минут прожило до исчерпания»), пиковые минуты.
 
 ---
 

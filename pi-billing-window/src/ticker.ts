@@ -12,6 +12,7 @@
  */
 
 import { mutateState, type State } from "./state.js";
+import { appendHistory } from "./history.js";
 
 export const TICK_MS = 5 * 60 * 1000;
 export const ABOUT_TO_RESET_MS = 5 * 60 * 1000;
@@ -19,7 +20,13 @@ export const DEDUP_WINDOW_MS = 10 * 60 * 1000;
 
 export type EmitFn = (event: string, payload: unknown) => void;
 
-export async function checkAndReset(emit: EmitFn): Promise<boolean> {
+/** Project/session attribution for history rows (optional). */
+export type HistoryMeta = { project?: string; session?: string };
+
+export async function checkAndReset(
+  emit: EmitFn,
+  meta?: HistoryMeta,
+): Promise<boolean> {
   try {
     let didReset = false;
     let aboutToReset: { provider: string; msRemaining: number } | null = null;
@@ -66,6 +73,16 @@ export async function checkAndReset(emit: EmitFn): Promise<boolean> {
       // the new windowStartedAt / resetCount / etc.
       const fresh = (await import("./state.js")).readStateSync();
       emit("billing:window_reset", fresh);
+      // Passive observer: auto reset row into the shared history CSV.
+      // fire-and-forget; appendHistory never throws.
+      void appendHistory({
+        kind: "window_reset",
+        project: meta?.project,
+        session: meta?.session,
+        callsInWindow: fresh?.callsInWindow,
+        resetCount: fresh?.resetCount,
+        note: "auto",
+      });
     } else if (aboutToReset !== null) {
       emit("billing:window_about_to_reset", aboutToReset);
     }

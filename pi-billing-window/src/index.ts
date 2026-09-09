@@ -45,6 +45,11 @@ import {
 import { parseDuration, formatDuration } from "./parser.js";
 import { sendNotify } from "./notifier.js";
 import {
+  appendHistory,
+  trimHistory,
+  type HistoryUsage,
+} from "./history.js";
+import {
   switchKey as armsSwitchKey,
   carryArmTo as armsCarryArmTo,
   arm as armsArm,
@@ -160,6 +165,68 @@ function sessionKeyOf(ctx: ExtensionContext | null): string {
   return typeof f === "string" && f.length > 0 ? f : `ephemeral:${process.pid}`;
 }
 
+// --- history.ts helpers -------------------------------------------------------
+
+const num = (v: unknown): number | undefined =>
+  typeof v === "number" && Number.isFinite(v) ? v : undefined;
+
+/**
+ * Project/session attribution for history rows. Project = full session cwd
+ * (per-project grouping is a report-time concern, not a write-time one);
+ * session = basename of the session file so two agents in the same cwd are
+ * still distinguishable.
+ */
+function historyMetaOf(ctx: ExtensionContext | null): {
+  project: string;
+  session: string;
+} {
+  const cwd = ctx?.sessionManager?.getCwd?.();
+  const key = sessionKeyOf(ctx);
+  const session =
+    key.startsWith("ephemeral:") ? key : key.split(/[\\/]/).pop() ?? key;
+  return {
+    project: typeof cwd === "string" ? cwd : "",
+    session,
+  };
+}
+
+/**
+ * Usage of the LAST assistant response, read from the in-memory session
+ * (pi-ai Usage: input/output/cacheRead/cacheWrite). The hook payload itself
+ * carries only {status, headers}, so this is the cheapest way to get real
+ * token burn. Returns null when unavailable (e.g. provider did not report
+ * usage) -- history rows then leave the token columns empty.
+ */
+function lastAssistantUsage(ctx: ExtensionContext | null): HistoryUsage | null {
+  try {
+    const entries = ctx?.sessionManager?.getEntries?.() as
+      | Array<{
+          type?: string;
+          message?: { role?: string; usage?: Record<string, unknown> };
+        }>
+      | undefined;
+    if (!Array.isArray(entries)) return null;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i];
+      if (e?.type !== "message" || !e.message) continue;
+      if (e.message.role !== "assistant") continue;
+      const u = e.message.usage;
+      if (u && typeof u === "object") {
+        return {
+          input: num(u.input),
+          output: num(u.output),
+          cacheRead: num(u.cacheRead),
+          cacheWrite: num(u.cacheWrite),
+        };
+      }
+      return null;
+    }
+  } catch {
+    // Session manager unavailable (early startup / rpc) -- no usage, no drama.
+  }
+  return null;
+}
+
 /** Force a footer refresh so the armed indicator appears/disappears promptly. */
 function refreshMarker(): void {
   if (currentCtx?.mode === "tui") {
@@ -227,13 +294,13 @@ async function evaluateArmedReset(): Promise<void> {
   if (st.lastResetAt <= arm.lastResetAtAtArm) {
     const msToBoundary = st.windowStartedAt + st.windowMs - now;
     if (msToBoundary <= 0) {
-      void checkAndReset(buildEmitFn()).then(() => {
+      void checkAndReset(buildEmitFn(), historyMetaOf(currentCtx)).then(() => {
         void evaluateArmedReset();
       });
     } else if (!boundaryResetTimer) {
       boundaryResetTimer = setTimeout(() => {
         boundaryResetTimer = null;
-        void checkAndReset(buildEmitFn()).then(() => {
+        void checkAndReset(buildEmitFn(), historyMetaOf(currentCtx)).then(() => {
           void evaluateArmedReset();
         });
       }, msToBoundary + 500);
@@ -495,11 +562,13 @@ async function onSessionStart(
       // Window already expired while pi was off. Let the ticker machinery
       // reset it -- this also fires billing:window_reset which our listener
       // will pick up and turn into a notify().
-      await checkAndReset(buildEmitFn());
+      await checkAndReset(buildEmitFn(), historyMetaOf(ctx));
     }
     // Refresh the status bar after a possible reset so the fresh countdown
     // is visible right away.
     forceUpdateStatus(ctx);
+    // Trim history rows older than RETENTION_DAYS (cheap: file is tiny).
+    void trimHistory();
   } catch (err) {
     console.warn(
       "pi-billing-window: state init on session_start failed:",
@@ -593,6 +662,19 @@ async function onAfterProviderResponse(
     });
   }
 
+  // History: one row per successful call with real token usage when the
+  // provider reports it. Fire-and-forget; never throws.
+  const meta = historyMetaOf(ctx);
+  const fresh = readStateSync();
+  void appendHistory({
+    kind: "call",
+    project: meta.project,
+    session: meta.session,
+    callsInWindow: fresh?.callsInWindow,
+    resetCount: fresh?.resetCount,
+    usage: lastAssistantUsage(ctx),
+  });
+
   // Refresh the status bar so the callsInWindow counter and any freshly
   // started countdown reflect the new state without waiting for the
   // 30-second ui.ts interval.
@@ -603,7 +685,7 @@ async function onAfterProviderResponse(
   // A long-running call could have crossed the window boundary. checkAndReset
   // is idempotent and dedups via lastResetAt, so calling it here is safe and
   // handles the edge case without waiting up to TICK_MS for the next tick.
-  await checkAndReset(emit);
+  await checkAndReset(emit, meta);
 }
 
 /**
@@ -688,7 +770,7 @@ function registerBillingTick(pi: ExtensionAPI): void {
           // ignore -- payload may not be JSON-serializable
         }
       };
-      const result = await checkAndReset(emit);
+      const result = await checkAndReset(emit, historyMetaOf(ctx));
       ctx.ui.notify(
         result ? "Тик: reset произошёл" : "Тик: reset не произошёл",
         "info",
@@ -738,6 +820,15 @@ function registerBillingReset(pi: ExtensionAPI): void {
           bus.emit("billing:window_reset", fresh);
         } catch {}
       }
+      // History: manual reset row.
+      const meta = historyMetaOf(ctx);
+      void appendHistory({
+        kind: "manual_reset",
+        project: meta.project,
+        session: meta.session,
+        callsInWindow: fresh?.callsInWindow,
+        resetCount: fresh?.resetCount,
+      });
     },
   });
 }
@@ -815,6 +906,16 @@ function registerSettimer(pi: ExtensionAPI): void {
             eventBus.emit("billing:window_reset", fresh);
           } catch {}
         }
+        // History: /settimer 0 performs a real reset.
+        const meta = historyMetaOf(ctx);
+        void appendHistory({
+          kind: "window_reset",
+          project: meta.project,
+          session: meta.session,
+          callsInWindow: fresh?.callsInWindow,
+          resetCount: fresh?.resetCount,
+          note: "settimer 0",
+        });
       } else {
         // Sync the countdown to the given remaining time: pick a
         // windowStartedAt that leaves durationMs of life in the window.
@@ -844,6 +945,17 @@ function registerSettimer(pi: ExtensionAPI): void {
               firstCallEmittedAt: undefined,
             },
           };
+        });
+        // History: timer sync row (no reset happened; lastResetAt untouched).
+        const meta = historyMetaOf(ctx);
+        const fresh2 = readStateSync();
+        void appendHistory({
+          kind: "settimer",
+          project: meta.project,
+          session: meta.session,
+          callsInWindow: fresh2?.callsInWindow,
+          resetCount: fresh2?.resetCount,
+          note: `sync ${formatDuration(durationMs)}`,
         });
       }
 

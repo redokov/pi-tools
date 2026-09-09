@@ -188,3 +188,48 @@ type ArmMap = Record<string, Arm>; // ключ = файл сессии (или "
 - **Запись и сброс не связаны**: arms-файл не мутирует тикером/tick'ами — только командой и срабатыванием.
 - **Один процесс — одна запись в фокусе**: process держит `currentKey`; чужие записи не трогаются.
 - **Побочные эффекты сброса окна на arms не влияют**: авто-reset, `/billing-reset` и `/settimer 0` пишут только state — флаг в arms видит это через рост `state.lastResetAt` и срабатывает. `/settimer` с `duration > 0` окно только передвигает (`lastResetAt` не трогает) — поэтому флаг от него **не срабатывает** и не сбрасывается.
+
+## 9. Файл истории (`pi-billing-window-history.csv`)
+
+Файл: **`~/.pi/agent/pi-billing-window-history.csv`** (создаётся при первом событии, с BOM — чтобы Excel показывал кириллицу). Lockfile: **`~/.pi/agent/pi-billing-window-history.lock`**.
+
+**Один файл на все pi-процессы** (лимит аккаунтный): проект — колонка, а не отдельный файл. Append под локом; трим строк старше 30 дней на `session_start`.
+
+### 9.1. Схема
+
+```csv
+ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count,input,output,cache_read,cache_write,note
+2026-09-12T14:03:21+03:00,1789283001000,call,c:\Tools,a1b2c3.jsonl,12,3,14500,3200,890000,0,
+2026-09-12T15:57:00+03:00,1789289820000,window_reset,c:\Tools,a1b2c3.jsonl,0,4,,,,,auto
+```
+
+| Колонка | Что значит |
+|---|---|
+| `ts_iso` / `epoch_ms` | Момент события (локальный ISO с offset / ms epoch) |
+| `kind` | `call` \| `window_reset` (note: `auto`, `settimer 0`) \| `manual_reset` \| `settimer` (note: `sync …`) |
+| `project` | Полный cwd сессии (у reset-строк — cwd процесса, выполнившего reset) |
+| `session` | Basename файла сессии (различает агентов в одной папке; `ephemeral:<pid>` в headless) |
+| `input/output/cache_read/cache_write` | Usage последнего ответа (если провайдер отдал; иначе пусто) |
+| `note` | Свободное поле (RFC 4180-эскейп) |
+
+### 9.2. Кто пишет
+
+| Событие | kind |
+|---|---|
+| Успешный вызов wormsoft (`after_provider_response`) | `call` |
+| Авто-reset (`checkAndReset`) | `window_reset`, note=`auto` |
+| `/billing-reset` | `manual_reset` |
+| `/settimer 0` | `window_reset`, note=`settimer 0` |
+| `/settimer N>0` | `settimer`, note=`sync …` |
+
+### 9.3. Анализ
+
+`scripts/billing_report.py` (в каталоге разработки): MD-отчёт — суммарный burn по всем проектам + секция на проект, окна восстанавливаются по инкрементам `reset_count`, пиковые минуты. Фильтры: `--project <хвост пути>` (регистронезависимо, кириллица ок), `--days N`, `--out report.md`.
+
+```bash
+python scripts/billing_report.py --project Комус --days 7 --out report.md
+```
+
+### 9.4. Отказоустойчивость
+
+Любая ошибка записи/трима — warn в лог, `appendHistory → false`, работа расширения не меняется. Ретеншн-трим: дроп строк с `epoch_ms < now − 30 дней` под тем же локом.
