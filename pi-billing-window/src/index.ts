@@ -142,15 +142,21 @@ let piApi: ExtensionAPI | null = null;
 
 /**
  * Periodic poller that drives cont-after-reset detection while the current
- * conversation is armed. Deliberately NOT cleared on session_shutdown so the
- * armed flag survives /new (module state persists across /new).
+ * conversation is armed. The armed FLAG survives /new (it is file-backed in
+ * arms.ts and re-adopted in session_start); this timer does NOT -- it closes
+ * over this session's captured pi/ctx, which pi invalidates on session
+ * replacement (new/fork/switch/reload). session_shutdown therefore stops it,
+ * and session_start restarts it against the fresh references when the arm
+ * is still active. Using the captured pi after replacement throws
+ * "extension ctx is stale" (docs: Session replacement lifecycle and footguns).
  */
 let armedPollTimer: NodeJS.Timeout | null = null;
 
 /**
  * One-shot timer that forces checkAndReset() at the true 2h boundary while a
  * conversation is armed, so the reset (and thus the "продолжи") does not have
- * to wait up to the 5-minute tick.
+ * to wait up to the 5-minute tick. Cleared together with the poller on
+ * session_shutdown for the same staleness reason.
  */
 let boundaryResetTimer: NodeJS.Timeout | null = null;
 
@@ -719,6 +725,12 @@ function onSessionShutdown(_event: unknown, _ctx: ExtensionContext): void {
     } catch {}
     stopStatusFn = null;
   }
+  // cont-after-reset: stop timers that close over this session's captured
+  // pi/ctx. The armed flag itself lives in arms.ts (file-backed) and is
+  // re-adopted by session_start, which restarts the poller with fresh refs.
+  // Keeping these timers alive past replacement left them calling
+  // piApi.sendUserMessage() on a stale pi -> "extension ctx is stale" spam.
+  stopArmedPoller();
   // We deliberately do NOT clear currentCtx -- a fresh session_start will
   // overwrite it, and clearing it here would lose any pending notifications.
 }

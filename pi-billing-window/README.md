@@ -114,7 +114,8 @@ C:\Tools\pi-billing-window\
 ├── tests/
 │   ├── test.mts           # unit-тесты (state, ticker, ui, parser, notifier)
 │   ├── arms.test.mts      # unit-тесты флагов /cont-after-reset
-│   └── history.test.mts   # unit-тесты CSV-истории
+│   ├── history.test.mts   # unit-тесты CSV-истории
+│   └── lifecycle.test.mts # регресс-тесты замены сессии (stale ctx, cont-after-reset)
 ├── docs/
 │   ├── ARCHITECTURE.md    # подробный разбор модулей и потоков
 │   ├── EVENTBUS.md        # контракт шины событий и подписчики
@@ -150,6 +151,7 @@ npx tsc -p tsconfig.json
 npx tsx tests/test.mts
 npx tsx tests/arms.test.mts
 npx tsx tests/history.test.mts
+npx tsx tests/lifecycle.test.mts
 ```
 
 Покрытие (тесты лежат в `tests/test.mts`):
