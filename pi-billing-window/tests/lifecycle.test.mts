@@ -18,7 +18,7 @@
  * session_start/session_shutdown wiring is exercised end-to-end.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -118,7 +118,7 @@ function makeCtx(sessionFile: string): unknown {
   return {
     mode: "tui",
     isIdle: () => true,
-    model: { provider: "wormsoft" },
+    model: { provider: "wormsoft", id: "test/model-1" },
     ui: {
       notify: () => {},
       setStatus: () => {},
@@ -190,6 +190,12 @@ function commandOf(
 }
 
 // --- tests --------------------------------------------------------------------
+
+/**
+ * Stale-pi resilience (the exact error from the field report): the send is
+ * attempted and REJECTED with pi's stale-ctx error. The arm must survive so
+ * a healthy instance can retry, and the failure must not crash the poller.
+ */
 
 /**
  * Regression for the reported failure: arm a conversation, let a reset
@@ -268,11 +274,6 @@ async function testReplacementRefires(): Promise<void> {
   }
 }
 
-/**
- * Stale-pi resilience (the exact error from the field report): the send is
- * attempted and REJECTED with pi's stale-ctx error. The arm must survive so
- * a healthy instance can retry, and the failure must not crash the poller.
- */
 async function testStaleSendKeepsArm(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-stale-"));
   applyPaths(tmp);

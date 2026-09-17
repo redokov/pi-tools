@@ -5,6 +5,7 @@ Reads ~/.pi/agent/pi-billing-window-history.csv (UTF-8 with BOM) written by
 the pi-billing-window extension and renders a Markdown report:
 
   - total burn across ALL projects (the wormsoft limit is account-wide),
+  - per-model breakdown (the `model` column; legacy rows -> `(no model)`),
   - one section per project (grouped by the `project` column),
   - per-window rows (a window = rows between reset_count increments),
   - peak minutes (60s buckets of token burn).
@@ -90,6 +91,7 @@ def load_rows(path, days):
                     "output": _int(r.get("output")),
                     "cache_read": _int(r.get("cache_read")),
                     "cache_write": _int(r.get("cache_write")),
+                    "model": (r.get("model") or "").strip(),
                 }
             )
     rows.sort(key=lambda x: x["epoch"])
@@ -125,15 +127,16 @@ def split_windows(rows):
     cur = None
     last_reset = None
     for r in rows:
-        if last_reset is None or r["reset"] > last_reset:
+        rst = r["reset"] or 0  # empty reset_count cell -> 0 (None-safe)
+        if last_reset is None or rst > last_reset:
             if cur:
                 windows.append(cur)
-            cur = {"start": r, "rows": [r], "reset": r["reset"]}
+            cur = {"start": r, "rows": [r], "reset": rst}
         else:
             if cur is None:
-                cur = {"start": r, "rows": [], "reset": r["reset"]}
+                cur = {"start": r, "rows": [], "reset": rst}
             cur["rows"].append(r)
-        last_reset = r["reset"] if r["reset"] is not None else last_reset
+        last_reset = rst
     if cur:
         windows.append(cur)
     return windows
@@ -168,6 +171,40 @@ def window_stats(w):
     }
 
 
+def render_per_model(rows):
+    """MD table: model x calls x input/output/cacheR/cacheW x total (kind=call only).
+
+    Aggregates in a single pass over the (already filtered) rows; empty or
+    missing model (legacy rows, resets without a model) -> one `(no model)`
+    group. Sorted by total tokens, descending.
+    """
+    agg = {}  # model -> [calls, input, output, cache_read, cache_write, total]
+    for r in rows:
+        if r["kind"] != "call":
+            continue
+        m = r["model"] or "(no model)"
+        a = agg.setdefault(m, [0, 0, 0, 0, 0, 0])
+        a[0] += 1
+        a[1] += r["input"]
+        a[2] += r["output"]
+        a[3] += r["cache_read"]
+        a[4] += r["cache_write"]
+        a[5] += tokens(r)
+    if not agg:
+        return ""  # no call rows -> no "## By model" section at all
+    out = ["## By model", ""]
+    out.append("| model | calls | input | output | cacheR | cacheW | total |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|")
+    for m in sorted(agg.keys(), key=lambda k: -agg[k][5]):
+        a = agg[m]
+        out.append(
+            "| %s | %d | %s | %s | %s | %s | %s |"
+            % (m, a[0], fmt_k(a[1]), fmt_k(a[2]), fmt_k(a[3]), fmt_k(a[4]), fmt_k(a[5]))
+        )
+    out.append("")
+    return "\n".join(out)
+
+
 def render(rows, title):
     out = []
     out.append("# Wormsoft billing report: %s" % title)
@@ -197,6 +234,10 @@ def render(rows, title):
             )
         )
     out.append("")
+
+    # ---- by model (call rows only; empty model -> `(no model)`) ----
+    if all_calls:
+        out.append(render_per_model(rows))
 
     # ---- per project (key = lowercased path: Windows paths are case-insensitive;
     # display label = the first casing encountered) ----

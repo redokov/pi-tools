@@ -33,6 +33,8 @@ $files = @(
     "ui.ts",
     "parser.ts",
     "notifier.ts",
+    "history.ts",
+    "arms.ts",
     "package.json"
 )
 

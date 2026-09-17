@@ -51,6 +51,8 @@ export type HistoryRow = {
   project?: string;
   /** Basename of the session file (distinguishes agents in the same cwd). */
   session?: string;
+  /** ctx.model.id for "call" rows; other kinds leave it empty. */
+  model?: string;
   callsInWindow?: number;
   resetCount?: number;
   usage?: HistoryUsage | null;
@@ -61,6 +63,11 @@ export type HistoryRow = {
 export const RETENTION_DAYS = 30;
 
 const HEADER =
+  "ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count," +
+  "input,output,cache_read,cache_write,note,model";
+
+/** Pre-model 12-column header; used only to detect and upgrade legacy files. */
+const LEGACY_HEADER =
   "ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count," +
   "input,output,cache_read,cache_write,note";
 
@@ -139,6 +146,7 @@ function buildRow(row: HistoryRow, now: number): string {
     u.cacheRead ?? "",
     u.cacheWrite ?? "",
     row.note ?? "",
+    row.model ?? "",
   ];
   return cells.map(csvEscape).join(",");
 }
@@ -158,10 +166,63 @@ async function withHistoryLock<T>(fn: () => T): Promise<T> {
   }
 }
 
-/** Create the file with BOM + header if it does not exist yet. Caller holds the lock. */
-function ensureFileLocked(): void {
-  if (fs.existsSync(historyFile)) return;
-  fs.writeFileSync(historyFile, "﻿" + HEADER + "\n", "utf8");
+/**
+ * Ensure the file exists AND carries the current schema. Caller holds the lock.
+ *
+ * - Missing file: create with BOM + HEADER.
+ * - Legacy 12-column header (pre-model): one-time migration to the 13-column
+ *   HEADER. Only the first line is replaced; data rows are copied untouched
+ *   (old rows stay positionally valid: model is the LAST column). The rewrite
+ *   goes through a tmp file + renameSync (same pattern as state.ts), so a
+ *   crash mid-migration leaves either the old or the new file, never a mix.
+ * - Current header: no-op (idempotent).
+ * - Foreign header: warn and leave the file alone (fire-and-forget policy).
+ */
+function ensureSchemaLocked(): void {
+  if (!fs.existsSync(historyFile)) {
+    fs.writeFileSync(historyFile, "\uFEFF" + HEADER + "\n", "utf8");
+    return;
+  }
+  const raw = fs.readFileSync(historyFile, "utf8");
+  // Detect the file's EOL style BEFORE rewriting, so a CRLF legacy file stays
+  // uniformly CRLF after migration (header and data rows share one EOL).
+  const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+  const lines = raw
+    .split("\n")
+    .map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+  const first = (lines[0] ?? "").replace(/^\uFEFF/, "");
+  if (first === HEADER) return; // already current schema
+  if (first !== LEGACY_HEADER) {
+    console.warn(
+      "pi-billing-window: unrecognized history header, skipping schema " +
+        "migration; rows will still be APPENDED to this file with its " +
+        "foreign header, so columns may not line up with the expected schema",
+    );
+    return;
+  }
+  const hadBom = (lines[0] ?? "").startsWith("\uFEFF");
+  lines[0] = (hadBom ? "\uFEFF" : "") + HEADER;
+  const tmp = historyFile + ".tmp." + process.pid;
+  try {
+    fs.writeFileSync(tmp, lines.join(eol), "utf8");
+    fs.renameSync(tmp, historyFile);
+  } finally {
+    // Never leave an orphan .tmp behind (rename may have failed midway).
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // already renamed away or never written -- nothing to clean up
+    }
+  }
+}
+
+function detectEol(): string {
+  try {
+    const raw = fs.readFileSync(historyFile, "utf8");
+    return raw.includes("\r\n") ? "\r\n" : "\n";
+  } catch {
+    return "\n";
+  }
 }
 
 /**
@@ -174,8 +235,8 @@ export async function appendHistory(
   try {
     const line = buildRow(row, now);
     await withHistoryLock(() => {
-      ensureFileLocked();
-      fs.appendFileSync(historyFile, line + "\n", "utf8");
+      ensureSchemaLocked();
+      fs.appendFileSync(historyFile, line + detectEol(), "utf8");
     });
     return true;
   } catch (err) {

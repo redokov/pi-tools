@@ -67,6 +67,12 @@ async function main(): Promise<void> {
       raw1.slice(1).startsWith("ts_iso,epoch_ms,kind,project,session,"),
       "append: header row is correct",
     );
+    assert(
+      raw1.slice(1).split("\n")[0] ===
+        "ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count," +
+        "input,output,cache_read,cache_write,note,model",
+      "schema: first line (after BOM) is the 13-column header with model last",
+    );
     assert(rows().length === 2, "append: BOM+header + 1 row after first append");
 
     await appendHistory(
@@ -76,12 +82,12 @@ async function main(): Promise<void> {
     assert(rows().length === 3, "append: second append adds exactly one row");
     const second = rows()[2];
     assert(
-      second.includes(",window_reset,") && second.endsWith(",auto"),
-      "append: reset row has kind and note",
+      second.includes(",window_reset,") && second.endsWith(",auto,"),
+      "append: reset row has kind and note with empty model cell",
     );
     assert(
-      (second.match(/,/g) ?? []).length >= 11,
-      "append: reset row has empty project/session/usage cells",
+      (second.match(/,/g) ?? []).length === 12,
+      "schema: reset row has 13 cells (12 commas), empty model",
     );
 
     // --- csv escaping -------------------------------------------------------
@@ -147,6 +153,216 @@ async function main(): Promise<void> {
       "trim: second run is a no-op (0 dropped)",
     );
     setPaths(file, lock); // restore for later asserts
+
+    // --- model column: call rows (FR-001) ------------------------------------
+    const okModel = await appendHistory(
+      { ...base, model: "zai/glm-5.3" },
+      1_000_004_000_000,
+    );
+    assert(okModel === true, "model: append with model returns true");
+    assert(
+      rows().at(-1)!.endsWith(",zai/glm-5.3"),
+      "model: call row ends with the model id",
+    );
+    await appendHistory({ ...base, model: undefined }, 1_000_004_000_001);
+    assert(
+      rows().at(-1)!.endsWith(","),
+      "model: call row without model ends with empty 13th cell",
+    );
+
+    // --- model column: escaping (RFC 4180, shared csvEscape) ----------------
+    await appendHistory(
+      { ...base, model: 'a,b"c' },
+      1_000_004_000_002,
+    );
+    assert(
+      rows().at(-1)!.includes('"a,b""c"'),
+      "model: comma/quote in model is escaped per RFC 4180",
+    );
+
+    // --- trim on the new 13-column format -------------------------------------
+    const fileM = join(tmp, "trim-model.csv");
+    const lockM = join(tmp, "trim-model.lock");
+    setPaths(fileM, lockM);
+    await appendHistory(
+      { ...base, model: "zai/glm-5.3", note: "keep-model" },
+      now - 1 * day,
+    );
+    await appendHistory(
+      { ...base, model: "zai/glm-5.3", note: "drop-model" },
+      now - (RETENTION_DAYS + 1) * day,
+    );
+    const droppedM = await trimHistory(now);
+    const trimModelLines = fs
+      .readFileSync(fileM, "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "");
+    assert(droppedM === 1, "trim-model: reports 1 dropped row");
+    assert(
+      trimModelLines.length === 2 &&
+        trimModelLines[0]!.endsWith(",note,model") &&
+        trimModelLines[1]!.endsWith(",zai/glm-5.3"),
+      "trim-model: header preserved as-is, kept row keeps its model",
+    );
+    setPaths(file, lock); // restore for later asserts
+
+    // --- migration: legacy 12-column header (D-102) ---------------------------
+    const LEGACY =
+      "ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count," +
+      "input,output,cache_read,cache_write,note";
+    const legacyRows = [
+      "2026-09-01T10:00:00+03:00,1756717200000,call,c:/p,s.jsonl,3,1,10,20,30,0,note1",
+      "2026-09-02T10:00:00+03:00,1756803600000,call,c:/p,s.jsonl,4,1,11,21,31,0,note2",
+    ];
+    const legacyFile = join(tmp, "legacy.csv");
+    const legacyLock = join(tmp, "legacy.lock");
+    fs.writeFileSync(
+      legacyFile,
+      "\uFEFF" + LEGACY + "\n" + legacyRows.join("\n") + "\n",
+      "utf8",
+    );
+    setPaths(legacyFile, legacyLock);
+    const okMig = await appendHistory(base, 1_000_005_000_000);
+    assert(okMig === true, "migration: append to legacy file returns true");
+    const migLines = fs.readFileSync(legacyFile, "utf8").split("\n");
+    assert(
+      migLines[0] ===
+        "\uFEFF" +
+        "ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count," +
+        "input,output,cache_read,cache_write,note,model",
+      "migration: header upgraded to 13 columns, BOM preserved",
+    );
+    assert(
+      migLines[1] === legacyRows[0] && migLines[2] === legacyRows[1],
+      "migration: old rows preserved byte-for-byte",
+    );
+    assert(
+      (migLines[3]!.match(/,/g) ?? []).length === 12,
+      "migration: new row has 13 cells",
+    );
+    const okMig2 = await appendHistory(base, 1_000_005_000_001);
+    assert(okMig2 === true, "migration: second append returns true");
+    const migLines2 = fs.readFileSync(legacyFile, "utf8").split("\n");
+    assert(
+      migLines2.length === 6 &&
+        migLines2[0] === migLines[0] &&
+        migLines2[1] === legacyRows[0] &&
+        migLines2[2] === legacyRows[1] &&
+        migLines2.filter((l) => l.trim() !== "").length === 5,
+      "migration: idempotent -- second append adds a row, header/old rows untouched",
+    );
+
+    // --- migration: CRLF legacy file stays uniformly CRLF (F1) ---------------
+    const crlfFile = join(tmp, "legacy-crlf.csv");
+    const crlfLock = join(tmp, "legacy-crlf.lock");
+    fs.writeFileSync(
+      crlfFile,
+      "\uFEFF" + LEGACY + "\r\n" + legacyRows.join("\r\n") + "\r\n",
+      "utf8",
+    );
+    setPaths(crlfFile, crlfLock);
+    const okCrlf = await appendHistory(base, 1_000_006_500_000);
+    assert(okCrlf === true, "migration-crlf: append returns true");
+    const crlfRaw = fs.readFileSync(crlfFile, "utf8");
+    const crlfParts = crlfRaw.split("\r\n");
+    assert(
+      !crlfParts.some((p) => p.includes("\n")),
+      "migration-crlf: no bare-LF separators left (file uniformly CRLF)",
+    );
+    assert(
+      crlfParts[0] === "\uFEFF" +
+        "ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count," +
+        "input,output,cache_read,cache_write,note,model",
+      "migration-crlf: header upgraded, BOM preserved",
+    );
+    assert(
+      crlfParts[1] === legacyRows[0] && crlfParts[2] === legacyRows[1],
+      "migration-crlf: old row contents unchanged (byte-for-byte sans EOL)",
+    );
+    assert(
+      crlfParts.filter((l) => l.trim() !== "").length === 4,
+      "migration-crlf: header + 2 old + 1 new line",
+    );
+    assert(
+      fs.readdirSync(tmp).filter((f) => f.includes(".tmp.")).length === 0,
+      "migration-crlf: no orphan .tmp file after successful migration",
+    );
+
+    // --- migration: failed rename leaves no orphan .tmp (F2) ------------------
+    // Read-only destination makes renameSync(tmp, file) fail with EPERM on
+    // Windows -- a real mid-migration failure without monkey-patching fs.
+    const roFile = join(tmp, "legacy-ro.csv");
+    const roLock = join(tmp, "legacy-ro.lock");
+    fs.writeFileSync(
+      roFile,
+      "\uFEFF" + LEGACY + "\n" + legacyRows.join("\n") + "\n",
+      "utf8",
+    );
+    fs.chmodSync(roFile, 0o444); // read-only
+    setPaths(roFile, roLock);
+    const okRo = await appendHistory(base, 1_000_006_600_000);
+    fs.chmodSync(roFile, 0o666); // restore for asserts/cleanup
+    assert(okRo === false, "migration-fail: append returns false when rename fails");
+    const roLeftovers = fs.readdirSync(tmp).filter((f) => f.includes(".tmp."));
+    assert(
+      roLeftovers.length === 0,
+      `migration-fail: no orphan .tmp files (got: ${roLeftovers})`,
+    );
+    assert(
+      fs.readFileSync(roFile, "utf8").split("\n")[0] === "\uFEFF" + LEGACY,
+      "migration-fail: original file untouched after failed rename",
+    );
+
+    // --- migration: concurrency (5 parallel appends on a legacy file) ---------
+    const concFile = join(tmp, "legacy-conc.csv");
+    const concLock = join(tmp, "legacy-conc.lock");
+    fs.writeFileSync(
+      concFile,
+      "\uFEFF" + LEGACY + "\n" + legacyRows.join("\n") + "\n",
+      "utf8",
+    );
+    setPaths(concFile, concLock);
+    const concResults = await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        appendHistory({ ...base, model: "m/" + i }, 1_000_006_000_000 + i),
+      ),
+    );
+    assert(
+      concResults.every((r) => r === true),
+      "migration-concurrency: all appends ok",
+    );
+    const concLines = fs
+      .readFileSync(concFile, "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "");
+    assert(
+      concLines.filter((l) => l.replace(/^\uFEFF/, "").startsWith("ts_iso,")).length === 1,
+      "migration-concurrency: exactly one header line",
+    );
+    assert(
+      concLines.length === 8,
+      "migration-concurrency: header + 2 old + 5 new lines",
+    );
+    assert(
+      concLines[1] === legacyRows[0] && concLines[2] === legacyRows[1],
+      "migration-concurrency: old rows preserved byte-for-byte",
+    );
+
+    // --- foreign header: never touched (design 5.1.4) -------------------------
+    const foreignFile = join(tmp, "foreign.csv");
+    const foreignLock = join(tmp, "foreign.lock");
+    fs.writeFileSync(foreignFile, "foo,bar\nsome,data\n", "utf8");
+    setPaths(foreignFile, foreignLock);
+    const okForeign = await appendHistory(base, 1_000_007_000_000);
+    assert(okForeign === true, "foreign header: append returns true (data kept)");
+    const foreignLines = fs
+      .readFileSync(foreignFile, "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "");
+    assert(
+      foreignLines[0] === "foo,bar" && foreignLines.length === 3,
+      "foreign header: header untouched, row appended",
+    );
 
     // --- failure tolerance ---------------------------------------------------
     const dirAsFile = join(tmp, "i-am-a-directory");

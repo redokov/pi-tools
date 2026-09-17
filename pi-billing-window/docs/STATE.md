@@ -198,10 +198,12 @@ type ArmMap = Record<string, Arm>; // ключ = файл сессии (или "
 ### 9.1. Схема
 
 ```csv
-ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count,input,output,cache_read,cache_write,note
-2026-09-12T14:03:21+03:00,1789283001000,call,c:\Tools,a1b2c3.jsonl,12,3,14500,3200,890000,0,
-2026-09-12T15:57:00+03:00,1789289820000,window_reset,c:\Tools,a1b2c3.jsonl,0,4,,,,,auto
+ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count,input,output,cache_read,cache_write,note,model
+2026-09-12T14:03:21+03:00,1789283001000,call,c:\Tools,a1b2c3.jsonl,12,3,14500,3200,890000,0,,zai/glm-5.3
+2026-09-12T15:57:00+03:00,1789289820000,window_reset,c:\Tools,a1b2c3.jsonl,0,4,,,,,auto,
 ```
+
+**Миграция legacy-файла:** при первом append под тем же локом заголовок старого 12-колоночного формата однократно заменяется на текущий 13-колоночный (tmp-файл + `renameSync`, идемпотентно, BOM сохраняется) — строки данных не трогаются. `model` — последняя колонка, поэтому старые 12-ячеечные строки остаются позиционно валидными (в отчёте попадают в группу `(no model)`). Чужой/нераспознанный заголовок не трогается (warn, fire-and-forget).
 
 | Колонка | Что значит |
 |---|---|
@@ -211,6 +213,7 @@ ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count,input,output,ca
 | `session` | Basename файла сессии (различает агентов в одной папке; `ephemeral:<pid>` в headless) |
 | `input/output/cache_read/cache_write` | Usage последнего ответа (если провайдер отдал; иначе пусто) |
 | `note` | Свободное поле (RFC 4180-эскейп) |
+| `model` | Имя модели вызова, `ctx.model.id` (например, `zai/glm-5.3`); пустая для reset/settimer-строк и строк, записанных до миграции |
 
 ### 9.2. Кто пишет
 
@@ -224,7 +227,7 @@ ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count,input,output,ca
 
 ### 9.3. Анализ
 
-`scripts/billing_report.py` (в каталоге разработки): MD-отчёт — суммарный burn по всем проектам + секция на проект, окна восстанавливаются по инкрементам `reset_count`, пиковые минуты. Фильтры: `--project <хвост пути>` (регистронезависимо, кириллица ок), `--days N`, `--out report.md`.
+`scripts/billing_report.py` (в каталоге разработки): MD-отчёт — суммарный burn по всем проектам, разрез по моделям (`## By model`, только call-строки; пустая/отсутствующая модель — одна группа `(no model)`, старый CSV без колонки читается без миграции данных), секция на проект; окна восстанавливаются по инкрементам `reset_count`, пиковые минуты. Фильтры: `--project <хвост пути>` (регистронезависимо, кириллица ок), `--days N`, `--out report.md`.
 
 ```bash
 python scripts/billing_report.py --project Комус --days 7 --out report.md

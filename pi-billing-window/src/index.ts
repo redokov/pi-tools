@@ -671,11 +671,13 @@ async function onAfterProviderResponse(
   // History: one row per successful call with real token usage when the
   // provider reports it. Fire-and-forget; never throws.
   const meta = historyMetaOf(ctx);
+  const modelId = ctx.model?.id ?? ""; // canonical model name for the call row
   const fresh = readStateSync();
   void appendHistory({
     kind: "call",
     project: meta.project,
     session: meta.session,
+    model: modelId,
     callsInWindow: fresh?.callsInWindow,
     resetCount: fresh?.resetCount,
     usage: lastAssistantUsage(ctx),

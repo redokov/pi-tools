@@ -34,6 +34,14 @@ Copy-Item -Force "$src\ticker.ts"    "$dst\ticker.ts"
 Copy-Item -Force "$src\ui.ts"        "$dst\ui.ts"
 Copy-Item -Force "$src\parser.ts"    "$dst\parser.ts"
 Copy-Item -Force "$src\notifier.ts"  "$dst\notifier.ts"
+Copy-Item -Force "$src\history.ts"   "$dst\history.ts"
+Copy-Item -Force "$src\arms.ts"      "$dst\arms.ts"
+```
+
+Ту же доставку одной командой выполняет **`deploy.ps1`** из корня репо — он копирует все `src/*.ts` (включая `history.ts` и `arms.ts`, а также `README.md` и `tsconfig.json`) в рабочую копию:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 ```
 
 **Вариант B — симлинк (быстро, но проверьте поддержку pi):**
@@ -102,7 +110,7 @@ npm i -D eslint @typescript-eslint/parser @typescript-eslint/eslint-plugin prett
 - Тэг в git: `pi-billing-window-vX.Y.Z`.
 - Changelog — в [`CHANGELOG.md`](./CHANGELOG.md) (создать при первом релизе).
 - Доставка в `C:\Users\r.edokov\.pi\agent\extensions\pi-billing-window\`:
-  - скопировать `src/*.ts`;
+  - скопировать `src/*.ts` (или запустить `deploy.ps1` из корня репо — копирует все модули, включая `history.ts` и `arms.ts`);
   - **обязательно** обновить `package.json` (если меняли `pi.extension` или версии зависимостей);
   - убедиться, что `node_modules` в рабочей копии содержит `proper-lockfile` (иначе запуск упадёт с `Cannot find module`).
 

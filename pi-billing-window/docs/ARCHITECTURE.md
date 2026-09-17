@@ -167,12 +167,12 @@ Passive-наблюдатель сбоку: ничего не меняет в п�
 
 | Событие | kind | Кто пишет |
 |---|---|---|
-| Успешный вызов wormsoft | `call` | `onAfterProviderResponse` (+ usage последнего ответа из `sessionManager.getEntries()`, если провайдер его отдал) |
+| Успешный вызов wormsoft | `call` | `onAfterProviderResponse` (+ usage последнего ответа из `sessionManager.getEntries()`, если провайдер его отдал, + модель `ctx.model.id`) |
 | Авто-reset | `window_reset`, note=`auto` | `ticker.checkAndReset` |
 | `/billing-reset` | `manual_reset` | команда |
 | `/settimer` | `window_reset` (note=`settimer 0`) или `settimer` (note=`sync …`) | команда |
 
-Пишущий процесс через общий лок `pi-billing-window-history.lock` — критическая секция одна строка (мс), вызовы LLM занимают секунды, очередей нет. BOM при создании файла (Excel/кириллица), эскейп по RFC 4180, ретеншн 30 дней (трим на `session_start`). Формат и отчёт — [`STATE.md`](./STATE.md) §9 и `scripts/billing_report.py`.
+Пишущий процесс через общий лок `pi-billing-window-history.lock` — критическая секция одна строка (мс), вызовы LLM занимают секунды, очередей нет. BOM при создании файла (Excel/кириллица), эскейп по RFC 4180, ретеншн 30 дней (трим на `session_start`). При первом append под локом выполняется одноразовая миграция заголовка legacy-файла (12 → 13 колонок, `model` в конце; tmp + rename, идемпотентно) — схема в [`STATE.md`](./STATE.md) §9. Формат и отчёт — [`STATE.md`](./STATE.md) §9 и `scripts/billing_report.py`.
 
 ## 7. Шина событий
 

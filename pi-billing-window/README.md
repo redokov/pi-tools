@@ -110,12 +110,13 @@ C:\Tools\pi-billing-window\
 │   ├── history.ts         # append-only CSV-история вызовов/сбросов
 │   └── notifier.ts        # HTTP POST в pi-remote
 ├── scripts/
-│   └── billing_report.py  # MD-отчёт из history.csv (по проектам/суммарно)
+│   └── billing_report.py  # MD-отчёт из history.csv (по моделям/проектам/суммарно)
 ├── tests/
-│   ├── test.mts           # unit-тесты (state, ticker, ui, parser, notifier)
-│   ├── arms.test.mts      # unit-тесты флагов /cont-after-reset
-│   ├── history.test.mts   # unit-тесты CSV-истории
-│   └── lifecycle.test.mts # регресс-тесты замены сессии (stale ctx, cont-after-reset)
+│   ├── test.mts                # unit-тесты (state, ticker, ui, parser, notifier)
+│   ├── arms.test.mts           # unit-тесты флагов /cont-after-reset
+│   ├── history.test.mts        # unit-тесты CSV-истории
+│   ├── lifecycle.test.mts      # регресс-тесты замены сессии (stale ctx, cont-after-reset)
+│   └── billing_report_test.py  # python-тесты MD-отчёта (секция By model)
 ├── docs/
 │   ├── ARCHITECTURE.md    # подробный разбор модулей и потоков
 │   ├── EVENTBUS.md        # контракт шины событий и подписчики
@@ -152,6 +153,7 @@ npx tsx tests/test.mts
 npx tsx tests/arms.test.mts
 npx tsx tests/history.test.mts
 npx tsx tests/lifecycle.test.mts
+python tests/billing_report_test.py
 ```
 
 Покрытие (тесты лежат в `tests/test.mts`):
@@ -165,7 +167,10 @@ npx tsx tests/lifecycle.test.mts
 - `arms.ts` — взвод/снятие/идемпотентность, TTL и prune, перенос флага при `/new` (`carryArmTo`), переключение ключа без переноса (`switchKey`), `resetReadyToFire` (граница grace, срабатывание только после взвода), атомарность записи
 
 Покрытие `tests/history.test.mts`:
-- `history.ts` — создание файла (BOM + заголовок ровно один раз), append строк, RFC 4180-эскейп (запятые/кавычки/переносы), `isoLocal` (локальный offset), 5 параллельных аппендов без потери строк (лок), ретеншн-трим (граница 30 дней, идемпотентность), отказоустойчивость (невалидный путь → false/0 без throw), `resetPaths`
+- `history.ts` — создание файла (BOM + заголовок ровно один раз), append строк, RFC 4180-эскейп (запятые/кавычки/переносы), `isoLocal` (локальный offset), 5 параллельных аппендов без потери строк (лок), одноразовая миграция legacy 12-колоночного заголовка к 13-колоночному (первый append, данные не трогаются, идемпотентно), ретеншн-трим (граница 30 дней, идемпотентность), отказоустойчивость (невалидный путь → false/0 без throw), `resetPaths`
+
+Покрытие `tests/billing_report_test.py`:
+- `billing_report.py` — секция `## By model` на новом 13-колоночном CSV (несколько моделей, reset-строки в разрез не попадают), legacy 12-колоночный CSV без падения (одна группа `(no model)`), смешанный CSV (мигрированный заголовок + старые и новые строки), фильтры `--days`/`--project` в per-model, регресс секций Total/per-project
 
 ### 6.4. Установка / переустановка в pi
 
@@ -256,12 +261,12 @@ New-Item -ItemType SymbolicLink `
 
 | Событие | kind |
 |---|---|
-| Успешный вызов wormsoft | `call` — с usage последнего ответа (input/output/cache-токены), если провайдер их отдаёт |
+| Успешный вызов wormsoft | `call` — с usage последнего ответа (input/output/cache-токены), если провайдер их отдаёт, и моделью вызова (`ctx.model.id`) |
 | Авто-reset | `window_reset` (note=`auto`) |
 | `/billing-reset` | `manual_reset` |
 | `/settimer` | `window_reset` (note=`settimer 0`) или `settimer` (note=`sync …`) |
 
-Проект — колонка `project` (полный cwd сессии), агент в той же папке различается колонкой `session`. Запись под локом (безопасно для нескольких процессов), UTF-8 + BOM (кириллица в Excel), ретеншн 30 дней (трим на старте сессии). Сбой истории никогда не влияет на счёт/сбросы/уведомления.
+Проект — колонка `project` (полный cwd сессии), агент в той же папке различается колонкой `session`. Формат — **13 колонок**, последняя — `model`: `ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count,input,output,cache_read,cache_write,note,model`. Значение `model` — канонический id модели pi (например, `zai/glm-5.3`); для reset/settimer-строк и строк, записанных до миграции, — пустая. Файл старого 12-колоночного формата мигрирует автоматически: при первом append под локом заменяется только строка заголовка (tmp-файл + rename, идемпотентно), данные не трогаются. Запись под локом (безопасно для нескольких процессов), UTF-8 + BOM (кириллица в Excel), ретеншн 30 дней (трим на старте сессии). Сбой истории никогда не влияет на счёт/сбросы/уведомления.
 
 Отчёт (MD): по требованию, из каталога разработки:
 
@@ -271,7 +276,7 @@ python scripts/billing_report.py --project Комус --days 7     # один п
 python scripts/billing_report.py --days 0 --out report.md     # в файл
 ```
 
-Скрипт восстанавливает окна по инкрементам `reset_count` и показывает: суммарный burn, окна каждого проекта (старт, вызовы, токены, «сколько минут прожило до исчерпания»), пиковые минуты.
+Скрипт восстанавливает окна по инкрементам `reset_count` и показывает: суммарный burn, разрез по моделям (`## By model`: модель × calls/input/output/cacheR/cacheW/total, сортировка по total по убыванию; строки без модели — группа `(no model)`; старый CSV без колонки `model` читается как есть — все call-строки попадут в `(no model)`), окна каждого проекта (старт, вызовы, токены, «сколько минут прожило до исчерпания»), пиковые минуты.
 
 ---
 
