@@ -16,6 +16,8 @@ import {
   carryArmTo,
   arm,
   disarm,
+  markFired,
+  confirmSuccess,
   isArmed,
   getArm,
   resetReadyToFire,
@@ -136,6 +138,69 @@ async function main(): Promise<void> {
   assert(
     !resetReadyToFire(armX, { lastResetAt: resetAt }, resetAt - 1),
     "no fire: before reset timestamp",
+  );
+
+  // --- markFired: pending phase + TTL extension -----------------------------
+  switchKey("convP");
+  const aP = await arm(7, T0 + 200_000);
+  assert(aP !== null, "markFired: arm exists before firing");
+  const fired = await markFired(T0 + 210_000);
+  assert(fired !== null, "markFired returns the arm");
+  const mp = getArm(T0 + 211_000);
+  assert(mp?.phase === "pending", "markFired: phase = pending");
+  assert(
+    mp?.lastFireAt === T0 + 210_000,
+    "markFired: lastFireAt recorded",
+  );
+  assert(
+    mp !== null && mp.expiresAt === T0 + 200_000 + ARMS_TTL_MS,
+    "markFired: does not shrink a longer existing TTL",
+  );
+
+  // markFired: extends a near-expiry arm to at least 1h from firing.
+  switchKey("convS");
+  const rawMap: Record<string, Arm> = JSON.parse(
+    fs.readFileSync(af, "utf8"),
+  );
+  rawMap["convS"] = {
+    armedAt: T0 + 230_000 - 60_000,
+    lastResetAtAtArm: 1,
+    expiresAt: T0 + 230_000 + 30 * 60_000, // only 30 min left
+  };
+  fs.writeFileSync(af, JSON.stringify(rawMap, null, 2), "utf8");
+  const firedShort = await markFired(T0 + 230_000);
+  assert(
+    firedShort?.expiresAt === T0 + 230_000 + 60 * 60 * 1000,
+    "markFired: extends a near-expiry arm to 1h",
+  );
+
+  // markFired with no arm under the current key -> null.
+  switchKey("convQ");
+  assert(
+    await markFired(T0 + 240_000) === null,
+    "markFired: null when no arm for the current key",
+  );
+
+  // --- confirmSuccess: removes ONLY a pending arm ---------------------------
+  switchKey("convR");
+  await arm(8, T0 + 250_000);
+  assert(
+    await confirmSuccess(T0 + 251_000) === false,
+    "confirmSuccess: false while still phase=armed",
+  );
+  assert(isArmed(T0 + 252_000), "confirmSuccess: armed arm survives");
+  switchKey("convP");
+  assert(
+    await confirmSuccess(T0 + 253_000) === true,
+    "confirmSuccess: removes a pending arm",
+  );
+  assert(
+    !isArmed(T0 + 254_000),
+    "confirmSuccess: pending arm gone after confirmation",
+  );
+  assert(
+    await confirmSuccess(T0 + 255_000) === false,
+    "confirmSuccess: second call returns false (already gone)",
   );
 
   // cleanup

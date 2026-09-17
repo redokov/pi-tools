@@ -35,7 +35,8 @@ export type HistoryKind =
   | "call"
   | "window_reset"
   | "manual_reset"
-  | "settimer";
+  | "settimer"
+  | "429";
 
 /** Token usage of the LLM response, when the provider reports it. */
 export type HistoryUsage = {

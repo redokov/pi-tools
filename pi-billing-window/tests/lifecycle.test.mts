@@ -18,7 +18,7 @@
  * session_start/session_shutdown wiring is exercised end-to-end.
  */
 
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,6 +26,7 @@ import piBillingWindowFactory from "../src/index.ts";
 import {
   writeStateSync,
   mutateState,
+  readStateSync,
   setPaths as stateSetPaths,
   resetPaths as stateResetPaths,
 } from "../src/state.ts";
@@ -33,6 +34,8 @@ import {
   setPaths as armsSetPaths,
   resetPaths as armsResetPaths,
   isArmed as armsIsArmed,
+  getArm as armsGetArm,
+  RETRY_AFTER_FIRE_MS,
 } from "../src/arms.ts";
 import {
   setPaths as historySetPaths,
@@ -263,8 +266,16 @@ async function testReplacementRefires(): Promise<void> {
       "replacement: 'продолжи' sent exactly once with the fresh pi",
     );
     assert(
+      armsGetArm()?.phase === "pending",
+      "replacement: flag switches to pending (not consumed) after the send",
+    );
+    await handlerOf(handlers, "after_provider_response")(
+      { status: 200, headers: {} },
+      ctx,
+    );
+    assert(
       !armsIsArmed(),
-      "replacement: one-shot arm consumed after successful send",
+      "replacement: pending flag cleared by the first successful response",
     );
 
     // Stop the ticker/status timers so the test process can exit.
@@ -303,6 +314,179 @@ async function testStaleSendKeepsArm(): Promise<void> {
   }
 }
 
+/**
+ * 429 handling: a rate-limited response records state.last429At, appends a
+ * kind="429" history row and does NOT increment callsInWindow.
+ */
+async function test429Recorded(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-429-"));
+  applyPaths(tmp);
+  try {
+    seedFreshWindow();
+    await mutateState((cur) => {
+      if (cur === null) throw new Error("state file missing");
+      return { next: { ...cur, callsInWindow: 5 } };
+    });
+    const { pi, handlers, sends } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
+    await handlerOf(handlers, "session_start")({}, ctx);
+
+    await handlerOf(handlers, "after_provider_response")(
+      { status: 429, headers: {} },
+      ctx,
+    );
+    await sleep(300); // history append is fire-and-forget
+
+    const st = readStateSync();
+    assert(
+      typeof st?.last429At === "number" && st.last429At > 0,
+      "429: last429At recorded in state",
+    );
+    assert(st?.callsInWindow === 5, "429: callsInWindow not incremented");
+    const csv = readFileSync(join(tmp, "history.csv"), "utf8");
+    assert(csv.includes(",429,"), "429: history row with kind=429");
+    assert(csv.includes("limit exhausted"), "429: history row has note");
+    assert(sends.length === 0, "429: no continuation send");
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    cleanupPaths(tmp);
+  }
+}
+
+/**
+ * Backdate the pending arm's lastFireAt on disk (the arms file is the
+ * persistence layer, so simulating elapsed time is a plain file edit --
+ * same idea as bumpReset() does for state).
+ */
+function backdateLastFireAt(tmp: string, ms: number): void {
+  const armsPath = join(tmp, "arms.json");
+  const map = JSON.parse(readFileSync(armsPath, "utf8")) as Record<
+    string,
+    { lastFireAt?: number }
+  >;
+  const key = Object.keys(map)[0];
+  if (!key) throw new Error("no arm on disk");
+  map[key].lastFireAt = Date.now() - ms;
+  writeFileSync(armsPath, JSON.stringify(map, null, 2), "utf8");
+}
+
+/**
+ * Pending phase: a 429 arriving right after a "продолжи" attempt blocks the
+ * retry until RETRY_AFTER_FIRE_MS have passed since that 429/attempt.
+ */
+async function testPendingRetryNotBeforeRetryDelay(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-soon429-"));
+  applyPaths(tmp);
+  try {
+    seedFreshWindow();
+    const { pi, handlers, commands, sends } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
+    await handlerOf(handlers, "session_start")({}, ctx);
+    await commandOf(commands, "cont-after-reset")("", ctx);
+    await bumpReset(2);
+    await commandOf(commands, "cont-after-reset")("", ctx); // immediate fire
+    await sleep(300);
+    assert(sends.length === 1, "soon-429: first 'продолжи' sent");
+    assert(
+      armsGetArm()?.phase === "pending",
+      "soon-429: flag is pending after the send",
+    );
+
+    // A fresh 429 right after the attempt: retryAfter moves to "now".
+    await handlerOf(handlers, "after_provider_response")(
+      { status: 429, headers: {} },
+      ctx,
+    );
+
+    // 11 minutes since the send, but the 429 is fresh -> NO retry yet.
+    backdateLastFireAt(tmp, RETRY_AFTER_FIRE_MS + 60_000);
+    await commandOf(commands, "cont-after-reset")("", ctx); // re-evaluate
+    await sleep(300);
+    assert(
+      sends.length === 1,
+      "soon-429: no retry before RETRY_AFTER_FIRE_MS after a fresh 429",
+    );
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    cleanupPaths(tmp);
+  }
+}
+
+/**
+ * Pending phase: once RETRY_AFTER_FIRE_MS have passed since the last
+ * attempt/429, the poller retries the send; the first successful response
+ * then confirms and clears the pending flag.
+ */
+async function testPendingRetryAndConfirm(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-pending-"));
+  applyPaths(tmp);
+  try {
+    seedFreshWindow();
+    const { pi, handlers, commands, sends } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
+    await handlerOf(handlers, "session_start")({}, ctx);
+    await commandOf(commands, "cont-after-reset")("", ctx);
+    await bumpReset(2);
+    await commandOf(commands, "cont-after-reset")("", ctx); // immediate fire
+    await sleep(300);
+    assert(sends.length === 1, "pending-retry: first 'продолжи' sent");
+    assert(
+      armsGetArm()?.phase === "pending",
+      "pending-retry: flag is pending after the send",
+    );
+
+    // A 429 arrives, then 11 minutes pass since BOTH the send and the 429.
+    await handlerOf(handlers, "after_provider_response")(
+      { status: 429, headers: {} },
+      ctx,
+    );
+    backdateLastFireAt(tmp, RETRY_AFTER_FIRE_MS + 60_000);
+    await mutateState((cur) => {
+      if (cur === null) throw new Error("state file missing");
+      return {
+        next: { ...cur, last429At: Date.now() - (RETRY_AFTER_FIRE_MS + 60_000) },
+      };
+    });
+
+    // Re-entering the command re-evaluates the pending arm -> retry fire.
+    await commandOf(commands, "cont-after-reset")("", ctx);
+    await sleep(300);
+    assert(
+      sends.length === 2,
+      "pending-retry: second 'продолжи' sent after RETRY_AFTER_FIRE_MS",
+    );
+    const arm = armsGetArm();
+    assert(
+      arm?.phase === "pending" &&
+        typeof arm.lastFireAt === "number" &&
+        arm.lastFireAt > Date.now() - 5_000,
+      "pending-retry: lastFireAt refreshed by the retry",
+    );
+
+    // First successful provider response confirms and clears the flag.
+    await handlerOf(handlers, "after_provider_response")(
+      { status: 200, headers: {} },
+      ctx,
+    );
+    assert(
+      !armsIsArmed(),
+      "pending-retry: first success confirms and removes the pending flag",
+    );
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    cleanupPaths(tmp);
+  }
+}
+
 // --- runner -------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -310,6 +494,9 @@ async function main(): Promise<void> {
   await testShutdownStopsPoller();
   await testReplacementRefires();
   await testStaleSendKeepsArm();
+  await test429Recorded();
+  await testPendingRetryNotBeforeRetryDelay();
+  await testPendingRetryAndConfirm();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

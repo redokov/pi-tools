@@ -37,6 +37,14 @@ import {
   type ParsedDuration,
 } from "../src/parser.ts";
 import { sendNotify, type NotifyPayload } from "../src/notifier.ts";
+import {
+  setPaths as historySetPaths,
+  resetPaths as historyResetPaths,
+} from "../src/history.ts";
+import {
+  setPaths as armsSetPaths,
+  resetPaths as armsResetPaths,
+} from "../src/arms.ts";
 
 // Mock emit: collects every (event, payload) call.
 type EmitCall = { event: string; payload: unknown };
@@ -127,6 +135,17 @@ const testStateFile = join(tmpDir, "state.json");
 const testLockFile = join(tmpDir, "state.lock");
 
 setPaths(testStateFile, testLockFile);
+
+// Redirect the shared history CSV and the arms file too: checkAndReset()
+// (ticker) appends "window_reset" rows into history.csv, and ui.ts reads the
+// arms file while rendering -- both must never touch the product files
+// during tests.
+const testHistoryFile = join(tmpDir, "history.csv");
+const testHistoryLock = join(tmpDir, "history.lock");
+const testArmsFile = join(tmpDir, "arms.json");
+const testArmsLock = join(tmpDir, "arms.lock");
+historySetPaths(testHistoryFile, testHistoryLock);
+armsSetPaths(testArmsFile, testArmsLock);
 
 let passed = 0;
 let failed = 0;
@@ -1142,6 +1161,8 @@ async function main(): Promise<void> {
   cleanState();
   rmSync(tmpDir, { recursive: true, force: true });
   resetPaths();
+  historyResetPaths();
+  armsResetPaths();
   restoreMock();
 
   console.log("\n========================================");

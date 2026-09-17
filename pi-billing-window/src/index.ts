@@ -54,10 +54,13 @@ import {
   carryArmTo as armsCarryArmTo,
   arm as armsArm,
   disarm as armsDisarm,
+  markFired as armsMarkFired,
+  confirmSuccess as armsConfirmSuccess,
   isArmed as armsIsArmed,
   getArm as armsGetArm,
   resetReadyToFire,
   RESET_GRACE_MS,
+  RETRY_AFTER_FIRE_MS,
   type Arm as ArmsArm,
 } from "./arms.js";
 
@@ -285,8 +288,23 @@ async function evaluateArmedReset(): Promise<void> {
     return;
   }
   const st = readStateSync();
-  if (!st) return;
   const now = Date.now();
+
+  // "продолжи" has already been sent for this arm (phase "pending"): wait
+  // for the first successful provider response to clear the flag
+  // (confirmSuccess, called from onAfterProviderResponse), retrying the
+  // send no more often than every RETRY_AFTER_FIRE_MS after the last
+  // attempt/429. In "pending" neither resetReadyToFire nor the boundary
+  // logic below applies.
+  if (arm.phase === "pending") {
+    const retryAfter = Math.max(arm.lastFireAt ?? 0, st?.last429At ?? 0);
+    if (now - retryAfter >= RETRY_AFTER_FIRE_MS) {
+      await fireContinue(arm);
+    }
+    return;
+  }
+
+  if (!st) return;
 
   // A reset has happened since arming. Fire once the grace period has elapsed.
   if (resetReadyToFire(arm, st, now)) {
@@ -319,7 +337,8 @@ async function evaluateArmedReset(): Promise<void> {
  *  - only when the agent is idle (spec: "if the agent is streaming, do
  *    nothing" -- we keep the arm and retry on the next poll);
  *  - only after the grace period (handled by the caller).
- * One-shot: clears the arm right after a successful send.
+ * After a successful send the flag switches to "pending" (markFired); the
+ * first successful provider response confirms it (confirmSuccess).
  */
 async function fireContinue(_arm: ArmsArm): Promise<void> {
   let idle = true;
@@ -338,10 +357,16 @@ async function fireContinue(_arm: ArmsArm): Promise<void> {
 
   try {
     await p.sendUserMessage("продолжи");
-    // Sent successfully: consume the one-shot flag and stop the poller.
-    stopArmedPoller();
-    await armsDisarm();
-    console.log("[pi-billing-window] cont-after-reset: 'продолжи' отправлен");
+    // Sent: switch the flag to "pending" instead of consuming it. The first
+    // successful provider response (confirmSuccess) clears it; a 429 means
+    // the provider has not recovered yet and the poller retries every
+    // RETRY_AFTER_FIRE_MS.
+    await armsMarkFired();
+    console.log(
+      "[pi-billing-window] cont-after-reset: 'продолжи' отправлен, " +
+      "флаг в pending — сниму после первого успешного ответа, " +
+      "при 429 повтор через 10 мин",
+    );
   } catch (err) {
     // Failed to send (e.g. bus busy). Keep the arm and poller; retry next poll.
     console.warn(
@@ -611,7 +636,13 @@ async function onSessionStart(
  * provider bumps callsInWindow under a lock. The first call after a
  * window-start sets firstCallEmittedAt and fires "llm:first_call" on the
  * EventBus. After mutation we run checkAndReset() so a window that
- * expired during this very call gets cleaned up immediately.
+ * expired during this very call gets cleaned up immediately. The first
+ * successful response also confirms a "pending" cont-after-reset arm
+ * (armsConfirmSuccess, one-shot after a CONFIRMED success).
+ *
+ * A 429 response is NOT an error here: it means the provider's limit is
+ * exhausted. We record state.last429At and append a kind="429" history row;
+ * a 429 does not increment callsInWindow.
  *
  * NOTE on filtering: the AfterProviderResponseEvent payload only carries
  * { status, headers } -- it does NOT carry the provider name. We get the
@@ -623,8 +654,7 @@ async function onAfterProviderResponse(
   event: { status: number; headers: Record<string, string> },
   ctx: ExtensionContext,
 ): Promise<void> {
-  // Only successful responses count towards the limit.
-  if (typeof event.status !== "number" || event.status >= 400) return;
+  if (typeof event.status !== "number") return;
 
   // Filter by provider. ctx.model may be undefined during startup / RPC.
   const providerName: string | undefined = ctx.model?.provider;
@@ -632,6 +662,31 @@ async function onAfterProviderResponse(
 
   // Keep currentCtx fresh so window_reset notifications find a live ctx.
   currentCtx = ctx;
+
+  // Limit exhausted: remember when it happened (drives the pending
+  // cont-after-reset retry pacing) and log a history row. A 429 does NOT
+  // count towards callsInWindow.
+  if (event.status === 429) {
+    await mutateState((cur) => {
+      const next: State = cur === null ? makeInitialState() : { ...cur };
+      next.last429At = Date.now();
+      return { next };
+    });
+    const meta429 = historyMetaOf(ctx);
+    const fresh429 = readStateSync();
+    void appendHistory({
+      kind: "429",
+      project: meta429.project,
+      session: meta429.session,
+      callsInWindow: fresh429?.callsInWindow,
+      resetCount: fresh429?.resetCount,
+      note: "limit exhausted",
+    });
+    return;
+  }
+
+  // Only successful responses count towards the limit.
+  if (event.status >= 400) return;
 
   const emit = buildEmitFn();
   const timestamp = Date.now();
@@ -659,6 +714,10 @@ async function onAfterProviderResponse(
 
     return { next, result: true };
   });
+
+  // The first successful wormsoft response after a "продолжи" confirms the
+  // pending cont-after-reset arm and removes it (no-op when not pending).
+  void armsConfirmSuccess();
 
   if (firstCallJustEmitted) {
     emit("llm:first_call", {

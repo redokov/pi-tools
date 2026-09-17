@@ -26,7 +26,10 @@
  *
  * Semantics
  * ---------
- *  - One-shot: index.ts clears the arm right after sending "продолжи".
+ *  - Phases: "armed" = waiting for the 2-hour window to reset; "pending" =
+ *    "продолжи" has already been sent -- the first successful provider
+ *    response (confirmSuccess) clears the flag, and index.ts retries the send
+ *    every RETRY_AFTER_FIRE_MS after the last 429/attempt.
  *  - TTL: an arm expires ARMS_TTL_MS after arming; expired arms are ignored and
  *    pruned on the next write.
  *  - Trigger: a window reset is detected as state.lastResetAt advancing past the
@@ -44,14 +47,31 @@ export type Arm = {
   armedAt: number;
   lastResetAtAtArm: number;
   expiresAt: number;
+  /** "armed" = waiting for a window reset; "pending" = "продолжи" sent, awaiting the first successful provider response. */
+  phase?: "armed" | "pending";
+  /** When "продолжи" was last sent (only meaningful in phase "pending"). */
+  lastFireAt?: number;
 };
 
 export type ArmMap = Record<string, Arm>;
 
-/** How long an armed flag stays valid: 2h window + 10 min slack. */
-export const ARMS_TTL_MS = (2 * 60 + 10) * 60 * 1000;
+/**
+ * How long an armed flag stays valid. 8 hours: the 2h window plus generous
+ * slack, so local timer drift or a late provider recovery never burns the
+ * flag before the reset it is waiting for happens.
+ */
+export const ARMS_TTL_MS = (8 * 60) * 60 * 1000;
 /** After a reset, wait this long before sending "продолжи". */
 export const RESET_GRACE_MS = 60 * 1000;
+/**
+ * While in phase "pending", how long to wait after the last "продолжи"
+ * attempt (or the last 429) before sending another one. A 429 right after a
+ * send means the provider has not recovered yet; retry instead of losing
+ * the flag.
+ */
+export const RETRY_AFTER_FIRE_MS = 10 * 60 * 1000;
+/** Minimum TTL of a pending flag after markFired(): room to await confirmation. */
+const PENDING_MS = 60 * 60 * 1000; // 1 hour
 
 let armsFile = path.join(
   os.homedir(),
@@ -223,6 +243,57 @@ export async function disarm(now: number = Date.now()): Promise<boolean> {
     const map = readArmsSync();
     pruneExpired(map, now);
     if (map[key] !== undefined) {
+      delete map[key];
+      removed = true;
+      writeArmsSync(map);
+    }
+  });
+  return removed;
+}
+
+/**
+ * Transition the current conversation's arm to "pending": "продолжи" has
+ * just been sent. Records lastFireAt, extends expiresAt to cover the
+ * confirmation wait (never shrinks an existing longer TTL) and writes the
+ * file. Returns the updated record, or null when there is no (unexpired)
+ * arm for the current conversation.
+ */
+export async function markFired(now: number = Date.now()): Promise<Arm | null> {
+  const key = currentKey;
+  if (!key) return null;
+  let result: Arm | null = null;
+  await withArmsLock(() => {
+    const map = readArmsSync();
+    pruneExpired(map, now);
+    const cur = map[key];
+    if (!cur) return;
+    const next: Arm = {
+      ...cur,
+      phase: "pending",
+      lastFireAt: now,
+      expiresAt: Math.max(cur.expiresAt, now + PENDING_MS),
+    };
+    map[key] = next;
+    writeArmsSync(map);
+    result = next;
+  });
+  return result;
+}
+
+/**
+ * Confirm a "pending" arm: the first successful provider response after
+ * "продолжи" clears the flag (one-shot semantics apply only after a
+ * CONFIRMED success). Returns true if a pending arm was removed.
+ */
+export async function confirmSuccess(now: number = Date.now()): Promise<boolean> {
+  const key = currentKey;
+  if (!key) return false;
+  let removed = false;
+  await withArmsLock(() => {
+    const map = readArmsSync();
+    pruneExpired(map, now);
+    const cur = map[key];
+    if (cur !== undefined && cur.phase === "pending") {
       delete map[key];
       removed = true;
       writeArmsSync(map);

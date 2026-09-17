@@ -20,6 +20,8 @@ export type State = {
   resetCount: number;
   callsInWindow: number;
   firstCallEmittedAt?: number;
+  /** Timestamp of the most recent 429 (limit exhausted) from the provider. */
+  last429At?: number;
 };
 
 let stateFile = path.join(os.homedir(), ".pi", "agent", "pi-billing-window.json");
