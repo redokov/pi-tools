@@ -282,8 +282,10 @@ function ensureArmedPoller(): void {
 async function evaluateArmedReset(): Promise<void> {
   const arm = armsGetArm();
   if (!arm) {
-    // Expired or removed.
-    stopArmedPoller();
+    // Expired or removed. Keep the poller alive: an external writer
+    // (night-agent helper scripts/arm_cont_after_reset.py) can (re)arm this
+    // conversation at any time, and the 10s no-op tick is what notices.
+    clearBoundaryResetTimer();
     refreshMarker();
     return;
   }
@@ -621,11 +623,11 @@ async function onSessionStart(
     } else {
       armsSwitchKey(key);
     }
-    if (armsIsArmed()) {
-      ensureArmedPoller();
-    } else {
-      refreshMarker();
-    }
+    // Always run the armed poller: the arm can be (re)created at any time by
+    // an external writer (night-agent helper scripts/arm_cont_after_reset.py),
+    // and a live poller is what notices and fires "продолжи".
+    ensureArmedPoller();
+    refreshMarker();
   } catch (err) {
     console.warn("pi-billing-window: arms session init failed:", err);
   }
