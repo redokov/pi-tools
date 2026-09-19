@@ -487,6 +487,130 @@ async function testPendingRetryAndConfirm(): Promise<void> {
   }
 }
 
+// --- /cont-after-reset argument parsing ---------------------------------------
+
+/**
+ * Parsing of the /cont-after-reset argument into the arms file: no argument
+ * arms a classic one-shot (repeat=1), a 1..99 integer arms that many total
+ * repetitions, "off"/"0"/"нет"/"выкл" disarm, and any other string keeps the
+ * backward-compatible one-shot fallback.
+ */
+async function testContAfterResetArgParsing(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-parse-"));
+  applyPaths(tmp);
+  try {
+    seedFreshWindow();
+    const { pi, handlers, commands } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-parse.jsonl"));
+    await handlerOf(handlers, "session_start")({}, ctx);
+    const cmd = commandOf(commands, "cont-after-reset");
+
+    await cmd("", ctx);
+    assert(armsGetArm()?.repeat === 1, "parse: no argument -> repeat=1");
+    assert(armsIsArmed(), "parse: no argument arms the flag");
+
+    await cmd("5", ctx);
+    assert(
+      armsGetArm()?.repeat === 5,
+      "parse: '5' -> repeat=5 (re-arms an existing flag)",
+    );
+
+    await cmd("off", ctx);
+    assert(!armsIsArmed(), "parse: 'off' disarms");
+    assert(armsGetArm() === null, "parse: record removed by 'off'");
+
+    await cmd("0", ctx);
+    assert(!armsIsArmed(), "parse: '0' disarms (existing synonym)");
+
+    // Non-numeric / out-of-range args keep the old one-shot fallback.
+    await cmd("abc", ctx);
+    assert(
+      armsGetArm()?.repeat === 1,
+      "parse: 'abc' falls back to repeat=1 (backward compatible)",
+    );
+    await cmd("100", ctx);
+    assert(
+      armsGetArm()?.repeat === 1,
+      "parse: out-of-range '100' falls back to repeat=1",
+    );
+
+    await cmd("нет", ctx);
+    assert(!armsIsArmed(), "parse: 'нет' disarms");
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    cleanupPaths(tmp);
+  }
+}
+
+/**
+ * End-to-end repeat mode: arm with repeat=3, let a reset fire, confirm the
+ * first success -- the flag must be re-armed (repeat=2, phase=armed, fresh
+ * lastResetAtAtArm) rather than consumed -- and fire again on the NEXT reset.
+ */
+async function testRepeatRearmAcrossResets(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-repeat-"));
+  applyPaths(tmp);
+  try {
+    seedFreshWindow();
+    const { pi, handlers, commands, sends } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-repeat.jsonl"));
+    await handlerOf(handlers, "session_start")({}, ctx);
+    const cmd = commandOf(commands, "cont-after-reset");
+
+    await cmd("3", ctx);
+    assert(armsGetArm()?.repeat === 3, "repeat-e2e: armed with repeat=3");
+
+    // First window reset -> first "продолжи".
+    await bumpReset(2);
+    await cmd("", ctx);
+    await sleep(300);
+    assert(sends.length === 1, "repeat-e2e: first 'продолжи' sent");
+    assert(armsGetArm()?.phase === "pending", "repeat-e2e: pending after send");
+
+    const markerAtConfirm = readStateSync()?.lastResetAt ?? -1;
+    await handlerOf(handlers, "after_provider_response")(
+      { status: 200, headers: {} },
+      ctx,
+    );
+    const re = armsGetArm();
+    assert(
+      re?.repeat === 2 && re?.phase === "armed",
+      "repeat-e2e: re-armed to repeat=2 after the first success",
+    );
+    assert(
+      re?.lastResetAtAtArm === markerAtConfirm,
+      "repeat-e2e: re-arm marker = current state.lastResetAt",
+    );
+    assert(
+      re?.lastFireAt === undefined,
+      "repeat-e2e: lastFireAt cleared on re-arm",
+    );
+
+    // Second window reset -> fires again (the nightly-repeat fix).
+    await bumpReset(2);
+    await cmd("", ctx);
+    await sleep(300);
+    assert(
+      sends.length === 2,
+      "repeat-e2e: second 'продолжи' fired on the next reset",
+    );
+    assert(armsGetArm()?.phase === "pending", "repeat-e2e: pending again");
+    assert(
+      armsGetArm()?.repeat === 2,
+      "repeat-e2e: repeat unchanged until the next confirmation",
+    );
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    cleanupPaths(tmp);
+  }
+}
+
 // --- runner -------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -497,6 +621,8 @@ async function main(): Promise<void> {
   await test429Recorded();
   await testPendingRetryNotBeforeRetryDelay();
   await testPendingRetryAndConfirm();
+  await testContAfterResetArgParsing();
+  await testRepeatRearmAcrossResets();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

@@ -203,6 +203,82 @@ async function main(): Promise<void> {
     "confirmSuccess: second call returns false (already gone)",
   );
 
+  // --- repeat>1: confirmation re-arms instead of deleting -------------------
+  switchKey("convRep3");
+  const aRep3 = await arm(11, T0 + 300_000, 3);
+  assert(aRep3?.repeat === 3, "repeat: arm stores repeat=3");
+  await markFired(T0 + 310_000);
+  assert(
+    (await confirmSuccess(T0 + 320_000, { lastResetAt: 777 })) === true,
+    "repeat: confirmation of a pending repeat arm returns true",
+  );
+  const reA = getArm(T0 + 321_000);
+  assert(reA !== null, "repeat: arm survives confirmation");
+  assert(reA?.repeat === 2, "repeat: decremented to 2");
+  assert(reA?.phase === "armed", "repeat: phase back to armed");
+  assert(
+    reA?.lastResetAtAtArm === 777,
+    "repeat: lastResetAtAtArm = passed lastResetAt",
+  );
+  assert(reA?.armedAt === T0 + 320_000, "repeat: armedAt = confirmation time");
+  assert(
+    reA?.expiresAt === T0 + 320_000 + ARMS_TTL_MS,
+    "repeat: fresh TTL counted from confirmation time",
+  );
+  assert(
+    reA?.lastFireAt === undefined,
+    "repeat: lastFireAt dropped on re-arm",
+  );
+
+  // Chained: repeat 2 -> confirm -> repeat 1 -> confirm removes (2 fires).
+  switchKey("convRep2");
+  await arm(12, T0 + 330_000, 2);
+  await markFired(T0 + 335_000);
+  await confirmSuccess(T0 + 340_000, { lastResetAt: 5 });
+  assert(
+    getArm(T0 + 341_000)?.repeat === 1,
+    "repeat: 2 -> 1 after the first confirmation",
+  );
+  await markFired(T0 + 345_000);
+  assert(
+    (await confirmSuccess(T0 + 350_000, { lastResetAt: 6 })) === true,
+    "repeat: final confirmation handled",
+  );
+  assert(
+    !isArmed(T0 + 351_000),
+    "repeat: record removed once the last repetition is confirmed",
+  );
+
+  // --- repeat=1 (explicit) and no-repeat keep one-shot behaviour -----------
+  switchKey("convRep1");
+  await arm(13, T0 + 360_000, 1);
+  await markFired(T0 + 365_000);
+  assert(
+    (await confirmSuccess(T0 + 370_000, { lastResetAt: 9 })) === true,
+    "repeat=1: confirmation returns true (removed)",
+  );
+  assert(!isArmed(T0 + 371_000), "repeat=1: record removed");
+
+  switchKey("convRepAbsent");
+  await arm(14, T0 + 380_000);
+  await markFired(T0 + 385_000);
+  await confirmSuccess(T0 + 390_000, { lastResetAt: 9 });
+  assert(
+    !isArmed(T0 + 391_000),
+    "no repeat field: classic one-shot removal preserved",
+  );
+
+  // --- omitted lastResetAt defaults to 0 (fires on any later reset) --------
+  switchKey("convRepDefault");
+  await arm(15, T0 + 400_000, 4);
+  await markFired(T0 + 405_000);
+  await confirmSuccess(T0 + 410_000); // no opts
+  const reDef = getArm(T0 + 411_000);
+  assert(
+    reDef?.repeat === 3 && reDef?.lastResetAtAtArm === 0,
+    "repeat: omitted lastResetAt defaults to 0",
+  );
+
   // cleanup
   resetPaths();
   try {

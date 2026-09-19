@@ -718,8 +718,11 @@ async function onAfterProviderResponse(
   });
 
   // The first successful wormsoft response after a "продолжи" confirms the
-  // pending cont-after-reset arm and removes it (no-op when not pending).
-  void armsConfirmSuccess();
+  // pending cont-after-reset arm. A one-shot arm is removed; a repeat>1 arm is
+  // re-armed for the NEXT reset. Passing the current state.lastResetAt lets
+  // the re-armed record wait for a reset that happens after confirmation.
+  const armState = readStateSync();
+  void armsConfirmSuccess(Date.now(), { lastResetAt: armState?.lastResetAt });
 
   if (firstCallJustEmitted) {
     emit("llm:first_call", {
@@ -1052,13 +1055,15 @@ function registerSettimer(pi: ExtensionAPI): void {
  * /cont-after-reset -- arm (default) or disarm ("off") the automatic
  * "continue after reset" for THIS conversation. When armed, the footer timer
  * shows " [cont-after-reset]"; on the next window reset (after ~1 min) the
- * agent gets a single "продолжи" and resumes the interrupted task. One-shot;
- * expires ~2h10m after arming if no reset comes.
+ * agent gets a "продолжи" and resumes the interrupted task. One-shot by
+ * default; "/cont-after-reset N" (N in 1..99) arms N total repetitions, each
+ * confirmed fire re-arming for the next reset. Expires ~8h (ARMS_TTL_MS) after
+ * arming if no reset comes.
  */
 function registerContAfterReset(pi: ExtensionAPI): void {
   pi.registerCommand("cont-after-reset", {
     description:
-      "Взвести/снять автопродолжение после сброса окна лимита. Без аргумента — взвести, 'off' — снять.",
+      "Взвести/снять автопродолжение после сброса окна лимита. Без аргумента — взвести один раз, N (1..99) — взвести на N срабатываний, 'off' — снять.",
     handler: async (args, ctx) => {
       currentCtx = ctx;
       try {
@@ -1068,6 +1073,19 @@ function registerContAfterReset(pi: ExtensionAPI): void {
         const arg = String(args ?? "").trim().toLowerCase();
         const wantOff =
           arg === "off" || arg === "0" || arg === "нет" || arg === "выкл";
+
+        // Optional repeat count: "/cont-after-reset 5" arms 5 total fires.
+        // Empty / non-numeric / out-of-range keeps the classic one-shot
+        // (repeat 1) so existing callers and arbitrary args are unaffected.
+        let repeat = 1;
+        let explicitRepeat = false;
+        if (arg !== "" && !wantOff) {
+          const n = Number(arg);
+          if (Number.isInteger(n) && n >= 1 && n <= 99) {
+            repeat = n;
+            explicitRepeat = true;
+          }
+        }
 
         if (wantOff) {
           const removed = await armsDisarm();
@@ -1082,9 +1100,16 @@ function registerContAfterReset(pi: ExtensionAPI): void {
           return;
         }
 
+        // An explicit numeric argument always re-arms so the requested repeat
+        // count is applied; a bare "/cont-after-reset" stays idempotent (an
+        // existing arm is left untouched).
+        if (explicitRepeat) await armsDisarm();
+
         const st = readStateSync();
-        const existing = armsGetArm();
-        const cur = existing ?? (await armsArm(st?.lastResetAt ?? 0));
+        const existing = explicitRepeat ? null : armsGetArm();
+        const cur =
+          existing ??
+          (await armsArm(st?.lastResetAt ?? 0, Date.now(), repeat));
         if (!cur) {
           ctx.ui.notify(
             "cont-after-reset: не удалось взвести флаг",
@@ -1111,8 +1136,13 @@ function registerContAfterReset(pi: ExtensionAPI): void {
           fireMins === null
             ? "сработает при сбросе окна"
             : `сработает при сбросе окна (через ~${fireMins} мин)`;
+        const rep = cur.repeat ?? 1;
+        const repeatText =
+          rep > 1
+            ? ` Режим повтора: ${rep} срабатываний всего (repeat=${rep}).`
+            : " Одноразовый флаг.";
         ctx.ui.notify(
-          `cont-after-reset: взведён, ${fireText}. Срок годности флага: до ${new Date(cur.expiresAt).toLocaleTimeString()} (${expMins} мин) — если сброса не будет, флаг сгорит.`,
+          `cont-after-reset: взведён, ${fireText}.${repeatText} Срок годности флага: до ${new Date(cur.expiresAt).toLocaleTimeString()} (${expMins} мин) — если сброса не будет, флаг сгорит.`,
           "info",
         );
         refreshMarker();

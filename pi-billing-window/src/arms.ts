@@ -28,8 +28,10 @@
  * ---------
  *  - Phases: "armed" = waiting for the 2-hour window to reset; "pending" =
  *    "продолжи" has already been sent -- the first successful provider
- *    response (confirmSuccess) clears the flag, and index.ts retries the send
- *    every RETRY_AFTER_FIRE_MS after the last 429/attempt.
+ *    response (confirmSuccess) either clears the flag (one-shot) or, for a
+ *    repeat>1 arm, re-arms it with repeat-1 so the next reset fires again.
+ *    index.ts retries the send every RETRY_AFTER_FIRE_MS after the last
+ *    429/attempt.
  *  - TTL: an arm expires ARMS_TTL_MS after arming; expired arms are ignored and
  *    pruned on the next write.
  *  - Trigger: a window reset is detected as state.lastResetAt advancing past the
@@ -51,6 +53,15 @@ export type Arm = {
   phase?: "armed" | "pending";
   /** When "продолжи" was last sent (only meaningful in phase "pending"). */
   lastFireAt?: number;
+  /**
+   * How many fires this arm is good for IN TOTAL, including the one it is
+   * currently waiting for. Absent or 1 = classic one-shot behaviour: the
+   * record is deleted once the send is confirmed. When > 1, confirmation
+   * re-arms the record with `repeat - 1` (armedAt = confirmation time,
+   * lastResetAtAtArm = the state.lastResetAt seen at confirmation, fresh
+   * ARMS_TTL_MS) so it fires again on the NEXT window reset.
+   */
+  repeat?: number;
 };
 
 export type ArmMap = Record<string, Arm>;
@@ -212,11 +223,14 @@ export function getArm(now: number = Date.now()): Arm | null {
 /**
  * Arm "continue after reset" for the current conversation. Records the
  * current state.lastResetAt so only a reset happening AFTER this point fires.
- * Idempotent: if an unexpired arm already exists it is left untouched.
+ * `repeat` (optional) is the TOTAL number of fires the flag is good for; omit
+ * it (or pass 1) for the classic one-shot behaviour. Idempotent: if an
+ * unexpired arm already exists it is left untouched.
  */
 export async function arm(
   lastResetAt: number,
   now: number = Date.now(),
+  repeat?: number,
 ): Promise<Arm | null> {
   const key = currentKey;
   if (!key) return null;
@@ -224,11 +238,15 @@ export async function arm(
     const map = readArmsSync();
     pruneExpired(map, now);
     if (map[key] && map[key].expiresAt > now) return; // already armed
-    map[key] = {
+    const rec: Arm = {
       armedAt: now,
       lastResetAtAtArm: lastResetAt,
       expiresAt: now + ARMS_TTL_MS,
     };
+    if (typeof repeat === "number" && Number.isFinite(repeat)) {
+      rec.repeat = repeat;
+    }
+    map[key] = rec;
     writeArmsSync(map);
   });
   return getArm(now);
@@ -282,24 +300,44 @@ export async function markFired(now: number = Date.now()): Promise<Arm | null> {
 
 /**
  * Confirm a "pending" arm: the first successful provider response after
- * "продолжи" clears the flag (one-shot semantics apply only after a
- * CONFIRMED success). Returns true if a pending arm was removed.
+ * "продолжи" resolves the flag (one-shot semantics apply only after a
+ * CONFIRMED success). One-shot arms (repeat absent or <= 1) are deleted; a
+ * repeat>1 arm is instead re-armed for the NEXT reset: armedAt = now,
+ * lastResetAtAtArm = opts.lastResetAt (0 when omitted), expiresAt =
+ * now + ARMS_TTL_MS, repeat = repeat - 1, phase = "armed", lastFireAt removed.
+ * Returns true when a pending arm was handled (re-armed or removed).
  */
-export async function confirmSuccess(now: number = Date.now()): Promise<boolean> {
+export async function confirmSuccess(
+  now: number = Date.now(),
+  opts?: { lastResetAt?: number },
+): Promise<boolean> {
   const key = currentKey;
   if (!key) return false;
-  let removed = false;
+  let handled = false;
   await withArmsLock(() => {
     const map = readArmsSync();
     pruneExpired(map, now);
     const cur = map[key];
-    if (cur !== undefined && cur.phase === "pending") {
+    if (cur === undefined || cur.phase !== "pending") return;
+    handled = true;
+    const repeat = typeof cur.repeat === "number" ? cur.repeat : 1;
+    if (repeat > 1) {
+      // Re-arm one fewer time; lastFireAt is intentionally dropped so the
+      // next confirmation starts from a clean "armed" record.
+      const next: Arm = {
+        armedAt: now,
+        lastResetAtAtArm: opts?.lastResetAt ?? 0,
+        expiresAt: now + ARMS_TTL_MS,
+        phase: "armed",
+        repeat: repeat - 1,
+      };
+      map[key] = next;
+    } else {
       delete map[key];
-      removed = true;
-      writeArmsSync(map);
     }
+    writeArmsSync(map);
   });
-  return removed;
+  return handled;
 }
 
 /**
