@@ -144,6 +144,20 @@ let stopStatusFn: (() => void) | null = null;
 let piApi: ExtensionAPI | null = null;
 
 /**
+ * Monotonic session epoch. Bumped as the FIRST action of session_shutdown
+ * so deferred code from the old session (poller ticks, .then continuations)
+ * can detect that its captured refs went stale and stop touching them.
+ */
+let sessionEpoch = 0;
+
+/**
+ * Invariant: `piApi` belongs to epoch `piApiEpoch`. If `piApiEpoch !==
+ * sessionEpoch`, the session `piApi` was captured for has been replaced
+ * (new/fork/switch/reload) and `piApi` must not be used.
+ */
+let piApiEpoch = 0;
+
+/**
  * Periodic poller that drives cont-after-reset detection while the current
  * conversation is armed. The armed FLAG survives /new (it is file-backed in
  * arms.ts and re-adopted in session_start); this timer does NOT -- it closes
@@ -280,6 +294,9 @@ function ensureArmedPoller(): void {
  * expired.
  */
 async function evaluateArmedReset(): Promise<void> {
+  // Epoch this evaluation belongs to; re-checked before every await below
+  // so a session replacement mid-flight aborts the chain on stale refs.
+  const ep = sessionEpoch;
   const arm = armsGetArm();
   if (!arm) {
     // Expired or removed. Keep the poller alive: an external writer
@@ -301,6 +318,7 @@ async function evaluateArmedReset(): Promise<void> {
   if (arm.phase === "pending") {
     const retryAfter = Math.max(arm.lastFireAt ?? 0, st?.last429At ?? 0);
     if (now - retryAfter >= RETRY_AFTER_FIRE_MS) {
+      if (ep !== sessionEpoch) return;
       await fireContinue(arm);
     }
     return;
@@ -310,6 +328,7 @@ async function evaluateArmedReset(): Promise<void> {
 
   // A reset has happened since arming. Fire once the grace period has elapsed.
   if (resetReadyToFire(arm, st, now)) {
+    if (ep !== sessionEpoch) return;
     await fireContinue(arm);
     return;
   }
@@ -320,13 +339,17 @@ async function evaluateArmedReset(): Promise<void> {
   if (st.lastResetAt <= arm.lastResetAtAtArm) {
     const msToBoundary = st.windowStartedAt + st.windowMs - now;
     if (msToBoundary <= 0) {
+      const ep = sessionEpoch;
       void checkAndReset(buildEmitFn(), historyMetaOf(currentCtx)).then(() => {
+        if (ep !== sessionEpoch) return;
         void evaluateArmedReset();
       });
     } else if (!boundaryResetTimer) {
       boundaryResetTimer = setTimeout(() => {
         boundaryResetTimer = null;
+        const ep = sessionEpoch;
         void checkAndReset(buildEmitFn(), historyMetaOf(currentCtx)).then(() => {
+          if (ep !== sessionEpoch) return;
           void evaluateArmedReset();
         });
       }, msToBoundary + 500);
@@ -356,6 +379,10 @@ async function fireContinue(_arm: ArmsArm): Promise<void> {
 
   const p = piApi;
   if (!p) return;
+  // Invariant: piApi belongs to epoch piApiEpoch. If the session was
+  // replaced, using piApi throws "ctx is stale" -- the new session's
+  // poller re-adopts the arm on session_start, so just bail out.
+  if (piApiEpoch !== sessionEpoch) return;
 
   try {
     await p.sendUserMessage("продолжи");
@@ -370,6 +397,16 @@ async function fireContinue(_arm: ArmsArm): Promise<void> {
       "при 429 повтор через 10 мин",
     );
   } catch (err) {
+    if (/stale/i.test(String((err as Error)?.message ?? err))) {
+      // pi went stale mid-send (session replaced mid-flight): stop the
+      // poller instead of spamming the same error every ~10 s; the next
+      // session_start restarts it with fresh refs.
+      stopArmedPoller();
+      console.warn(
+        "[pi-billing-window] cont-after-reset: pi устарел (сессия заменена), poller остановлен до session_start",
+      );
+      return;
+    }
     // Failed to send (e.g. bus busy). Keep the arm and poller; retry next poll.
     console.warn(
       "[pi-billing-window] cont-after-reset: не удалось отправить:",
@@ -783,6 +820,12 @@ function onModelSelect(
  * status updater. Re-runs cleanly on quit / reload / new / resume / fork.
  */
 function onSessionShutdown(_event: unknown, _ctx: ExtensionContext): void {
+  // Race guard: a late shutdown for an already-replaced session must not
+  // tear down the new session's freshly restarted poller.
+  if (_ctx && currentCtx && _ctx !== currentCtx) return;
+  // Bump the epoch FIRST so deferred code still holding old-session refs
+  // aborts instead of touching them (stale pi -> runtime error).
+  sessionEpoch++;
   shutdownTicker();
   unsubscribeFromBillingEvents();
   if (stopStatusFn) {
@@ -1162,6 +1205,7 @@ export default function (pi: ExtensionAPI): void {
   eventBus = pi.events;
   // Keep a live ExtensionAPI reference for pi.sendUserMessage (cont-after-reset).
   piApi = pi;
+  piApiEpoch = sessionEpoch;
 
   pi.on("session_start", onSessionStart);
   pi.on("model_select", onModelSelect);
