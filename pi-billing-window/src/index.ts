@@ -184,8 +184,12 @@ const ARMED_POLL_MS = 10_000;
 
 /** A stable per-process identity for the conversation we are showing. */
 function sessionKeyOf(ctx: ExtensionContext | null): string {
-  const f = ctx?.sessionManager?.getSessionFile?.();
-  return typeof f === "string" && f.length > 0 ? f : `ephemeral:${process.pid}`;
+  try {
+    const f = ctx?.sessionManager?.getSessionFile?.();
+    return typeof f === "string" && f.length > 0 ? f : `ephemeral:${process.pid}`;
+  } catch {
+    return `ephemeral:${process.pid}`;
+  }
 }
 
 // --- history.ts helpers -------------------------------------------------------
@@ -203,14 +207,21 @@ function historyMetaOf(ctx: ExtensionContext | null): {
   project: string;
   session: string;
 } {
-  const cwd = ctx?.sessionManager?.getCwd?.();
-  const key = sessionKeyOf(ctx);
-  const session =
-    key.startsWith("ephemeral:") ? key : key.split(/[\\/]/).pop() ?? key;
-  return {
-    project: typeof cwd === "string" ? cwd : "",
-    session,
-  };
+  // ctx may be stale (session replaced while a timer was in flight) -- any
+  // property access on it throws; fall back to a neutral meta instead of
+  // crashing the process.
+  try {
+    const cwd = ctx?.sessionManager?.getCwd?.();
+    const key = sessionKeyOf(ctx);
+    const session =
+      key.startsWith("ephemeral:") ? key : key.split(/[\\/]/).pop() ?? key;
+    return {
+      project: typeof cwd === "string" ? cwd : "",
+      session,
+    };
+  } catch {
+    return { project: "", session: `ephemeral:${process.pid}` };
+  }
 }
 
 /**
@@ -250,13 +261,28 @@ function lastAssistantUsage(ctx: ExtensionContext | null): HistoryUsage | null {
   return null;
 }
 
+/**
+ * Safe `ctx.mode === "tui"` check: the `mode` getter throws on a stale
+ * ctx (session replaced / reloaded while a timer was in flight), so the
+ * plain comparison can kill the whole process via uncaughtException.
+ */
+function ctxIsTui(ctx: ExtensionContext | null): boolean {
+  if (!ctx) return false;
+  try {
+    return ctx.mode === "tui";
+  } catch {
+    // Stale ctx after session replacement or reload -- treat as non-TUI.
+    return false;
+  }
+}
+
 /** Force a footer refresh so the armed indicator appears/disappears promptly. */
 function refreshMarker(): void {
-  if (currentCtx?.mode === "tui") {
-    try {
-      forceUpdateStatus(currentCtx);
-    } catch {}
-  }
+  const ctx = currentCtx;
+  if (!ctxIsTui(ctx)) return;
+  try {
+    forceUpdateStatus(ctx);
+  } catch {}
 }
 
 function clearBoundaryResetTimer(): void {
@@ -472,10 +498,11 @@ function shutdownTicker(): void {
  * notify() would just clutter logs there.
  */
 function handleWindowReset(_payload: unknown): void {
-  if (!currentCtx) return;
-  if (currentCtx.mode !== "tui") return;
+  const ctx = currentCtx;
+  if (!ctx) return;
+  if (!ctxIsTui(ctx)) return;
   try {
-    currentCtx.ui.notify(
+    ctx.ui.notify(
       "wormsoft: 2-часовой лимит сброшен, свежий слот доступен",
       "info",
     );
