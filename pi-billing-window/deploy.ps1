@@ -35,6 +35,7 @@ $files = @(
     "notifier.ts",
     "history.ts",
     "arms.ts",
+    "armslog.ts",
     "package.json"
 )
 

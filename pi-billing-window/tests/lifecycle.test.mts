@@ -22,7 +22,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import piBillingWindowFactory from "../src/index.ts";
+import piBillingWindowFactory, {
+  setArmsLogPath,
+  setStaleRetryMsForTests,
+  __tickArmedForTests,
+} from "../src/index.ts";
 import {
   writeStateSync,
   mutateState,
@@ -164,6 +168,7 @@ function applyPaths(tmp: string): void {
   stateSetPaths(join(tmp, "state.json"), join(tmp, "state.lock"));
   armsSetPaths(join(tmp, "arms.json"), join(tmp, "arms.lock"));
   historySetPaths(join(tmp, "history.csv"), join(tmp, "history.lock"));
+  setArmsLogPath(join(tmp, "armslog.log"));
 }
 
 function cleanupPaths(tmp: string): void {
@@ -248,28 +253,37 @@ async function testReplacementRefires(): Promise<void> {
   applyPaths(tmp);
   try {
     seedFreshWindow();
-    const { pi, handlers, commands, sends } = makeMockPi();
-    piBillingWindowFactory(pi as never);
+    // Session A: arm, then it is replaced. Real pi re-runs the extension
+    // factory for the replacement session with a FRESH pi -- that is what
+    // refreshes piApi -- so the test must simulate exactly that (calling
+    // handlers of the old factory emulates a stale pi and hits the
+    // epoch-mismatch guard on purpose, see testStaleSendKeepsPollerRetries).
+    const a = makeMockPi();
+    piBillingWindowFactory(a.pi as never);
 
     const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
-    await handlerOf(handlers, "session_start")({}, ctx);
-    await commandOf(commands, "cont-after-reset")("", ctx);
+    await handlerOf(a.handlers, "session_start")({}, ctx);
+    await commandOf(a.commands, "cont-after-reset")("", ctx);
     await bumpReset(2);
-    await handlerOf(handlers, "session_shutdown")({}, ctx);
+    await handlerOf(a.handlers, "session_shutdown")({}, ctx);
 
-    // New extension instance for the replacement session.
-    await handlerOf(handlers, "session_start")({ reason: "reload" }, ctx);
-    await sleep(300); // fire is async (lock file I/O for disarm)
+    // Replacement session: fresh factory invocation (fresh pi + handlers).
+    const b = makeMockPi();
+    piBillingWindowFactory(b.pi as never);
+    await handlerOf(b.handlers, "session_start")({ reason: "reload" }, ctx);
+    await __tickArmedForTests(); // deterministic poller evaluation
+    await sleep(150); // the immediate evaluation from session_start is
+    // fire-and-forget (send + lockfile I/O): let it settle before asserting
 
     assert(
-      sends.length === 1 && sends[0]!.content === "продолжи",
+      b.sends.length === 1 && b.sends[0]!.content === "продолжи",
       "replacement: 'продолжи' sent exactly once with the fresh pi",
     );
     assert(
       armsGetArm()?.phase === "pending",
       "replacement: flag switches to pending (not consumed) after the send",
     );
-    await handlerOf(handlers, "after_provider_response")(
+    await handlerOf(b.handlers, "after_provider_response")(      
       { status: 200, headers: {} },
       ctx,
     );
@@ -279,7 +293,7 @@ async function testReplacementRefires(): Promise<void> {
     );
 
     // Stop the ticker/status timers so the test process can exit.
-    await handlerOf(handlers, "session_shutdown")({}, ctx);
+    await handlerOf(b.handlers, "session_shutdown")({}, ctx);
   } finally {
     cleanupPaths(tmp);
   }
@@ -290,6 +304,50 @@ async function testStaleSendKeepsArm(): Promise<void> {
   applyPaths(tmp);
   try {
     seedFreshWindow();
+    // Session A arms; on replacement the factory re-runs with a fresh pi
+    // that REJECTS sends with the stale-ctx error (like pi does mid-replace).
+    const a = makeMockPi();
+    piBillingWindowFactory(a.pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
+    await handlerOf(a.handlers, "session_start")({}, ctx);
+    await commandOf(a.commands, "cont-after-reset")("", ctx);
+    await bumpReset(2);
+    await handlerOf(a.handlers, "session_shutdown")({}, ctx);
+
+    const b = makeMockPi(true);
+    piBillingWindowFactory(b.pi as never);
+    await handlerOf(b.handlers, "session_start")({ reason: "reload" }, ctx);
+    await __tickArmedForTests();
+
+    assert(b.sends.length === 1, "stale-pi: send was attempted");
+    assert(
+      armsIsArmed(),
+      "stale-pi: arm kept after rejected send (retry on next poll)",
+    );
+
+    await handlerOf(b.handlers, "session_shutdown")({}, ctx);
+  } finally {
+    cleanupPaths(tmp);
+  }
+}
+
+/**
+ * REGRESSION (production evidence 2026-09-24..25): a stale-pi send error
+ * used to call stopArmedPoller() "until session_start" -- which never
+ * comes in an idle night session, so ONE stale error killed the whole
+ * cont-after-reset mechanism for the rest of the night. Now the poller
+ * must survive, keep the arm, pace retries and log the failure to the
+ * persistent arms log.
+ */
+async function testStaleSendKeepsPollerRetries(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-stale2-"));
+  applyPaths(tmp);
+  setStaleRetryMsForTests(60);
+  try {
+    seedFreshWindow();
+    // Single live process: the pi rejects sends with the stale error, but
+    // no session replacement ever arrives (the night scenario).
     const { pi, handlers, commands, sends } = makeMockPi(true);
     piBillingWindowFactory(pi as never);
 
@@ -297,19 +355,40 @@ async function testStaleSendKeepsArm(): Promise<void> {
     await handlerOf(handlers, "session_start")({}, ctx);
     await commandOf(commands, "cont-after-reset")("", ctx);
     await bumpReset(2);
-    await handlerOf(handlers, "session_shutdown")({}, ctx);
 
-    await handlerOf(handlers, "session_start")({ reason: "reload" }, ctx);
-    await sleep(300);
-
-    assert(sends.length === 1, "stale-pi: send was attempted");
+    // First fire attempt (deterministic tick): rejected with the stale error.
+    await __tickArmedForTests();
+    assert(sends.length === 1, "stale-poller: первая попытка отправки была");
     assert(
       armsIsArmed(),
-      "stale-pi: arm kept after rejected send (retry on next poll)",
+      "stale-poller: флаг сохранён после stale-ошибки",
+    );
+
+    // The poller must NOT have been stopped: with retry pacing of 60 ms
+    // further attempts follow while the reset is still ready.
+    await sleep(120);
+    await __tickArmedForTests();
+    await sleep(120);
+    await __tickArmedForTests();
+    assert(
+      sends.length >= 2,
+      `stale-poller: poller жив, повторные попытки идут (sends=${sends.length})`,
+    );
+
+    // The stale failure must be visible in the persistent arms log.
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      log.includes("send-error:stale"),
+      "stale-poller: send-error:stale записан в armslog",
+    );
+    assert(
+      log.includes("fire:reset-ready"),
+      "stale-poller: fire:reset-ready записан в armslog",
     );
 
     await handlerOf(handlers, "session_shutdown")({}, ctx);
   } finally {
+    setStaleRetryMsForTests(RETRY_AFTER_FIRE_MS);
     cleanupPaths(tmp);
   }
 }
@@ -618,6 +697,7 @@ async function main(): Promise<void> {
   await testShutdownStopsPoller();
   await testReplacementRefires();
   await testStaleSendKeepsArm();
+  await testStaleSendKeepsPollerRetries();
   await test429Recorded();
   await testPendingRetryNotBeforeRetryDelay();
   await testPendingRetryAndConfirm();

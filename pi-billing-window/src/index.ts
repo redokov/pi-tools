@@ -58,11 +58,15 @@ import {
   confirmSuccess as armsConfirmSuccess,
   isArmed as armsIsArmed,
   getArm as armsGetArm,
+  getKey as armsGetKey,
   resetReadyToFire,
   RESET_GRACE_MS,
   RETRY_AFTER_FIRE_MS,
   type Arm as ArmsArm,
 } from "./arms.js";
+import { armsLog, setArmsLogPath } from "./armslog.js";
+
+export { setArmsLogPath };
 
 const PROVIDER = "wormsoft";
 const WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -179,6 +183,39 @@ let boundaryResetTimer: NodeJS.Timeout | null = null;
 
 /** How often the armed poller wakes up. */
 const ARMED_POLL_MS = 10_000;
+
+/**
+ * After a stale-pi send failure, do not retry the send more often than
+ * this (one log line + one warn per interval, not one per 10s poll tick).
+ * Exported override for tests.
+ */
+let staleRetryMs = RETRY_AFTER_FIRE_MS;
+
+export function setStaleRetryMsForTests(ms: number): void {
+  staleRetryMs = Math.max(0, ms);
+  staleRetryNotBefore = 0; // reset pacing so a previous test's backoff
+  // does not leak into the next one
+}
+
+/**
+ * Earliest moment a send may be attempted again after a stale failure
+ * (module-level, not persisted: a process restart naturally re-arms).
+ */
+let staleRetryNotBefore = 0;
+
+/**
+ * Test hook: run one armed-poller evaluation immediately (the real poller
+ * ticks every 10 s; tests need determinism).
+ */
+export function __tickArmedForTests(): Promise<void> {
+  return evaluateArmedReset();
+}
+
+/**
+ * Track arm visibility changes so evaluateArmedReset logs "arm-seen" /
+ * "arm-gone" only on the transition, not on every 10s tick.
+ */
+let lastArmSeenKey: string | null = null;
 
 // --- cont-after-reset helpers -------------------------------------------------
 
@@ -319,7 +356,25 @@ function ensureArmedPoller(): void {
  * the real zero (not up to 5 min late). Stops itself when the arm is gone or
  * expired.
  */
+/**
+ * In-flight guard: the poller tick (10s), the boundary timer callback and
+ * session_start's immediate evaluation can OVERLAP while a send is being
+ * awaited, double-firing "продолжи" (reproduced by the replacement test:
+ * two send-ok lines for one reset). Serialized here.
+ */
+let armedEvalInFlight = false;
+
 async function evaluateArmedReset(): Promise<void> {
+  if (armedEvalInFlight) return;
+  armedEvalInFlight = true;
+  try {
+    await evaluateArmedResetInner();
+  } finally {
+    armedEvalInFlight = false;
+  }
+}
+
+async function evaluateArmedResetInner(): Promise<void> {
   // Epoch this evaluation belongs to; re-checked before every await below
   // so a session replacement mid-flight aborts the chain on stale refs.
   const ep = sessionEpoch;
@@ -330,7 +385,18 @@ async function evaluateArmedReset(): Promise<void> {
     // conversation at any time, and the 10s no-op tick is what notices.
     clearBoundaryResetTimer();
     refreshMarker();
+    if (lastArmSeenKey !== null) {
+      lastArmSeenKey = null;
+      armsLog("arm-gone", "флаг исчез/истёк (poller продолжает жить)");
+    }
     return;
+  }
+  if (lastArmSeenKey === null) {
+    lastArmSeenKey = armsGetKey();
+    armsLog(
+      "arm-seen",
+      `repeat=${arm.repeat ?? 1} phase=${arm.phase ?? "armed"} key=${lastArmSeenKey?.split(/[\\/]/).pop() ?? "?"}`,
+    );
   }
   const st = readStateSync();
   const now = Date.now();
@@ -354,7 +420,12 @@ async function evaluateArmedReset(): Promise<void> {
 
   // A reset has happened since arming. Fire once the grace period has elapsed.
   if (resetReadyToFire(arm, st, now)) {
+    if (now < staleRetryNotBefore) return; // paced retry after a stale failure
     if (ep !== sessionEpoch) return;
+    armsLog(
+      "fire:reset-ready",
+      `сброс окна ${new Date(st.lastResetAt).toISOString()}, отправляю «продолжи»`,
+    );
     await fireContinue(arm);
     return;
   }
@@ -404,11 +475,20 @@ async function fireContinue(_arm: ArmsArm): Promise<void> {
   }
 
   const p = piApi;
-  if (!p) return;
+  if (!p) {
+    armsLog("block:no-pi", "piApi ещё не захвачен фабрикой — флаг сохранён");
+    return;
+  }
   // Invariant: piApi belongs to epoch piApiEpoch. If the session was
   // replaced, using piApi throws "ctx is stale" -- the new session's
   // poller re-adopts the arm on session_start, so just bail out.
-  if (piApiEpoch !== sessionEpoch) return;
+  if (piApiEpoch !== sessionEpoch) {
+    armsLog(
+      "block:epoch-mismatch",
+      `piApiEpoch=${piApiEpoch} sessionEpoch=${sessionEpoch} — флаг сохранён, повтор когда фабрика обновит ссылки`,
+    );
+    return;
+  }
 
   try {
     await p.sendUserMessage("продолжи");
@@ -417,27 +497,27 @@ async function fireContinue(_arm: ArmsArm): Promise<void> {
     // the provider has not recovered yet and the poller retries every
     // RETRY_AFTER_FIRE_MS.
     await armsMarkFired();
-    console.log(
-      "[pi-billing-window] cont-after-reset: 'продолжи' отправлен, " +
-      "флаг в pending — сниму после первого успешного ответа, " +
-      "при 429 повтор через 10 мин",
-    );
+    staleRetryNotBefore = 0;
+    armsLog("fire:send-ok", "«продолжи» отправлен, флаг в pending до первого успешного ответа");
   } catch (err) {
     if (/stale/i.test(String((err as Error)?.message ?? err))) {
-      // pi went stale mid-send (session replaced mid-flight): stop the
-      // poller instead of spamming the same error every ~10 s; the next
-      // session_start restarts it with fresh refs.
-      stopArmedPoller();
-      console.warn(
-        "[pi-billing-window] cont-after-reset: pi устарел (сессия заменена), poller остановлен до session_start",
+      // pi went stale mid-send. THE OLD BEHAVIOUR was stopArmedPoller()
+      // "until session_start" -- but at night NO session_start ever comes,
+      // so ONE stale error killed the mechanism for the rest of the night
+      // (production evidence 2026-09-24..25: 4 resets, 0 fires, the user
+      // saw exactly this warn). Now: keep the poller and the arm, pace
+      // retries (staleRetryNotBefore) so the next attempt happens after
+      // the factory refreshes piApi (a session replacement re-runs the
+      // factory; /new carries the arm, reload/resume re-adopts it).
+      staleRetryNotBefore = Date.now() + staleRetryMs;
+      armsLog(
+        "send-error:stale",
+        `pi устарел: ${String((err as Error)?.message ?? err).slice(0, 160)} — poller жив, повтор через ${Math.round(staleRetryMs / 60000)} мин`,
       );
       return;
     }
     // Failed to send (e.g. bus busy). Keep the arm and poller; retry next poll.
-    console.warn(
-      "[pi-billing-window] cont-after-reset: не удалось отправить:",
-      err,
-    );
+    armsLog("send-error", String((err as Error)?.message ?? err).slice(0, 200));
   }
   refreshMarker();
 }
@@ -695,6 +775,10 @@ async function onSessionStart(
   } catch (err) {
     console.warn("pi-billing-window: arms session init failed:", err);
   }
+  armsLog(
+    "session-start",
+    `reason=${String((event as { reason?: string } | null)?.reason ?? "?")} key=${armsGetKey()?.split(/[\\/]/).pop() ?? "?"} armed=${armsIsArmed()}`,
+  );
 }
 
 /**
@@ -786,7 +870,12 @@ async function onAfterProviderResponse(
   // re-armed for the NEXT reset. Passing the current state.lastResetAt lets
   // the re-armed record wait for a reset that happens after confirmation.
   const armState = readStateSync();
-  void armsConfirmSuccess(Date.now(), { lastResetAt: armState?.lastResetAt });
+  const confirmed = await armsConfirmSuccess(Date.now(), {
+    lastResetAt: armState?.lastResetAt,
+  });
+  if (confirmed) {
+    armsLog("fire:confirmed", "успешный ответ после «продолжи» — флаг снят/перевзведён");
+  }
 
   if (firstCallJustEmitted) {
     emit("llm:first_call", {
