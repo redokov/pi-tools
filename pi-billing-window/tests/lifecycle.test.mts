@@ -1,15 +1,22 @@
 /**
- * lifecycle.test.mts -- regression tests for the session-replacement fix in
- * src/index.ts (cont-after-reset vs stale extension ctx).
+ * lifecycle.test.mts -- regression tests for cont-after-reset vs session
+ * replacement in src/index.ts (watchdog model).
  *
- * Bug being covered: the cont-after-reset poller (armedPollTimer) and the
- * boundary timer survived session_shutdown and later called
- * piApi.sendUserMessage() on a CAPTURED pi. pi invalidates captured
- * session-bound extension objects on session replacement
- * (new/fork/switch/reload), so the send threw:
+ * What is covered: after a session_shutdown all cont-after-reset timers
+ * (watchdog, pending-retry interval, grace timer, sync-poller) must be dead,
+ * so nothing ever calls sendUserMessage() on a CAPTURED (stale) pi. pi
+ * invalidates captured session-bound extension objects on session
+ * replacement (new/fork/switch/reload), so the send would throw:
  *   "Error: This extension ctx is stale after session replacement or reload"
- * The fix stops the pollers in session_shutdown; session_start re-adopts the
- * (file-backed) arm and restarts the poller against the fresh references.
+ * session_start re-adopts the (file-backed) arm and restarts the machinery
+ * against the fresh references.
+ *
+ * Timing model: real minutes are never waited. The watchdog boundary is made
+ * reachable by backdating state.windowStartedAt (the boundary then lies in
+ * the past and the watchdog fires immediately), the grace and stale-retry
+ * intervals are shrunk via setResetGraceMsForTests() /
+ * setStaleRetryMsForTests(), and resync/retry ticks are driven manually via
+ * __syncWatchdogForTests() / __retryTickForTests().
  *
  * Run: .\node_modules\.bin\tsx.cmd tests/lifecycle.test.mts
  *
@@ -25,7 +32,9 @@ import { join } from "node:path";
 import piBillingWindowFactory, {
   setArmsLogPath,
   setStaleRetryMsForTests,
-  __tickArmedForTests,
+  setResetGraceMsForTests,
+  __syncWatchdogForTests,
+  __retryTickForTests,
 } from "../src/index.ts";
 import {
   writeStateSync,
@@ -39,6 +48,7 @@ import {
   resetPaths as armsResetPaths,
   isArmed as armsIsArmed,
   getArm as armsGetArm,
+  RESET_GRACE_MS,
   RETRY_AFTER_FIRE_MS,
 } from "../src/arms.ts";
 import {
@@ -95,7 +105,7 @@ function makeMockPi(rejectSends = false): {
         busSubs.set(ch, arr);
         return () => {
           const i = arr.indexOf(h);
-          if (i >= 0) arr.splice(i, 1);
+          if (i >= 0) arr.splice(i, i === -1 ? arr.length : 1);
         };
       },
     },
@@ -153,13 +163,19 @@ function seedFreshWindow(): void {
   });
 }
 
-/** Simulate a billing-window reset `minAgo` minutes ago (past the 1 min grace). */
-async function bumpReset(minAgo: number): Promise<void> {
-  const now = Date.now();
+/**
+ * Backdate the window so the boundary (windowStartedAt + windowMs) lies in
+ * the past: the watchdog, once resynced, fires immediately, checkAndReset()
+ * performs a real reset and the (shortened) grace schedules the send.
+ */
+async function expireWindow(): Promise<void> {
   await mutateState((cur) => {
     if (cur === null) throw new Error("state file missing");
     return {
-      next: { ...cur, lastResetAt: now - minAgo * 60_000, windowStartedAt: now },
+      next: {
+        ...cur,
+        windowStartedAt: Date.now() - WINDOW_MS - 1000,
+      },
     };
   });
 }
@@ -193,30 +209,23 @@ function commandOf(
   name: string,
 ): CommandHandler {
   const h = commands.get(name);
-  if (!h) throw new Error(`no command registered for ${name}`);
+  if (!h) throw new Error(`no handler registered for ${name}`);
   return h;
 }
 
 // --- tests --------------------------------------------------------------------
 
 /**
- * Stale-pi resilience (the exact error from the field report): the send is
- * attempted and REJECTED with pi's stale-ctx error. The arm must survive so
- * a healthy instance can retry, and the failure must not crash the poller.
+ * Regression for the reported failure: arm a conversation, let the watchdog
+ * reach a fireable state (boundary in the past -> reset + grace pending),
+ * then shut the session down. Everything must be dead: no sendUserMessage
+ * attempts on the captured (stale) pi. Pre-fix this failed: the pollers
+ * survived shutdown and fired "продолжи" within seconds.
  */
-
-/**
- * Regression for the reported failure: arm a conversation, let a reset
- * happen, replace the session (shutdown without a new session_start -- the
- * old extension instance is gone). The poller must be dead: no
- * sendUserMessage attempts on the captured (stale) pi.
- *
- * Pre-fix this failed: the poller survived shutdown and fired "продолжи"
- * within ARMED_POLL_MS (10 s).
- */
-async function testShutdownStopsPoller(): Promise<void> {
+async function testShutdownStopsTimers(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-shutdown-"));
   applyPaths(tmp);
+  setResetGraceMsForTests(150);
   try {
     seedFreshWindow();
     const { pi, handlers, commands, sends } = makeMockPi();
@@ -225,19 +234,25 @@ async function testShutdownStopsPoller(): Promise<void> {
     const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
     await handlerOf(handlers, "session_start")({}, ctx);
     await commandOf(commands, "cont-after-reset")("", ctx);
-    assert(armsIsArmed(), "shutdown-stops-poller: arm is set");
+    assert(armsIsArmed(), "shutdown-stops-timers: arm is set");
 
-    await bumpReset(2); // reset happened 2 min ago -> past 1 min grace
+    // Boundary in the past: the resync arms the watchdog at a past moment,
+    // it fires immediately, checkAndReset() resets the window and the grace
+    // send is scheduled 150 ms out.
+    await expireWindow();
+    await __syncWatchdogForTests();
+    await sleep(80); // watchdog fired, checkAndReset done, grace pending
+
     await handlerOf(handlers, "session_shutdown")({}, ctx);
 
-    // One full poll interval (10 s) plus slack: a live poller would have
-    // attempted the send by now.
-    await sleep(11_500);
+    // A live grace timer would have sent by now (grace is 150 ms).
+    await sleep(400);
     assert(
       sends.length === 0,
-      "shutdown-stops-poller: no sendUserMessage after session_shutdown (stale-pi bug)",
+      "shutdown-stops-timers: no sendUserMessage after session_shutdown (grace/retry/watchdog stopped)",
     );
   } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
     cleanupPaths(tmp);
   }
 }
@@ -246,11 +261,13 @@ async function testShutdownStopsPoller(): Promise<void> {
  * Replacement session lifecycle: old instance shuts down, a new instance
  * starts for the same conversation ("reload" reason keeps the same key).
  * session_start must re-adopt the file-backed arm, fire "продолжи" once with
- * the FRESH pi, consume the one-shot flag and stop the poller.
+ * the FRESH pi, consume the one-shot flag (pending) and confirm on the first
+ * successful provider response.
  */
 async function testReplacementRefires(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-refire-"));
   applyPaths(tmp);
+  setResetGraceMsForTests(50);
   try {
     seedFreshWindow();
     // Session A: arm, then it is replaced. Real pi re-runs the extension
@@ -264,26 +281,28 @@ async function testReplacementRefires(): Promise<void> {
     const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
     await handlerOf(a.handlers, "session_start")({}, ctx);
     await commandOf(a.commands, "cont-after-reset")("", ctx);
-    await bumpReset(2);
     await handlerOf(a.handlers, "session_shutdown")({}, ctx);
 
     // Replacement session: fresh factory invocation (fresh pi + handlers).
     const b = makeMockPi();
     piBillingWindowFactory(b.pi as never);
     await handlerOf(b.handlers, "session_start")({ reason: "reload" }, ctx);
-    await __tickArmedForTests(); // deterministic poller evaluation
-    await sleep(150); // the immediate evaluation from session_start is
-    // fire-and-forget (send + lockfile I/O): let it settle before asserting
+
+    // Now let the boundary pass and resync: the watchdog fires, resets the
+    // window, and the (shortened) grace sends with the fresh pi.
+    await expireWindow();
+    await __syncWatchdogForTests();
+    await sleep(300); // watchdog fire + checkAndReset + grace are async
 
     assert(
-      b.sends.length === 1 && b.sends[0]!.content === "продолжи",
+      b.sends.length === 1 && b.sends[0]?.content === "продолжи",
       "replacement: 'продолжи' sent exactly once with the fresh pi",
     );
     assert(
       armsGetArm()?.phase === "pending",
       "replacement: flag switches to pending (not consumed) after the send",
     );
-    await handlerOf(b.handlers, "after_provider_response")(      
+    await handlerOf(b.handlers, "after_provider_response")(
       { status: 200, headers: {} },
       ctx,
     );
@@ -295,13 +314,20 @@ async function testReplacementRefires(): Promise<void> {
     // Stop the ticker/status timers so the test process can exit.
     await handlerOf(b.handlers, "session_shutdown")({}, ctx);
   } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
     cleanupPaths(tmp);
   }
 }
 
+/**
+ * Stale-pi resilience (the exact error from the field report): the send is
+ * attempted and REJECTED with pi's stale-ctx error. The arm must survive so
+ * a healthy instance can retry, and the failure must not crash anything.
+ */
 async function testStaleSendKeepsArm(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-stale-"));
   applyPaths(tmp);
+  setResetGraceMsForTests(50);
   try {
     seedFreshWindow();
     // Session A arms; on replacement the factory re-runs with a fresh pi
@@ -312,38 +338,41 @@ async function testStaleSendKeepsArm(): Promise<void> {
     const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
     await handlerOf(a.handlers, "session_start")({}, ctx);
     await commandOf(a.commands, "cont-after-reset")("", ctx);
-    await bumpReset(2);
     await handlerOf(a.handlers, "session_shutdown")({}, ctx);
 
     const b = makeMockPi(true);
     piBillingWindowFactory(b.pi as never);
     await handlerOf(b.handlers, "session_start")({ reason: "reload" }, ctx);
-    await __tickArmedForTests();
+    await expireWindow();
+    await __syncWatchdogForTests();
+    await sleep(300);
 
     assert(b.sends.length === 1, "stale-pi: send was attempted");
     assert(
       armsIsArmed(),
-      "stale-pi: arm kept after rejected send (retry on next poll)",
+      "stale-pi: arm kept after rejected send (retry on next resync)",
     );
 
     await handlerOf(b.handlers, "session_shutdown")({}, ctx);
   } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
     cleanupPaths(tmp);
   }
 }
 
 /**
  * REGRESSION (production evidence 2026-09-24..25): a stale-pi send error
- * used to call stopArmedPoller() "until session_start" -- which never
- * comes in an idle night session, so ONE stale error killed the whole
- * cont-after-reset mechanism for the rest of the night. Now the poller
- * must survive, keep the arm, pace retries and log the failure to the
- * persistent arms log.
+ * used to stop the poller "until session_start" -- which never comes in an
+ * idle night session, so ONE stale error killed the whole cont-after-reset
+ * mechanism for the rest of the night. Now the arm must survive and further
+ * resyncs keep attempting (paced by staleRetryNotBefore), with the failure
+ * visible in the persistent arms log.
  */
 async function testStaleSendKeepsPollerRetries(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-stale2-"));
   applyPaths(tmp);
   setStaleRetryMsForTests(60);
+  setResetGraceMsForTests(20);
   try {
     seedFreshWindow();
     // Single live process: the pi rejects sends with the stale error, but
@@ -354,25 +383,28 @@ async function testStaleSendKeepsPollerRetries(): Promise<void> {
     const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
     await handlerOf(handlers, "session_start")({}, ctx);
     await commandOf(commands, "cont-after-reset")("", ctx);
-    await bumpReset(2);
 
-    // First fire attempt (deterministic tick): rejected with the stale error.
-    await __tickArmedForTests();
+    // First fire attempt (deterministic resync): rejected with the stale
+    // error, but the arm and the machinery survive.
+    await expireWindow();
+    await __syncWatchdogForTests();
+    await sleep(120);
     assert(sends.length === 1, "stale-poller: первая попытка отправки была");
     assert(
       armsIsArmed(),
       "stale-poller: флаг сохранён после stale-ошибки",
     );
 
-    // The poller must NOT have been stopped: with retry pacing of 60 ms
-    // further attempts follow while the reset is still ready.
+    // The resync path must keep working: with retry pacing of 60 ms further
+    // attempts follow while the boundary stays in the past.
     await sleep(120);
-    await __tickArmedForTests();
+    await __syncWatchdogForTests();
     await sleep(120);
-    await __tickArmedForTests();
+    await __syncWatchdogForTests();
+    await sleep(120);
     assert(
       sends.length >= 2,
-      `stale-poller: poller жив, повторные попытки идут (sends=${sends.length})`,
+      `stale-poller: retry жив, повторные попытки идут (sends=${sends.length})`,
     );
 
     // The stale failure must be visible in the persistent arms log.
@@ -389,6 +421,7 @@ async function testStaleSendKeepsPollerRetries(): Promise<void> {
     await handlerOf(handlers, "session_shutdown")({}, ctx);
   } finally {
     setStaleRetryMsForTests(RETRY_AFTER_FIRE_MS);
+    setResetGraceMsForTests(RESET_GRACE_MS);
     cleanupPaths(tmp);
   }
 }
@@ -437,8 +470,8 @@ async function test429Recorded(): Promise<void> {
 
 /**
  * Backdate the pending arm's lastFireAt on disk (the arms file is the
- * persistence layer, so simulating elapsed time is a plain file edit --
- * same idea as bumpReset() does for state).
+ * persistence layer, so simulating elapsed time is a plain file edit -- the
+ * same idea expireWindow() does for the window boundary).
  */
 function backdateLastFireAt(tmp: string, ms: number): void {
   const armsPath = join(tmp, "arms.json");
@@ -459,6 +492,7 @@ function backdateLastFireAt(tmp: string, ms: number): void {
 async function testPendingRetryNotBeforeRetryDelay(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-soon429-"));
   applyPaths(tmp);
+  setResetGraceMsForTests(20);
   try {
     seedFreshWindow();
     const { pi, handlers, commands, sends } = makeMockPi();
@@ -467,8 +501,8 @@ async function testPendingRetryNotBeforeRetryDelay(): Promise<void> {
     const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
     await handlerOf(handlers, "session_start")({}, ctx);
     await commandOf(commands, "cont-after-reset")("", ctx);
-    await bumpReset(2);
-    await commandOf(commands, "cont-after-reset")("", ctx); // immediate fire
+    await expireWindow();
+    await __syncWatchdogForTests(); // deterministic watchdog fire
     await sleep(300);
     assert(sends.length === 1, "soon-429: first 'продолжи' sent");
     assert(
@@ -484,7 +518,8 @@ async function testPendingRetryNotBeforeRetryDelay(): Promise<void> {
 
     // 11 minutes since the send, but the 429 is fresh -> NO retry yet.
     backdateLastFireAt(tmp, RETRY_AFTER_FIRE_MS + 60_000);
-    await commandOf(commands, "cont-after-reset")("", ctx); // re-evaluate
+    await __syncWatchdogForTests(); // pending branch -> retry interval
+    await __retryTickForTests();
     await sleep(300);
     assert(
       sends.length === 1,
@@ -493,18 +528,20 @@ async function testPendingRetryNotBeforeRetryDelay(): Promise<void> {
 
     await handlerOf(handlers, "session_shutdown")({}, ctx);
   } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
     cleanupPaths(tmp);
   }
 }
 
 /**
  * Pending phase: once RETRY_AFTER_FIRE_MS have passed since the last
- * attempt/429, the poller retries the send; the first successful response
+ * attempt/429, the retry tick re-sends; the first successful response
  * then confirms and clears the pending flag.
  */
 async function testPendingRetryAndConfirm(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-pending-"));
   applyPaths(tmp);
+  setResetGraceMsForTests(20);
   try {
     seedFreshWindow();
     const { pi, handlers, commands, sends } = makeMockPi();
@@ -513,8 +550,8 @@ async function testPendingRetryAndConfirm(): Promise<void> {
     const ctx = makeCtx(join(tmp, "sess-a.jsonl"));
     await handlerOf(handlers, "session_start")({}, ctx);
     await commandOf(commands, "cont-after-reset")("", ctx);
-    await bumpReset(2);
-    await commandOf(commands, "cont-after-reset")("", ctx); // immediate fire
+    await expireWindow();
+    await __syncWatchdogForTests(); // deterministic watchdog fire
     await sleep(300);
     assert(sends.length === 1, "pending-retry: first 'продолжи' sent");
     assert(
@@ -535,8 +572,9 @@ async function testPendingRetryAndConfirm(): Promise<void> {
       };
     });
 
-    // Re-entering the command re-evaluates the pending arm -> retry fire.
-    await commandOf(commands, "cont-after-reset")("", ctx);
+    // The pending-retry tick re-sends "продолжи".
+    await __syncWatchdogForTests(); // pending branch -> retry interval
+    await __retryTickForTests();
     await sleep(300);
     assert(
       sends.length === 2,
@@ -562,6 +600,7 @@ async function testPendingRetryAndConfirm(): Promise<void> {
 
     await handlerOf(handlers, "session_shutdown")({}, ctx);
   } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
     cleanupPaths(tmp);
   }
 }
@@ -632,6 +671,7 @@ async function testContAfterResetArgParsing(): Promise<void> {
 async function testRepeatRearmAcrossResets(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-repeat-"));
   applyPaths(tmp);
+  setResetGraceMsForTests(20);
   try {
     seedFreshWindow();
     const { pi, handlers, commands, sends } = makeMockPi();
@@ -645,8 +685,8 @@ async function testRepeatRearmAcrossResets(): Promise<void> {
     assert(armsGetArm()?.repeat === 3, "repeat-e2e: armed with repeat=3");
 
     // First window reset -> first "продолжи".
-    await bumpReset(2);
-    await cmd("", ctx);
+    await expireWindow();
+    await __syncWatchdogForTests();
     await sleep(300);
     assert(sends.length === 1, "repeat-e2e: first 'продолжи' sent");
     assert(armsGetArm()?.phase === "pending", "repeat-e2e: pending after send");
@@ -671,8 +711,8 @@ async function testRepeatRearmAcrossResets(): Promise<void> {
     );
 
     // Second window reset -> fires again (the nightly-repeat fix).
-    await bumpReset(2);
-    await cmd("", ctx);
+    await expireWindow();
+    await __syncWatchdogForTests();
     await sleep(300);
     assert(
       sends.length === 2,
@@ -686,6 +726,7 @@ async function testRepeatRearmAcrossResets(): Promise<void> {
 
     await handlerOf(handlers, "session_shutdown")({}, ctx);
   } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
     cleanupPaths(tmp);
   }
 }
@@ -694,7 +735,7 @@ async function testRepeatRearmAcrossResets(): Promise<void> {
 
 async function main(): Promise<void> {
   console.log("\n=== Lifecycle tests (session replacement / cont-after-reset) ===");
-  await testShutdownStopsPoller();
+  await testShutdownStopsTimers();
   await testReplacementRefires();
   await testStaleSendKeepsArm();
   await testStaleSendKeepsPollerRetries();

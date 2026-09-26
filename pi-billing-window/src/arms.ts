@@ -80,7 +80,7 @@ export const RESET_GRACE_MS = 60 * 1000;
  * send means the provider has not recovered yet; retry instead of losing
  * the flag.
  */
-export const RETRY_AFTER_FIRE_MS = 10 * 60 * 1000;
+export const RETRY_AFTER_FIRE_MS = 5 * 60 * 1000;
 /** Minimum TTL of a pending flag after markFired(): room to await confirmation. */
 const PENDING_MS = 60 * 60 * 1000; // 1 hour
 

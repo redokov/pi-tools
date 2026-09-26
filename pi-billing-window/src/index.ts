@@ -59,12 +59,15 @@ import {
   isArmed as armsIsArmed,
   getArm as armsGetArm,
   getKey as armsGetKey,
-  resetReadyToFire,
   RESET_GRACE_MS,
   RETRY_AFTER_FIRE_MS,
-  type Arm as ArmsArm,
 } from "./arms.js";
 import { armsLog, setArmsLogPath } from "./armslog.js";
+import {
+  armWatchdog,
+  clearWatchdog,
+  computeFireAt,
+} from "./watchdog.js";
 
 export { setArmsLogPath };
 
@@ -162,31 +165,37 @@ let sessionEpoch = 0;
 let piApiEpoch = 0;
 
 /**
- * Periodic poller that drives cont-after-reset detection while the current
- * conversation is armed. The armed FLAG survives /new (it is file-backed in
- * arms.ts and re-adopted in session_start); this timer does NOT -- it closes
+ * cont-after-reset timers. The armed FLAG survives /new (it is file-backed in
+ * arms.ts and re-adopted in session_start); these timers do NOT -- they close
  * over this session's captured pi/ctx, which pi invalidates on session
- * replacement (new/fork/switch/reload). session_shutdown therefore stops it,
- * and session_start restarts it against the fresh references when the arm
- * is still active. Using the captured pi after replacement throws
- * "extension ctx is stale" (docs: Session replacement lifecycle and footguns).
+ * replacement (new/fork/switch/reload). session_shutdown therefore stops them,
+ * and session_start restarts them against the fresh references. Using the
+ * captured pi after replacement throws "extension ctx is stale" (docs:
+ * Session replacement lifecycle and footguns).
+ *
+ *  - retryTimer: slow interval (RETRY_AFTER_FIRE_MS) re-sending "продолжи"
+ *    while an arm is in phase "pending";
+ *  - graceTimer: one-shot send of "продолжи" RESET_GRACE_MS after the reset;
+ *  - syncTimer: slow poller (SYNC_POLL_MS) whose only job is to notice
+ *    external writes into arms.json and resync the watchdog.
  */
-let armedPollTimer: NodeJS.Timeout | null = null;
+let retryTimer: NodeJS.Timeout | null = null;
+let graceTimer: NodeJS.Timeout | null = null;
+let syncTimer: NodeJS.Timeout | null = null;
 
-/**
- * One-shot timer that forces checkAndReset() at the true 2h boundary while a
- * conversation is armed, so the reset (and thus the "продолжи") does not have
- * to wait up to the 5-minute tick. Cleared together with the poller on
- * session_shutdown for the same staleness reason.
- */
-let boundaryResetTimer: NodeJS.Timeout | null = null;
+/** How often the sync-poller resyncs the watchdog (external arms writes). */
+const SYNC_POLL_MS = 60_000;
 
-/** How often the armed poller wakes up. */
-const ARMED_POLL_MS = 10_000;
+/** Grace override for tests (production value is RESET_GRACE_MS). */
+let resetGraceMs = RESET_GRACE_MS;
+
+export function setResetGraceMsForTests(ms: number): void {
+  resetGraceMs = Math.max(0, ms);
+}
 
 /**
  * After a stale-pi send failure, do not retry the send more often than
- * this (one log line + one warn per interval, not one per 10s poll tick).
+ * this (one log line + one warn per interval, not one per resync).
  * Exported override for tests.
  */
 let staleRetryMs = RETRY_AFTER_FIRE_MS;
@@ -203,17 +212,29 @@ export function setStaleRetryMsForTests(ms: number): void {
  */
 let staleRetryNotBefore = 0;
 
+// --- Test hooks (deterministic; no real minutes are ever waited) --------------
+
 /**
- * Test hook: run one armed-poller evaluation immediately (the real poller
- * ticks every 10 s; tests need determinism).
+ * Test hook: run one full watchdog resync immediately (what the sync-poller
+ * tick and every mutation point do).
  */
-export function __tickArmedForTests(): Promise<void> {
-  return evaluateArmedReset();
+export function __syncWatchdogForTests(): void {
+  syncWatchdog();
+}
+
+/** Test hook: force one watchdog fire (reset + grace + send scheduling). */
+export function __fireWatchdogForTests(): Promise<void> {
+  return onWatchdogFire();
+}
+
+/** Test hook: run one pending-retry tick manually (interval is 5 min). */
+export function __retryTickForTests(): Promise<void> {
+  return retryTick();
 }
 
 /**
- * Track arm visibility changes so evaluateArmedReset logs "arm-seen" /
- * "arm-gone" only on the transition, not on every 10s tick.
+ * Track arm visibility changes so syncWatchdog logs "arm-seen" /
+ * "arm-gone" only on the transition, not on every sync tick.
  */
 let lastArmSeenKey: string | null = null;
 
@@ -322,147 +343,221 @@ function refreshMarker(): void {
   } catch {}
 }
 
-function clearBoundaryResetTimer(): void {
-  if (boundaryResetTimer) {
-    clearTimeout(boundaryResetTimer);
-    boundaryResetTimer = null;
+function stopRetryInterval(): void {
+  if (retryTimer !== null) {
+    clearInterval(retryTimer);
+    retryTimer = null;
   }
 }
 
-function stopArmedPoller(): void {
-  if (armedPollTimer) {
-    clearInterval(armedPollTimer);
-    armedPollTimer = null;
+function stopGraceTimer(): void {
+  if (graceTimer !== null) {
+    clearTimeout(graceTimer);
+    graceTimer = null;
   }
-  clearBoundaryResetTimer();
+}
+
+function stopSyncPoller(): void {
+  if (syncTimer !== null) {
+    clearInterval(syncTimer);
+    syncTimer = null;
+  }
 }
 
 /**
- * Ensure the armed poller is running (used after arming / adoption).
+ * Stop every timer that closes over this session's captured pi/ctx. The
+ * armed flag itself is file-backed (arms.ts) and is re-adopted by
+ * session_start, which restarts the sync-poller with fresh references.
  */
-function ensureArmedPoller(): void {
-  if (!armedPollTimer) {
-    armedPollTimer = setInterval(() => {
-      void evaluateArmedReset();
-    }, ARMED_POLL_MS);
-  }
-  void evaluateArmedReset();
+function stopWatchdogTimers(): void {
+  stopSyncPoller();
+  stopRetryInterval();
+  stopGraceTimer();
+  clearWatchdog();
 }
 
 /**
- * While a conversation is armed: (1) fire "продолжи" once a reset since the
- * arming has passed, and the 60 s grace has elapsed; (2) otherwise schedule a
- * one-shot force-reset at the true window boundary so the trigger lands near
- * the real zero (not up to 5 min late). Stops itself when the arm is gone or
- * expired.
+ * Pending-phase retry loop ("продолжи" sent, awaiting the first successful
+ * provider response). The interval itself is RETRY_AFTER_FIRE_MS; the tick
+ * re-checks the pacing condition against the current arm/state.
  */
-/**
- * In-flight guard: the poller tick (10s), the boundary timer callback and
- * session_start's immediate evaluation can OVERLAP while a send is being
- * awaited, double-firing "продолжи" (reproduced by the replacement test:
- * two send-ok lines for one reset). Serialized here.
- */
-let armedEvalInFlight = false;
-
-async function evaluateArmedReset(): Promise<void> {
-  if (armedEvalInFlight) return;
-  armedEvalInFlight = true;
-  try {
-    await evaluateArmedResetInner();
-  } finally {
-    armedEvalInFlight = false;
-  }
+function ensureRetryInterval(): void {
+  if (retryTimer !== null) return;
+  retryTimer = setInterval(() => {
+    void retryTick();
+  }, RETRY_AFTER_FIRE_MS);
+  retryTimer.unref();
 }
 
-async function evaluateArmedResetInner(): Promise<void> {
-  // Epoch this evaluation belongs to; re-checked before every await below
-  // so a session replacement mid-flight aborts the chain on stale refs.
-  const ep = sessionEpoch;
+/**
+ * Start (once per session) the slow sync-poller and resync the watchdog
+ * immediately. The sync-poller's ONLY job is to notice external writes into
+ * arms.json (night helper script) and call syncWatchdog(); it never sends
+ * anything itself.
+ */
+function ensureSyncPoller(): void {
+  if (syncTimer === null) {
+    syncTimer = setInterval(() => {
+      syncWatchdog();
+    }, SYNC_POLL_MS);
+    syncTimer.unref();
+  }
+  syncWatchdog();
+}
+
+/**
+ * In-flight guard: the watchdog fire, the pending-retry tick and the grace
+ * callback can OVERLAP while a send is being awaited, double-firing
+ * "продолжи" (reproduced by the replacement test: two send-ok lines for one
+ * reset). Serialized here. A failure inside the guarded fn is logged, never
+ * propagated (callers use fire-and-forget `void`).
+ */
+let watchdogEvalInFlight = false;
+
+function runGuarded(fn: () => Promise<void>): Promise<void> {
+  if (watchdogEvalInFlight) return Promise.resolve();
+  watchdogEvalInFlight = true;
+  return (async () => {
+    try {
+      await fn();
+    } catch (err) {
+      armsLog(
+        "watchdog:eval-error",
+        String((err as Error)?.message ?? err).slice(0, 200),
+      );
+    } finally {
+      watchdogEvalInFlight = false;
+    }
+  })();
+}
+
+/**
+ * Full resync of the cont-after-reset machinery against the CURRENT arm and
+ * state on disk. Never sends anything itself:
+ *  - no arm: watchdog on the window boundary anyway (a precise reset even
+ *    without a flag); retry/grace stopped;
+ *  - arm "armed": watchdog on the window boundary -- or, when a reset
+ *    already happened after arming (missed boundary / another process /
+ *    a failed send), on reset+grace, which fires immediately once the grace
+ *    has elapsed;
+ *  - arm "pending": retry interval; watchdog/grace cleared.
+ */
+function syncWatchdog(): void {
   const arm = armsGetArm();
-  if (!arm) {
-    // Expired or removed. Keep the poller alive: an external writer
-    // (night-agent helper scripts/arm_cont_after_reset.py) can (re)arm this
-    // conversation at any time, and the 10s no-op tick is what notices.
-    clearBoundaryResetTimer();
-    refreshMarker();
+  const st = readStateSync();
+  const key = armsGetKey();
+
+  if (arm === null) {
+    if (st !== null) {
+      armWatchdog(computeFireAt(st), onWatchdogFire);
+    } else {
+      clearWatchdog();
+    }
+    stopRetryInterval();
+    stopGraceTimer();
     if (lastArmSeenKey !== null) {
       lastArmSeenKey = null;
-      armsLog("arm-gone", "флаг исчез/истёк (poller продолжает жить)");
+      armsLog("arm-gone", "флаг исчез/истёк (sync-poller продолжает жить)");
     }
+    refreshMarker();
     return;
   }
+
   if (lastArmSeenKey === null) {
-    lastArmSeenKey = armsGetKey();
+    lastArmSeenKey = key;
     armsLog(
       "arm-seen",
-      `repeat=${arm.repeat ?? 1} phase=${arm.phase ?? "armed"} key=${lastArmSeenKey?.split(/[\\/]/).pop() ?? "?"}`,
+      `repeat=${arm.repeat ?? 1} phase=${arm.phase ?? "armed"} key=${key?.split(/[\\/]/).pop() ?? "?"}`
     );
   }
-  const st = readStateSync();
-  const now = Date.now();
 
-  // "продолжи" has already been sent for this arm (phase "pending"): wait
-  // for the first successful provider response to clear the flag
-  // (confirmSuccess, called from onAfterProviderResponse), retrying the
-  // send no more often than every RETRY_AFTER_FIRE_MS after the last
-  // attempt/429. In "pending" neither resetReadyToFire nor the boundary
-  // logic below applies.
+  stopGraceTimer();
   if (arm.phase === "pending") {
-    const retryAfter = Math.max(arm.lastFireAt ?? 0, st?.last429At ?? 0);
-    if (now - retryAfter >= RETRY_AFTER_FIRE_MS) {
-      if (ep !== sessionEpoch) return;
-      await fireContinue(arm);
-    }
+    clearWatchdog();
+    ensureRetryInterval();
     return;
   }
 
-  if (!st) return;
+  stopRetryInterval();
+  if (st === null) {
+    clearWatchdog();
+    return;
+  }
+  let fireAt = computeFireAt(st);
+  // A reset already happened after arming: the interesting moment is
+  // reset+grace (in the past -> immediate fire), not the new boundary.
+  if (st.lastResetAt > arm.lastResetAtAtArm) {
+    fireAt = Math.min(fireAt, st.lastResetAt + resetGraceMs);
+  }
+  armWatchdog(fireAt, onWatchdogFire);
+}
 
-  // A reset has happened since arming. Fire once the grace period has elapsed.
-  if (resetReadyToFire(arm, st, now)) {
-    if (now < staleRetryNotBefore) return; // paced retry after a stale failure
+/** One pending-retry tick (also exposed to tests for determinism). */
+async function retryTick(): Promise<void> {
+  return runGuarded(async () => {
+    const arm = armsGetArm();
+    if (!arm || arm.phase !== "pending") return;
+    const st = readStateSync();
+    const retryAfter = Math.max(arm.lastFireAt ?? 0, st?.last429At ?? 0);
+    if (Date.now() - retryAfter < RETRY_AFTER_FIRE_MS) return;
+    await fireContinue();
+  });
+}
+
+/**
+ * The watchdog fired (window boundary or reset+grace): do a precise
+ * checkAndReset() and, when the conversation is armed, schedule the
+ * "продолжи" send after the grace period. The grace delay is measured from
+ * state.lastResetAt, so a reset that happened before the fire (lazy ticker,
+ * another process) does not wait the grace twice.
+ */
+async function onWatchdogFire(): Promise<void> {
+  return runGuarded(async () => {
+    const ep = sessionEpoch;
+    // A stray fire while a previous grace is pending would schedule a
+    // second grace timer -- drop the previous one first (found by e2e).
+    stopGraceTimer();
+    try {
+      await checkAndReset(buildEmitFn(), historyMetaOf(currentCtx));
+    } catch (err) {
+      armsLog(
+        "watchdog:reset-error",
+        String((err as Error)?.message ?? err).slice(0, 160),
+      );
+      return;
+    }
     if (ep !== sessionEpoch) return;
+    if (armsGetArm() === null) return;
+    const st = readStateSync();
+    const base = st !== null && st.lastResetAt > 0 ? st.lastResetAt : Date.now();
+    const delay = Math.max(0, base + resetGraceMs - Date.now());
     armsLog(
       "fire:reset-ready",
-      `сброс окна ${new Date(st.lastResetAt).toISOString()}, отправляю «продолжи»`,
+      `watchdog: сброс окна ${new Date(base).toISOString()}, отправляю «продолжи» через ${Math.round(delay / 1000)} с`
     );
-    await fireContinue(arm);
-    return;
-  }
-
-  // No reset yet (or reset too recent to act on). If the window already reads
-  // expired but lastResetAt has not advanced (another process owns the lazy
-  // tick), force a boundary reset soon.
-  if (st.lastResetAt <= arm.lastResetAtAtArm) {
-    const msToBoundary = st.windowStartedAt + st.windowMs - now;
-    if (msToBoundary <= 0) {
-      const ep = sessionEpoch;
-      void checkAndReset(buildEmitFn(), historyMetaOf(currentCtx)).then(() => {
-        if (ep !== sessionEpoch) return;
-        void evaluateArmedReset();
-      });
-    } else if (!boundaryResetTimer) {
-      boundaryResetTimer = setTimeout(() => {
-        boundaryResetTimer = null;
-        const ep = sessionEpoch;
-        void checkAndReset(buildEmitFn(), historyMetaOf(currentCtx)).then(() => {
-          if (ep !== sessionEpoch) return;
-          void evaluateArmedReset();
-        });
-      }, msToBoundary + 500);
-    }
-  }
+    graceTimer = setTimeout(() => {
+      graceTimer = null;
+      if (ep !== sessionEpoch) return;
+      void runGuarded(fireContinue);
+    }, delay);
+    graceTimer.unref();
+  });
 }
 
 /**
  * Send the one-word "продолжи" so the interrupted agent resumes. Guards:
  *  - only when the agent is idle (spec: "if the agent is streaming, do
- *    nothing" -- we keep the arm and retry on the next poll);
- *  - only after the grace period (handled by the caller).
+ *    nothing" -- we keep the arm and retry on the next tick);
+ *  - only after the grace period (handled by the caller);
+ *  - paced after a stale-pi failure (staleRetryNotBefore).
  * After a successful send the flag switches to "pending" (markFired); the
  * first successful provider response confirms it (confirmSuccess).
  */
-async function fireContinue(_arm: ArmsArm): Promise<void> {
+async function fireContinue(): Promise<void> {
+  if (Date.now() < staleRetryNotBefore) {
+    // Paced retry after a stale failure -- the arm and the timers stay.
+    return;
+  }
   let idle = true;
   try {
     idle = currentCtx?.isIdle?.() ?? true;
@@ -470,7 +565,7 @@ async function fireContinue(_arm: ArmsArm): Promise<void> {
     idle = true;
   }
   if (!idle) {
-    // Streaming -- spec says do nothing. Keep the arm; next poll retries.
+    // Streaming -- spec says do nothing. Keep the arm; the next tick retries.
     return;
   }
 
@@ -481,7 +576,7 @@ async function fireContinue(_arm: ArmsArm): Promise<void> {
   }
   // Invariant: piApi belongs to epoch piApiEpoch. If the session was
   // replaced, using piApi throws "ctx is stale" -- the new session's
-  // poller re-adopts the arm on session_start, so just bail out.
+  // sync-poller re-adopts the arm on session_start, so just bail out.
   if (piApiEpoch !== sessionEpoch) {
     armsLog(
       "block:epoch-mismatch",
@@ -494,29 +589,29 @@ async function fireContinue(_arm: ArmsArm): Promise<void> {
     await p.sendUserMessage("продолжи");
     // Sent: switch the flag to "pending" instead of consuming it. The first
     // successful provider response (confirmSuccess) clears it; a 429 means
-    // the provider has not recovered yet and the poller retries every
+    // the provider has not recovered yet and the retry loop re-sends every
     // RETRY_AFTER_FIRE_MS.
     await armsMarkFired();
     staleRetryNotBefore = 0;
     armsLog("fire:send-ok", "«продолжи» отправлен, флаг в pending до первого успешного ответа");
   } catch (err) {
     if (/stale/i.test(String((err as Error)?.message ?? err))) {
-      // pi went stale mid-send. THE OLD BEHAVIOUR was stopArmedPoller()
+      // pi went stale mid-send. THE OLD BEHAVIOUR was stopping the poller
       // "until session_start" -- but at night NO session_start ever comes,
       // so ONE stale error killed the mechanism for the rest of the night
       // (production evidence 2026-09-24..25: 4 resets, 0 fires, the user
-      // saw exactly this warn). Now: keep the poller and the arm, pace
+      // saw exactly this warn). Now: keep the arm and the timers, pace
       // retries (staleRetryNotBefore) so the next attempt happens after
       // the factory refreshes piApi (a session replacement re-runs the
       // factory; /new carries the arm, reload/resume re-adopts it).
       staleRetryNotBefore = Date.now() + staleRetryMs;
       armsLog(
         "send-error:stale",
-        `pi устарел: ${String((err as Error)?.message ?? err).slice(0, 160)} — poller жив, повтор через ${Math.round(staleRetryMs / 60000)} мин`,
+        `pi устарел: ${String((err as Error)?.message ?? err).slice(0, 160)} — retry жив, повтор через ${Math.round(staleRetryMs / 60000)} мин`,
       );
       return;
     }
-    // Failed to send (e.g. bus busy). Keep the arm and poller; retry next poll.
+    // Failed to send (e.g. bus busy). Keep the arm; the next tick retries.
     armsLog("send-error", String((err as Error)?.message ?? err).slice(0, 200));
   }
   refreshMarker();
@@ -767,10 +862,10 @@ async function onSessionStart(
     } else {
       armsSwitchKey(key);
     }
-    // Always run the armed poller: the arm can be (re)created at any time by
+    // Always run the sync-poller: the arm can be (re)created at any time by
     // an external writer (night-agent helper scripts/arm_cont_after_reset.py),
-    // and a live poller is what notices and fires "продолжи".
-    ensureArmedPoller();
+    // and a live sync-poller is what notices and re-arms the watchdog.
+    ensureSyncPoller();
     refreshMarker();
   } catch (err) {
     console.warn("pi-billing-window: arms session init failed:", err);
@@ -875,6 +970,9 @@ async function onAfterProviderResponse(
   });
   if (confirmed) {
     armsLog("fire:confirmed", "успешный ответ после «продолжи» — флаг снят/перевзведён");
+    // Re-arm the watchdog for the next boundary (repeat>1) or drop it
+    // (the one-shot arm was removed by confirmSuccess).
+    syncWatchdog();
   }
 
   if (firstCallJustEmitted) {
@@ -952,10 +1050,10 @@ function onSessionShutdown(_event: unknown, _ctx: ExtensionContext): void {
   }
   // cont-after-reset: stop timers that close over this session's captured
   // pi/ctx. The armed flag itself lives in arms.ts (file-backed) and is
-  // re-adopted by session_start, which restarts the poller with fresh refs.
-  // Keeping these timers alive past replacement left them calling
+  // re-adopted by session_start, which restarts the sync-poller with fresh
+  // refs. Keeping these timers alive past replacement left them calling
   // piApi.sendUserMessage() on a stale pi -> "extension ctx is stale" spam.
-  stopArmedPoller();
+  stopWatchdogTimers();
   // We deliberately do NOT clear currentCtx -- a fresh session_start will
   // overwrite it, and clearing it here would lose any pending notifications.
 }
@@ -1196,6 +1294,10 @@ function registerSettimer(pi: ExtensionAPI): void {
         });
       }
 
+      // The watchdog must track the (possibly moved) window boundary: resync
+      // after the state mutation in BOTH branches (0 = reset, sync = shift).
+      syncWatchdog();
+
       ctx.ui.notify(
         durationMs === 0
           ? "Таймер: окно сброшено (свежие 2 часа)"
@@ -1248,7 +1350,7 @@ function registerContAfterReset(pi: ExtensionAPI): void {
 
         if (wantOff) {
           const removed = await armsDisarm();
-          stopArmedPoller();
+          syncWatchdog();
           ctx.ui.notify(
             removed
               ? "cont-after-reset: флаг снят"
@@ -1276,7 +1378,7 @@ function registerContAfterReset(pi: ExtensionAPI): void {
           );
           return;
         }
-        ensureArmedPoller();
+        syncWatchdog();
         const now = Date.now();
         const expMins = Math.max(0, Math.ceil((cur.expiresAt - now) / 60_000));
 
