@@ -107,6 +107,7 @@ export function startTicker(emit: EmitFn): () => void {
   intervalHandle = setInterval(() => {
     void checkAndReset(emit);
   }, TICK_MS);
+  intervalHandle.unref();
 
   return () => {
     if (intervalHandle !== null) {
@@ -121,4 +122,12 @@ export function stopTicker(): void {
     clearInterval(intervalHandle);
     intervalHandle = null;
   }
+}
+
+/**
+ * Spec 003 (exit hygiene): test probe -- whether the running interval is
+ * ref'd (keeps the event loop alive). null = no interval running.
+ */
+export function hasRefForTests(): boolean | null {
+  return intervalHandle === null ? null : intervalHandle.hasRef();
 }

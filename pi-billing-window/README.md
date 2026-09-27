@@ -119,6 +119,7 @@ C:\Tools\pi-billing-window\
 │   ├── lifecycle.test.mts      # регресс-тесты замены сессии (stale ctx, cont-after-reset)
 │   ├── replacement.test.mts    # spec 002: replacement не теряет флаг молча (FR-001)
 │   ├── stale-capitulation.test.mts # spec 002: N=6 backoff + капитуляция с notify (FR-003/004)
+│   ├── exit-hygiene.test.mts  # spec 003: юнит unref-контракт + e2e "каждый сьют exit 0"
 │   └── billing_report_test.py  # python-тесты MD-отчёта (секция By model)
 ├── docs/
 │   ├── ARCHITECTURE.md    # подробный разбор модулей и потоков
@@ -274,6 +275,7 @@ New-Item -ItemType SymbolicLink `
 - внешний poller 10 с удалён; его роль подхватил медленный sync-poller
   (60 с), который лишь замечает внешние записи в arms.json (ночной
   helper-скрипт) и пересинхронизирует watchdog — сам он ничего не шлёт;
+- гигиена завершения (spec 003): все периодические таймеры расширения (ticker, statusUpdater, sync/retry/grace) unref'нуты — ни один не держит процесс pi или теста живым после завершения основной работы;
 - продолжается только взведённое окно. Остальные окна сброс просто отражают
   в счётчике.
 

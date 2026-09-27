@@ -136,6 +136,7 @@ export function startStatusUpdater(
       applyStatus(currentCtx, currentKey);
     }
   }, intervalMs);
+  currentInterval.unref();
 
   // Capture for the stopper so it can clean up exactly what it started
   // even if a subsequent startStatusUpdater() has swapped module state.
@@ -175,4 +176,12 @@ export function stopStatusUpdater(): void {
   }
   currentCtx = null;
   currentKey = null;
+}
+
+/**
+ * Spec 003 (exit hygiene): test probe -- whether the running interval is
+ * ref'd (keeps the event loop alive). null = no interval running.
+ */
+export function hasRefForTests(): boolean | null {
+  return currentInterval === null ? null : currentInterval.hasRef();
 }
