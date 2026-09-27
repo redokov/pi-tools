@@ -6,3 +6,4 @@
 | Spec | Статус | Артефакты |
 |---|---|---|
 | `001-model-in-history` | tasks:draft | requirements.md, design.md, tasks.md |
+| `002-cont-after-reset-stale-session` | requirements:draft | requirements.md, design.md, tasks.md |
