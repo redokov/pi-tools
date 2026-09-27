@@ -232,12 +232,26 @@ function backdateLastFireAt(tmp: string, ms: number): void {
   writeFileSync(armsPath, JSON.stringify(map, null, 2), "utf8");
 }
 
-/** Backdate state.last429At (drives the pending-retry pacing). */
+/** Backdate state.last429At (spec 005: no longer paces the pending branch). */
 async function backdateLast429At(ms: number): Promise<void> {
   await mutateState((cur) => {
     if (cur === null) throw new Error("state file missing");
     return {
       next: { ...cur, last429At: Date.now() - ms },
+    };
+  });
+}
+
+/**
+ * Advance state.lastResetAt to a "new" window reset (spec 005): the pending
+ * branch of retryTick re-sends only once state.lastResetAt differs from the
+ * reset the previous "продолжи" was made for.
+ */
+async function advanceResetAt(msAgo = 30_000): Promise<void> {
+  await mutateState((cur) => {
+    if (cur === null) throw new Error("state file missing");
+    return {
+      next: { ...cur, lastResetAt: Date.now() - msAgo },
     };
   });
 }
@@ -337,7 +351,8 @@ async function testWatchdogFireSendsOnce(): Promise<void> {
     );
 
     // Double hook invocation after the send: the pending branch never sends
-    // directly, and the retry tick is paced by RETRY_AFTER_FIRE_MS.
+    // directly, and the retry tick is gated by a NEW window reset (spec 005,
+    // not by RETRY_AFTER_FIRE_MS).
     await __syncWatchdogForTests();
     await __syncWatchdogForTests();
     await __retryTickForTests();
@@ -357,10 +372,11 @@ async function testWatchdogFireSendsOnce(): Promise<void> {
 // --- 3. 429 → повтор не раньше 5 минут ------------------------------------------
 
 /**
- * Scenario 3: right after a "продолжи" a 429 arrives. The pending-retry tick
-  * must NOT re-send (RETRY_AFTER_FIRE_MS has not passed); once 6 minutes are
- * backdated into BOTH the arm's lastFireAt (arms.json) and state.last429At,
- * the retry tick re-sends.
+ * Scenario 3: right after a "продолжи" a 429 arrives. The pending-retry
+ * tick must NOT re-send -- neither immediately nor on elapsed time
+ * (RETRY_AFTER_FIRE_MS / last429At no longer pace the pending branch).
+ * Only a NEW window reset (state.lastResetAt advanced) unlocks exactly one
+ * repeat.
  */
 async function test429RetryPacing(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-wd-429-"));
@@ -379,7 +395,7 @@ async function test429RetryPacing(): Promise<void> {
     await sleep(300);
     assert(sends.length === 1, "429: первый «продолжи» отправлен");
 
-    // Fresh 429 after the send: retryAfter moves to "now".
+    // Fresh 429 after the send: no repeat without a new window reset.
     await handlerOf(handlers, "after_provider_response")(
       { status: 429, headers: {} },
       ctx,
@@ -388,17 +404,27 @@ async function test429RetryPacing(): Promise<void> {
     await sleep(200);
     assert(
       sends.length === 1,
-      "429: нет повтора сразу после 429 (не прошло 5 мин)",
+      "429: нет повтора сразу после 429 (нужен новый сброс окна, а не таймаут)",
     );
 
-    // 6 minutes since BOTH the send and the 429 -> the retry fires.
+    // 6 minutes since BOTH the send and the 429 -> STILL no repeat: under
+    // spec 005 elapsed time no longer unlocks the pending branch.
     backdateLastFireAt(tmp, RETRY_AFTER_FIRE_MS + 60_000);
     await backdateLast429At(RETRY_AFTER_FIRE_MS + 60_000);
     await __retryTickForTests();
     await sleep(300);
     assert(
+      sends.length === 1,
+      "429: 5+ минут без нового сброса окна → повтора нет",
+    );
+
+    // A NEW window reset -> exactly one repeat (lastFireAt refreshed).
+    await advanceResetAt(30_000);
+    await __retryTickForTests();
+    await sleep(300);
+    assert(
       sends.length === 2 && sends[1]?.content === "продолжи",
-      "429: повтор после прошествия 5+ минут",
+      "429: повтор после нового сброса окна",
     );
     assert(
       armsGetArm()?.phase === "pending",

@@ -212,6 +212,19 @@ function backdateLastFireAt(tmp: string, ms: number): void {
   writeFileSync(armsPath, JSON.stringify(map, null, 2), "utf8");
 }
 
+/**
+ * Advance state.lastResetAt to a "new" window reset (spec 005): the pending
+ * branch of retryTick re-attempts only once state.lastResetAt differs from
+ * the reset the previous "продолжи" was made for. A distinct value per call
+ * lets each stale attempt in a loop pass the pending gate exactly once.
+ */
+async function advanceResetAt(msAgo: number): Promise<void> {
+  await mutateState((cur) => {
+    if (cur === null) throw new Error("state file missing");
+    return { next: { ...cur, lastResetAt: Date.now() - msAgo } };
+  });
+}
+
 /** Expected backoff: MIN(RETRY_AFTER_FIRE_MS * 2^(n-1), 60 min). */
 function expectedBackoff(attempt: number): number {
   return Math.min(
@@ -426,10 +439,13 @@ async function testSuccessResetsCounter(): Promise<void> {
 
     // Go stale again: a full NEW set of 6 failures is needed before the
     // capitulation fires (the counter was reset by the success above).
+    // Spec 005: the pending branch needs a NEW window reset per attempt to
+    // pass the gate (elapsed time via lastFireAt no longer unlocks it), so
+    // each loop step advances state.lastResetAt before the tick.
     reject.enabled = true;
     let attempts = 3;
     for (let n = 1; n <= 5; n++) {
-      backdateLastFireAt(tmp, RETRY_AFTER_FIRE_MS + 60_000); // pending pacing
+      await advanceResetAt(30_000 + n * 1_000);
       setStaleRetryMsForTests(0);
       await __retryTickForTests();
       await sleep(80);
@@ -446,8 +462,8 @@ async function testSuccessResetsCounter(): Promise<void> {
     );
     assert(armsIsArmed(), "reset: флаг всё ещё взведён (5/6 после сброса)");
 
-    // The 6th stale failure after the reset capitulates.
-    backdateLastFireAt(tmp, RETRY_AFTER_FIRE_MS + 60_000);
+    // The 6th stale failure after the reset capitulates (fresh reset too).
+    await advanceResetAt(20_000);
     setStaleRetryMsForTests(0);
     await __retryTickForTests();
     await sleep(150);

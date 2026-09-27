@@ -209,6 +209,19 @@ let staleAttempts = 0;
 /** Spec 002 (D-203): the reset window this arm has already fired for. */
 let lastFiredResetAt: number | null = null;
 
+/**
+ * Spec 005 (fire-once-per-window): the state.lastResetAt value the last
+ * successful "продолжи" was sent FOR. In phase "pending" a re-send is
+ * allowed ONLY once this marker no longer equals the current
+ * state.lastResetAt -- i.e. a NEW window reset has arrived (FR1). Set in
+ * fireContinue() immediately after a successful send (the same spot where
+ * markFired() runs), reset to null on confirmation / flag removal and in
+ * __resetStaleStateForTests(). Not persisted: a process restart between
+ * resets yields null, which the pending branch treats as "wait for a new
+ * reset" (firedReset falls back to 0 -> at most one send per reset).
+ */
+let pendingFiredResetAt: number | null = null;
+
 /** Exponential backoff: RETRY_AFTER_FIRE_MS * 2^(attempt-1), capped. */
 function staleBackoffMs(attempt: number): number {
   return Math.min(
@@ -225,6 +238,7 @@ export function __resetStaleStateForTests(): void {
   staleAttempts = 0;
   staleRetryNotBefore = 0;
   lastFiredResetAt = null;
+  pendingFiredResetAt = null;
 }
 
 /** Test hook: read the current stale-retry pacing moment. */
@@ -606,9 +620,16 @@ async function retryTick(): Promise<void> {
     if (!arm) return;
     const st = readStateSync();
     if (arm.phase === "pending") {
-      const retryAfter = Math.max(arm.lastFireAt ?? 0, st?.last429At ?? 0);
-      if (Date.now() - retryAfter < RETRY_AFTER_FIRE_MS) return;
-      await fireContinue();
+      if (st === null) return;
+      // Spec 005 (fire-once-per-window): "продолжи" may be re-sent only
+      // after a NEW window reset -- state.lastResetAt advanced past the
+      // reset the previous send was made for (pendingFiredResetAt). Elapsed
+      // time since lastFireAt / last429At is NO LONGER a send condition
+      // (FR1/FR6). A null marker (process restart between resets) is
+      // compared against 0 so a send happens at most once per reset.
+      const firedReset = pendingFiredResetAt ?? 0;
+      if (st.lastResetAt === firedReset) return; // нового сброса нет — ждём
+      await fireContinue(); // новый сброс → повтор
       return;
     }
     // Spec 002 (D-204): armed phase with a stale delivery in flight -- the
@@ -776,6 +797,10 @@ async function fireContinue(): Promise<void> {
     // Spec 002 (D-204): a successful delivery resets the stale counter so
     // the next stale streak starts from scratch (no false capitulation).
     staleAttempts = 0;
+    // Spec 005: record the reset this send was made for so the pending
+    // branch of retryTick re-sends only on a NEW reset, not on a 5-min
+    // timeout (FR1).
+    pendingFiredResetAt = readStateSync()?.lastResetAt ?? null;
     armsLog("fire:send-ok", "«продолжи» отправлен, флаг в pending до первого успешного ответа");
   } catch (err) {
     if (/stale/i.test(String((err as Error)?.message ?? err))) {
@@ -1217,6 +1242,9 @@ async function onAfterProviderResponse(
     // Spec 002 (D-203): a repeat re-arm waits for the NEXT reset; give the
     // dedup marker a fresh window.
     lastFiredResetAt = null;
+    // Spec 005: confirmation clears the pending-send marker (FR3) so a
+    // freshly re-armed repeat flag starts from a clean slate.
+    pendingFiredResetAt = null;
     armsLog("fire:confirmed", "успешный ответ после «продолжи» — флаг снят/перевзведён");
     // Re-arm the watchdog for the next boundary (repeat>1) or drop it
     // (the one-shot arm was removed by confirmSuccess).
@@ -1598,6 +1626,8 @@ function registerContAfterReset(pi: ExtensionAPI): void {
 
         if (wantOff) {
           const removed = await armsDisarm();
+          // Spec 005: снятие флага снимает и маркер последней отправки.
+          pendingFiredResetAt = null;
           syncWatchdog();
           ctx.ui.notify(
             removed

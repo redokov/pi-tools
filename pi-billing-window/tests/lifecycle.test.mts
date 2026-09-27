@@ -180,6 +180,23 @@ async function expireWindow(): Promise<void> {
   });
 }
 
+/**
+ * Advance state.lastResetAt to a "new" window reset (spec 005): the pending
+ * branch of retryTick re-sends "продолжи" only once state.lastResetAt
+ * differs from the reset the last send was made for.
+ */
+async function advanceResetAt(msAgo = 30_000): Promise<void> {
+  await mutateState((cur) => {
+    if (cur === null) throw new Error("state file missing");
+    return {
+      next: {
+        ...cur,
+        lastResetAt: Date.now() - msAgo,
+      },
+    };
+  });
+}
+
 function applyPaths(tmp: string): void {
   stateSetPaths(join(tmp, "state.json"), join(tmp, "state.lock"));
   armsSetPaths(join(tmp, "arms.json"), join(tmp, "arms.lock"));
@@ -490,8 +507,10 @@ function backdateLastFireAt(tmp: string, ms: number): void {
 }
 
 /**
- * Pending phase: a 429 arriving right after a "продолжи" attempt blocks the
- * retry until RETRY_AFTER_FIRE_MS have passed since that 429/attempt.
+ * Pending phase (spec 005): a 429 arriving right after a "продолжи" attempt
+ * never re-sends on elapsed time -- neither RETRY_AFTER_FIRE_MS nor the 429
+ * paces the pending branch any more. Only a NEW window reset would unlock
+ * the repeat; here none has happened, so the tick must stay silent.
  */
 async function testPendingRetryNotBeforeRetryDelay(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-soon429-"));
@@ -520,14 +539,25 @@ async function testPendingRetryNotBeforeRetryDelay(): Promise<void> {
       ctx,
     );
 
-    // 11 minutes since the send, but the 429 is fresh -> NO retry yet.
+    // 11 minutes since the send, the 429 still fresh, and NO new window
+    // reset -> no retry (spec 005: elapsed time / 429 are not the trigger).
     backdateLastFireAt(tmp, RETRY_AFTER_FIRE_MS + 60_000);
     await __syncWatchdogForTests(); // pending branch -> retry interval
     await __retryTickForTests();
     await sleep(300);
     assert(
       sends.length === 1,
-      "soon-429: no retry before RETRY_AFTER_FIRE_MS after a fresh 429",
+      "soon-429: no retry without a new window reset (elapsed time / fresh 429 are not the trigger)",
+    );
+
+    // Even a NEW window reset re-sends (the 429 does not hold it back):
+    // spec 005 dropped last429At from the pending pacing entirely.
+    await advanceResetAt(30_000);
+    await __retryTickForTests();
+    await sleep(300);
+    assert(
+      sends.length === 2,
+      "soon-429: new window reset re-sends despite the fresh 429 (one repeat)",
     );
 
     await handlerOf(handlers, "session_shutdown")({}, ctx);
@@ -538,9 +568,11 @@ async function testPendingRetryNotBeforeRetryDelay(): Promise<void> {
 }
 
 /**
- * Pending phase: once RETRY_AFTER_FIRE_MS have passed since the last
- * attempt/429, the retry tick re-sends; the first successful response
- * then confirms and clears the pending flag.
+ * Pending phase (spec 005): a re-send happens only once a NEW window reset
+ * arrives (state.lastResetAt advanced past the reset the last "продолжи"
+ * was made for). The retry tick then sends exactly one more "продолжи"
+ * (lastFireAt refreshed); the first successful response confirms and
+ * clears the pending flag.
  */
 async function testPendingRetryAndConfirm(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-pending-"));
@@ -564,6 +596,8 @@ async function testPendingRetryAndConfirm(): Promise<void> {
     );
 
     // A 429 arrives, then 11 minutes pass since BOTH the send and the 429.
+    // Spec 005: elapsed time alone must NOT unlock a re-send -- the next
+    // "продолжи" awaits a NEW window reset.
     await handlerOf(handlers, "after_provider_response")(
       { status: 429, headers: {} },
       ctx,
@@ -576,13 +610,22 @@ async function testPendingRetryAndConfirm(): Promise<void> {
       };
     });
 
-    // The pending-retry tick re-sends "продолжи".
+    // Pending tick after elapsed time, still no new reset -> silence.
     await __syncWatchdogForTests(); // pending branch -> retry interval
     await __retryTickForTests();
     await sleep(300);
     assert(
+      sends.length === 1,
+      "pending-retry: no retry on elapsed time alone (needs a new window reset)",
+    );
+
+    // A NEW window reset arrives: the retry tick re-sends exactly once.
+    await advanceResetAt(30_000);
+    await __retryTickForTests();
+    await sleep(300);
+    assert(
       sends.length === 2,
-      "pending-retry: second 'продолжи' sent after RETRY_AFTER_FIRE_MS",
+      "pending-retry: second 'продолжи' sent after a new window reset",
     );
     const arm = armsGetArm();
     assert(
