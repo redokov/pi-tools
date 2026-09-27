@@ -18,7 +18,15 @@ const DEFAULT_URL = "http://localhost:7681/api/notify";
 const DEFAULT_TIMEOUT_MS = 3000;
 
 export type NotifyPayload = {
+  /** Billing window was reset (the classic toast). */
   type: "billing:window_reset";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
+} | {
+  /** Spec 002 (D-205): cont-after-reset capitulated after N stale attempts. */
+  type: "billing:cont-after-reset-capitulation";
   provider: string;
   title: string;
   body: string;

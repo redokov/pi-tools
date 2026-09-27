@@ -364,9 +364,11 @@ async function testStaleSendKeepsArm(): Promise<void> {
  * REGRESSION (production evidence 2026-09-24..25): a stale-pi send error
  * used to stop the poller "until session_start" -- which never comes in an
  * idle night session, so ONE stale error killed the whole cont-after-reset
- * mechanism for the rest of the night. Now the arm must survive and further
- * resyncs keep attempting (paced by staleRetryNotBefore), with the failure
- * visible in the persistent arms log.
+ * mechanism for the rest of the night. Now the arm must survive and the
+ * bounded retry loop keeps attempting (paced by staleRetryNotBefore with
+ * exponential backoff; spec 002 D-203 stops the sync-poller from re-firing
+ * the same reset, so retries are driven by the retry tick), with the
+ * failure visible in the persistent arms log.
  */
 async function testStaleSendKeepsPollerRetries(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-stale2-"));
@@ -395,12 +397,14 @@ async function testStaleSendKeepsPollerRetries(): Promise<void> {
       "stale-poller: флаг сохранён после stale-ошибки",
     );
 
-    // The resync path must keep working: with retry pacing of 60 ms further
-    // attempts follow while the boundary stays in the past.
+    // The bounded retry loop must keep working (spec 002: the sync-poller
+    // no longer re-fires the same reset; retries come from the retry
+    // interval). Pacing is force-opened for determinism.
+    setStaleRetryMsForTests(0);
+    await __retryTickForTests();
     await sleep(120);
-    await __syncWatchdogForTests();
-    await sleep(120);
-    await __syncWatchdogForTests();
+    setStaleRetryMsForTests(0);
+    await __retryTickForTests();
     await sleep(120);
     assert(
       sends.length >= 2,

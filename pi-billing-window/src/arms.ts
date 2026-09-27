@@ -162,6 +162,20 @@ function pruneExpired(map: ArmMap, now: number): void {
 }
 
 /**
+ * Pure decision helper (spec 002, D-202): how a session_start `reason` maps
+ * onto the arm record. "carry" -> the armed record moves with this window
+ * ("new" carries to the fresh conversation, "fork" to the fork, "replacement"
+ * is a no-op carry for the same conversation); "repoint" -> the window merely
+ * re-points at the conversation (resume/reload/startup), an arm stays with
+ * the conversation that created it.
+ */
+export function remapKey(reason: string): "carry" | "repoint" {
+  return reason === "new" || reason === "fork" || reason === "replacement"
+    ? "carry"
+    : "repoint";
+}
+
+/**
  * Re-point this window at `newKey` WITHOUT moving any armed record. Used on
  * /resume, /fork, /reload and fresh startup: an arm stays with the
  * conversation that created it, and is only picked up again if this window

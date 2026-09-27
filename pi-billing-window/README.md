@@ -117,6 +117,8 @@ C:\Tools\pi-billing-window\
 │   ├── arms.test.mts           # unit-тесты флагов /cont-after-reset
 │   ├── history.test.mts        # unit-тесты CSV-истории
 │   ├── lifecycle.test.mts      # регресс-тесты замены сессии (stale ctx, cont-after-reset)
+│   ├── replacement.test.mts    # spec 002: replacement не теряет флаг молча (FR-001)
+│   ├── stale-capitulation.test.mts # spec 002: N=6 backoff + капитуляция с notify (FR-003/004)
 │   └── billing_report_test.py  # python-тесты MD-отчёта (секция By model)
 ├── docs/
 │   ├── ARCHITECTURE.md    # подробный разбор модулей и потоков
@@ -251,6 +253,20 @@ New-Item -ItemType SymbolicLink `
   успешный ответ подтверждает флаг — одноразовый снимается, при `repeat > 1`
   перевзводится на следующий сброс И watchdog взводится на следующую
   границу (≈ t+2 часа от сброса);
+- **замена сессии не молчит** (spec 002): после replacement/reload
+  `session_start` переснимает ссылки на pi/events, если pi их несёт
+  (armslog `replacement:adopted`), иначе пишет `replacement:waiting` и
+  эпоха-гуард не пропускает отправку по старым ссылкам; флаг при
+  `new/fork/replacement` переносится вместе с окном;
+- **один fire на один сброс окна** (spec 002): тики sync-poller'а (60 с)
+  не перепланируют уже спланированный fire — нет цикла
+  «fire:reset-ready» каждые 60 с; новый сброс снова разрешает fire
+  (repeat-семантика сохранена);
+- **капитуляция вместо вечного ретрая** (spec 002): если доставка
+  «продолжи» падает по stale, попытки идут с экспоненциальным backoff
+  (5 мин → 60 мин); после 6 неудач флаг снимается, в armslog пишется
+  `capitulation:after-6`, а через `notifier.ts` уходит уведомление
+  (`billing:cont-after-reset-capitulation`);
 - внешний poller 10 с удалён; его роль подхватил медленный sync-poller
   (60 с), который лишь замечает внешние записи в arms.json (ночной
   helper-скрипт) и пересинхронизирует watchdog — сам он ничего не шлёт;

@@ -59,6 +59,7 @@ import {
   isArmed as armsIsArmed,
   getArm as armsGetArm,
   getKey as armsGetKey,
+  remapKey,
   RESET_GRACE_MS,
   RETRY_AFTER_FIRE_MS,
 } from "./arms.js";
@@ -194,14 +195,53 @@ export function setResetGraceMsForTests(ms: number): void {
 }
 
 /**
- * After a stale-pi send failure, do not retry the send more often than
- * this (one log line + one warn per interval, not one per resync).
- * Exported override for tests.
+ * Spec 002 (D-204): bounded stale-retry. After a failed delivery attempt
+ * (stale pi or an epoch mismatch) the next attempt is paced with an
+ * exponentially growing backoff; after STALE_MAX_ATTEMPTS failed attempts
+ * the arm is disarmed and a capitulation notification is sent ("never
+ * fail silently"). Module-level state on purpose: arms.json/state.json
+ * formats must not change (D-004).
+ */
+const STALE_MAX_ATTEMPTS = 6;
+const STALE_BACKOFF_CAP_MS = 60 * 60 * 1000; // 60 min
+let staleAttempts = 0;
+
+/** Spec 002 (D-203): the reset window this arm has already fired for. */
+let lastFiredResetAt: number | null = null;
+
+/** Exponential backoff: RETRY_AFTER_FIRE_MS * 2^(attempt-1), capped. */
+function staleBackoffMs(attempt: number): number {
+  return Math.min(
+    RETRY_AFTER_FIRE_MS * Math.pow(2, attempt - 1),
+    STALE_BACKOFF_CAP_MS,
+  );
+}
+
+/**
+ * Test hook: reset the stale-retry counter / pacing / fire dedup marker so
+ * scenarios in one process do not leak attempts into each other.
+ */
+export function __resetStaleStateForTests(): void {
+  staleAttempts = 0;
+  staleRetryNotBefore = 0;
+  lastFiredResetAt = null;
+}
+
+/** Test hook: read the current stale-retry pacing moment. */
+export function __staleRetryNotBeforeForTests(): number {
+  return staleRetryNotBefore;
+}
+
+/**
+ * After a stale failure, the next send attempt is paced with an
+ * exponential backoff (see staleBackoffMs). Exported override kept for
+ * tests: its remaining role is to reset the pacing marker so a test can
+ * force the next attempt deterministically.
  */
 let staleRetryMs = RETRY_AFTER_FIRE_MS;
 
-export function setStaleRetryMsForTests(ms: number): void {
-  staleRetryMs = Math.max(0, ms);
+export function setStaleRetryMsForTests(_ms: number): void {
+  staleRetryMs = Math.max(0, _ms);
   staleRetryNotBefore = 0; // reset pacing so a previous test's backoff
   // does not leak into the next one
 }
@@ -478,7 +518,15 @@ function syncWatchdog(): void {
     return;
   }
 
-  stopRetryInterval();
+  // Spec 002 (D-204): an armed arm with a stale delivery in flight is
+  // re-driven by the bounded retry interval, not by re-firing the watchdog
+  // (the fire dedup below keeps sync ticks from re-planning the send).
+  if (staleAttempts > 0) {
+    ensureRetryInterval();
+  } else {
+    stopRetryInterval();
+  }
+
   if (st === null) {
     clearWatchdog();
     return;
@@ -486,8 +534,17 @@ function syncWatchdog(): void {
   let fireAt = computeFireAt(st);
   // A reset already happened after arming: the interesting moment is
   // reset+grace (in the past -> immediate fire), not the new boundary.
-  if (st.lastResetAt > arm.lastResetAtAtArm) {
+  // Spec 002 (D-203): idempotent per reset -- once a fire has been planned
+  // for this lastResetAt value, further sync ticks must NOT re-plan it
+  // (the incident's 60 s "fire:reset-ready" loop).
+  if (
+    st.lastResetAt > arm.lastResetAtAtArm &&
+    st.lastResetAt !== lastFiredResetAt
+  ) {
     fireAt = Math.min(fireAt, st.lastResetAt + resetGraceMs);
+    lastFiredResetAt = st.lastResetAt;
+    // A fresh reset gives the delivery a clean slate (D-204 reset rules).
+    staleAttempts = 0;
   }
   armWatchdog(fireAt, onWatchdogFire);
 }
@@ -496,11 +553,20 @@ function syncWatchdog(): void {
 async function retryTick(): Promise<void> {
   return runGuarded(async () => {
     const arm = armsGetArm();
-    if (!arm || arm.phase !== "pending") return;
-    const st = readStateSync();
-    const retryAfter = Math.max(arm.lastFireAt ?? 0, st?.last429At ?? 0);
-    if (Date.now() - retryAfter < RETRY_AFTER_FIRE_MS) return;
-    await fireContinue();
+    if (!arm) return;
+    if (arm.phase === "pending") {
+      const st = readStateSync();
+      const retryAfter = Math.max(arm.lastFireAt ?? 0, st?.last429At ?? 0);
+      if (Date.now() - retryAfter < RETRY_AFTER_FIRE_MS) return;
+      await fireContinue();
+      return;
+    }
+    // Spec 002 (D-204): armed phase with a stale delivery in flight -- the
+    // bounded retry loop re-attempts fireContinue (paced internally by
+    // staleRetryNotBefore with exponential backoff).
+    if (staleAttempts > 0) {
+      await fireContinue();
+    }
   });
 }
 
@@ -530,6 +596,9 @@ async function onWatchdogFire(): Promise<void> {
     if (armsGetArm() === null) return;
     const st = readStateSync();
     const base = st !== null && st.lastResetAt > 0 ? st.lastResetAt : Date.now();
+    // Spec 002 (D-203): this reset window has now been planned a fire for;
+    // sync ticks must not re-plan it.
+    lastFiredResetAt = base;
     const delay = Math.max(0, base + resetGraceMs - Date.now());
     armsLog(
       "fire:reset-ready",
@@ -545,11 +614,61 @@ async function onWatchdogFire(): Promise<void> {
 }
 
 /**
+ * Spec 002 (D-204): capitulation -- the "never fail silently" path. After
+ * STALE_MAX_ATTEMPTS failed delivery attempts the arm is disarmed, the
+ * capitulation is logged ("capitulation:after-N") and a notification goes
+ * out through the existing notifier.ts channel (D-205, no new secrets).
+ */
+async function capitulate(): Promise<void> {
+  const key = armsGetKey();
+  await armsDisarm();
+  armsLog(
+    `capitulation:after-${STALE_MAX_ATTEMPTS}`,
+    `«продолжи» не доставлен после ${STALE_MAX_ATTEMPTS} stale-попыток, ключ ${key?.split(/[\\/]/).pop() ?? "?"} — флаг снят, уведомление отправлено`,
+  );
+  void sendNotify({
+    type: "billing:cont-after-reset-capitulation",
+    provider: PROVIDER,
+    title: "cont-after-reset: капитуляция",
+    body: `«продолжи» не удалось доставить после сброса окна (${STALE_MAX_ATTEMPTS} неудачных stale-попыток). Флаг снят, чтобы не молчать. Подробности: ~/.pi/agent/pi-billing-window-arms.log`,
+    timestamp: Date.now(),
+  });
+  staleAttempts = 0;
+  staleRetryNotBefore = 0;
+  syncWatchdog();
+}
+
+/**
+ * Spec 002 (D-204): record one failed delivery attempt (a stale pi send or
+ * an epoch-mismatch guard) and pace the retry with exponential backoff.
+ * After STALE_MAX_ATTEMPTS attempts the mechanism capitulates instead of
+ * looping forever (the production incident's "50 minutes, 0 deliveries").
+ */
+async function noteStaleFailure(
+  kind: "stale" | "waiting",
+  detail: string,
+): Promise<void> {
+  staleAttempts++;
+  const backoff = staleBackoffMs(staleAttempts);
+  staleRetryNotBefore = Date.now() + backoff;
+  const event = kind === "waiting" ? "replacement:waiting" : "send-error:stale";
+  armsLog(
+    event,
+    `${detail} — попытка ${staleAttempts}/${STALE_MAX_ATTEMPTS}, повтор через ${Math.round(backoff / 60000)} мин`,
+  );
+  ensureRetryInterval();
+  if (staleAttempts >= STALE_MAX_ATTEMPTS) {
+    await capitulate();
+  }
+}
+
+/**
  * Send the one-word "продолжи" so the interrupted agent resumes. Guards:
  *  - only when the agent is idle (spec: "if the agent is streaming, do
  *    nothing" -- we keep the arm and retry on the next tick);
  *  - only after the grace period (handled by the caller);
- *  - paced after a stale-pi failure (staleRetryNotBefore).
+ *  - paced after a stale failure (staleRetryNotBefore, exponential
+ *    backoff, D-204).
  * After a successful send the flag switches to "pending" (markFired); the
  * first successful provider response confirms it (confirmSuccess).
  */
@@ -575,12 +694,13 @@ async function fireContinue(): Promise<void> {
     return;
   }
   // Invariant: piApi belongs to epoch piApiEpoch. If the session was
-  // replaced, using piApi throws "ctx is stale" -- the new session's
-  // sync-poller re-adopts the arm on session_start, so just bail out.
+  // replaced, using piApi throws "ctx is stale". Spec 002 (D-201): do not
+  // touch the stale refs; count a bounded attempt and capitulate with a
+  // notification if re-adoption never comes (instead of looping silently).
   if (piApiEpoch !== sessionEpoch) {
-    armsLog(
-      "block:epoch-mismatch",
-      `piApiEpoch=${piApiEpoch} sessionEpoch=${sessionEpoch} — флаг сохранён, повтор когда фабрика обновит ссылки`,
+    await noteStaleFailure(
+      "waiting",
+      `ссылки из прошлой эпохи (piApiEpoch=${piApiEpoch}, sessionEpoch=${sessionEpoch}) — не шлю, жду переусыновления`,
     );
     return;
   }
@@ -593,21 +713,18 @@ async function fireContinue(): Promise<void> {
     // RETRY_AFTER_FIRE_MS.
     await armsMarkFired();
     staleRetryNotBefore = 0;
+    // Spec 002 (D-204): a successful delivery resets the stale counter so
+    // the next stale streak starts from scratch (no false capitulation).
+    staleAttempts = 0;
     armsLog("fire:send-ok", "«продолжи» отправлен, флаг в pending до первого успешного ответа");
   } catch (err) {
     if (/stale/i.test(String((err as Error)?.message ?? err))) {
-      // pi went stale mid-send. THE OLD BEHAVIOUR was stopping the poller
-      // "until session_start" -- but at night NO session_start ever comes,
-      // so ONE stale error killed the mechanism for the rest of the night
-      // (production evidence 2026-09-24..25: 4 resets, 0 fires, the user
-      // saw exactly this warn). Now: keep the arm and the timers, pace
-      // retries (staleRetryNotBefore) so the next attempt happens after
-      // the factory refreshes piApi (a session replacement re-runs the
-      // factory; /new carries the arm, reload/resume re-adopts it).
-      staleRetryNotBefore = Date.now() + staleRetryMs;
-      armsLog(
-        "send-error:stale",
-        `pi устарел: ${String((err as Error)?.message ?? err).slice(0, 160)} — retry жив, повтор через ${Math.round(staleRetryMs / 60000)} мин`,
+      // pi went stale mid-send. Spec 002 (D-204): bounded retry with
+      // exponential backoff; after N attempts capitulate with a notify
+      // (the arm/timers keep running until then).
+      await noteStaleFailure(
+        "stale",
+        `pi устарел: ${String((err as Error)?.message ?? err).slice(0, 160)}`,
       );
       return;
     }
@@ -785,6 +902,48 @@ function unsubscribeFromBillingEvents(): void {
 
 // --- Session lifecycle hooks --------------------------------------------------
 
+type EventBusRef = {
+  emit: (channel: string, data: unknown) => void;
+  on: (channel: string, handler: (data: unknown) => void) => () => void;
+};
+
+/**
+ * Spec 002 (D-201, FAQ F-1): best-effort re-capture of the live pi/events
+ * references from a session_start event/context. Current pi shapes do NOT
+ * expose them (SessionStartEvent carries only type/reason/previousSessionFile,
+ * ExtensionContext has no api/events fields), so in production today this
+ * returns null and the "replacement:waiting" fallback path applies; the
+ * probe is kept so a future pi exposing the refs lights up automatically.
+ */
+function sessionBusOf(event: unknown, ctx: unknown): {
+  api: ExtensionAPI;
+  bus: EventBusRef;
+} | null {
+  const holders: unknown[] = [event, ctx];
+  for (const holder of holders) {
+    if (typeof holder !== "object" || holder === null) continue;
+    const h = holder as Record<string, unknown>;
+    const api = h["api"] ?? h["pi"] ?? h["extensionApi"];
+    const bus = h["events"] ?? h["eventBus"] ?? h["bus"];
+    if (
+      typeof api === "object" &&
+      api !== null &&
+      typeof (api as { sendUserMessage?: unknown }).sendUserMessage ===
+        "function" &&
+      typeof bus === "object" &&
+      bus !== null &&
+      typeof (bus as { emit?: unknown }).emit === "function" &&
+      typeof (bus as { on?: unknown }).on === "function"
+    ) {
+      return {
+        api: api as ExtensionAPI,
+        bus: bus as EventBusRef,
+      };
+    }
+  }
+  return null;
+}
+
 /**
  * pi.on("session_start"): capture ctx, initialize state if missing, run a
  * one-shot checkAndReset() if the saved state is already expired, and
@@ -796,6 +955,31 @@ async function onSessionStart(
   ctx: ExtensionContext,
 ): Promise<void> {
   currentCtx = ctx;
+
+  // Spec 002 (D-201): after a session replacement the factory may NOT have
+  // re-run, so piApi/eventBus may still belong to the replaced session and
+  // every send would fail with "extension ctx is stale". Try to re-capture
+  // the fresh refs from the session_start event/context; if that fails, we
+  // are on the bounded waiting path (replacement:waiting -> capitulation).
+  if (piApiEpoch !== sessionEpoch) {
+    const fresh = sessionBusOf(event, ctx);
+    if (fresh !== null) {
+      eventBus = fresh.bus;
+      piApi = fresh.api;
+      piApiEpoch = sessionEpoch;
+      staleAttempts = 0;
+      staleRetryNotBefore = 0;
+      armsLog(
+        "replacement:adopted",
+        "session_start переснял ссылки на pi/events — отправка «продолжи» снова возможна",
+      );
+    } else {
+      armsLog(
+        "replacement:waiting",
+        "свежие ссылки не найдены в session_start — жду переусыновления (после 6 попыток капитуляция с уведомлением)",
+      );
+    }
+  }
 
   // Subscribe to our own EventBus channels so we can notify the user when
   // a reset happens (also useful for future "about to reset" hooks).
@@ -849,15 +1033,16 @@ async function onSessionStart(
   }
 
   // cont-after-reset: (re)bind this window to its conversation's armed flag.
-  // On /new the armed record is carried to the fresh conversation (spec: keep
-  // the flag after /new). On /resume, /fork, /reload or startup we merely
-  // re-point at the current conversation; an arm stays with the conversation
-  // that created it and is re-adopted only if we come back to it. A process
-  // restart re-adopts the record persisted under its conversation file.
+  // Spec 002 (D-202): on /new the armed record is carried to the fresh
+  // conversation, on fork/replacement the record is carried (fork) or
+  // already in place (replacement of the same conversation); on resume /
+  // reload / startup we merely re-point at the current conversation -- an
+  // arm stays with the conversation that created it. A process restart
+  // re-adopts the record persisted under its conversation file.
   try {
     const key = sessionKeyOf(ctx);
     const reason = (event as { reason?: string } | null)?.reason;
-    if (reason === "new") {
+    if (remapKey(reason ?? "") === "carry") {
       await armsCarryArmTo(key);
     } else {
       armsSwitchKey(key);
@@ -969,6 +1154,9 @@ async function onAfterProviderResponse(
     lastResetAt: armState?.lastResetAt,
   });
   if (confirmed) {
+    // Spec 002 (D-203): a repeat re-arm waits for the NEXT reset; give the
+    // dedup marker a fresh window.
+    lastFiredResetAt = null;
     armsLog("fire:confirmed", "успешный ответ после «продолжи» — флаг снят/перевзведён");
     // Re-arm the watchdog for the next boundary (repeat>1) or drop it
     // (the one-shot arm was removed by confirmSuccess).
@@ -1378,6 +1566,8 @@ function registerContAfterReset(pi: ExtensionAPI): void {
           );
           return;
         }
+        // Spec 002 (D-203): a fresh arm allows one fire for the current reset.
+        lastFiredResetAt = null;
         syncWatchdog();
         const now = Date.now();
         const expMins = Math.max(0, Math.ceil((cur.expiresAt - now) / 60_000));

@@ -56,3 +56,28 @@ Watchdog взводится по известной границе окна **в
 ### Task 4 — deploy + docs
 - `deploy.ps1`: добавить `watchdog.ts` в список копируемых файлов.
 - README §8a/архитектура: кратко отразить watchdog-модель. Запустить deploy.
+
+## Spec 002: поведение при replacement / капитуляция
+
+Спека `.ai/sdd/specs/002-cont-after-reset-stale-session/` (производственный инцидент 2026-09-26: 50 минут бесконечных stale-ретраев, 0 доставленных «продолжи», флаг сгорел по TTL) добавила к watchdog-модели три вещи.
+
+### 1. Replacement не молчит (D-201/D-202)
+
+- `session_start` после замены сессии пытается переснять `piApi`/`eventBus` из свежего контекста события; при успехе — armslog `replacement:adopted`, счётчик stale обнуляется. Актуальные типы pi (`SessionStartEvent`, `ExtensionContext`) этих ссылок не несут, поэтому в продакшене работает запасной путь: armslog `replacement:waiting`, а эпоха-гуард в `fireContinue` не пропускает отправку по ссылкам прошлой эпохи (событие `block:epoch-mismatch` заменено на `replacement:waiting`).
+- Маппинг `reason` (`arms.remapKey`): `new`/`fork`/`replacement` → `carryArmTo` (флаг переносится с окном), `resume`/`reload`/`startup` → `switchKey` (флаг остаётся у своей беседы).
+
+### 2. Один fire на один сброс окна (D-203)
+
+Модульный маркер `lastFiredResetAt`: как только fire для значения `state.lastResetAt = R` спланирован, повторные тики sync-poller'а (60 с) НЕ перепланируют его (нет цикла «fire:reset-ready» каждые 60 с). Новый сброс `R' ≠ R` снова разрешает ровно один fire; `confirmSuccess` и повторный взвод сбрасывают маркер. Состояние живёт в памяти процесса — формат `arms.json`/`state.json` не меняется.
+
+### 3. Ограниченный stale-retry: N=6 + экспоненциальный backoff + капитуляция (D-204/D-205)
+
+После каждой неудачной доставки (stale-pi ошибка ИЛИ эпоха-гуард «replacement:waiting»): счётчик `staleAttempts++`, пацинг `staleRetryNotBefore = now + min(RETRY_AFTER_FIRE_MS * 2^(n-1), 60 мин)`, armslog с пометкой «попытка n/6». Повторы гоняет 5-минутный retry-interval (sync-poller больше не пере-fire'ит тот же сброс). На 6-й неудаче — капитуляция:
+
+- флаг снимается (disarm);
+- armslog: `capitulation:after-6`;
+- уведомление через существующий `notifier.ts` → pi-remote (`type: "billing:cont-after-reset-capitulation"`), без новых каналов и секретов.
+
+Сброс счётчика: успешная отправка, переусыновление (`replacement:adopted`), новый сброс окна.
+
+Новые события armslog: `replacement:waiting`, `replacement:adopted`, `capitulation:after-N` (существующие не переименовываются). Тесты спеки: `tests/replacement.test.mts`, `tests/stale-capitulation.test.mts`, сценарий 9 в `tests/watchdog.e2e.test.mts`, маппинг reason — в `tests/arms.test.mts`. Вечный цикл и «тихое сгорание» флага более невозможны: механизм либо доставляет «продолжи», либо явно капитулируется с уведомлением.

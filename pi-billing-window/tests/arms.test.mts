@@ -21,6 +21,7 @@ import {
   isArmed,
   getArm,
   resetReadyToFire,
+  remapKey,
   ARMS_TTL_MS,
   RESET_GRACE_MS,
   type Arm,
@@ -247,6 +248,66 @@ async function main(): Promise<void> {
   assert(
     !isArmed(T0 + 351_000),
     "repeat: record removed once the last repetition is confirmed",
+  );
+
+  // --- spec 002 (D-202): remapKey — reason → carry/repoint ------------------
+
+  // Spec 002 / FR-001: fork and replacement must CARRY the armed record
+  // with this window; resume/reload/startup merely re-point. Previously only
+  // reason="new" carried, so a fork/replacement left the arm orphaned.
+  assert(remapKey("new") === "carry", "remapKey: new -> carry");
+  assert(remapKey("fork") === "carry", "remapKey: fork -> carry");
+  assert(
+    remapKey("replacement") === "carry",
+    "remapKey: replacement -> carry",
+  );
+  assert(remapKey("resume") === "repoint", "remapKey: resume -> repoint");
+  assert(remapKey("reload") === "repoint", "remapKey: reload -> repoint");
+  assert(remapKey("startup") === "repoint", "remapKey: startup -> repoint");
+  assert(
+    remapKey("") === "repoint",
+    "remapKey: unknown/empty reason -> repoint (безопасный дефолт)",
+  );
+
+  // fork: arm is carried from convA into the fork key.
+  switchKey("convA");
+  await arm(20, T0 + 400_000);
+  assert(remapKey("fork") === "carry", "fork: маппинг carry");
+  await carryArmTo("convFork");
+  assert(
+    isArmed(T0 + 401_000),
+    "fork: arm перенесён в fork-ключ (isArmed под convFork)",
+  );
+  switchKey("convA");
+  assert(
+    !isArmed(T0 + 402_000),
+    "fork: старый ключ больше не вооружён",
+  );
+
+  // replacement (same key): carry is a no-op, the record stays in place.
+  switchKey("convRep");
+  await arm(21, T0 + 410_000);
+  assert(remapKey("replacement") === "carry", "replacement: маппинг carry");
+  await carryArmTo("convRep");
+  const repArm = getArm(T0 + 411_000);
+  assert(
+    repArm !== null && repArm.lastResetAtAtArm === 21,
+    "replacement: запись остаётся на месте (carry no-op для того же ключа)",
+  );
+
+  // resume/reload/startup: repoint only, the owner's arm is NOT moved.
+  switchKey("convOwner");
+  await arm(22, T0 + 420_000);
+  assert(remapKey("resume") === "repoint", "resume: маппинг repoint");
+  switchKey("convOther");
+  assert(
+    !isArmed(T0 + 421_000),
+    "resume: arm владельца-беседы не двигается (repoint)",
+  );
+  switchKey("convOwner");
+  assert(
+    isArmed(T0 + 422_000),
+    "resume: вернувшись к беседе, виден её arm",
   );
 
   // --- repeat=1 (explicit) and no-repeat keep one-shot behaviour -----------

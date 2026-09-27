@@ -36,6 +36,7 @@ import piBillingWindowFactory, {
   __syncWatchdogForTests,
   __fireWatchdogForTests,
   __retryTickForTests,
+  __resetStaleStateForTests,
 } from "../src/index.ts";
 import {
   writeStateSync,
@@ -89,7 +90,7 @@ const sleep = (ms: number): Promise<void> =>
 type SessionHandler = (event: unknown, ctx: unknown) => unknown;
 type CommandHandler = (args: string, ctx: unknown) => Promise<void> | void;
 
-function makeMockPi(): {
+function makeMockPi(rejectSends = false): {
   pi: unknown;
   handlers: Map<string, SessionHandler[]>;
   commands: Map<string, CommandHandler>;
@@ -123,6 +124,11 @@ function makeMockPi(): {
     },
     sendUserMessage: async (content: unknown, opts?: unknown) => {
       sends.push({ content, opts });
+      if (rejectSends) {
+        throw new Error(
+          "This extension ctx is stale after session replacement or reload.",
+        );
+      }
       return undefined;
     },
   };
@@ -721,6 +727,85 @@ async function testContAfterResetOff(): Promise<void> {
   }
 }
 
+// --- 9. Fire идемпотентен на один сброс окна (spec 002, FR-002) -----------------
+
+/**
+ * Scenario 9 (design §5.2): one fire per reset window. Arm on a
+ * lastResetAt = R in the past (grace elapsed), fire once and then run 3
+ * sync ticks -- the "продолжи" send must be ATTEMPTED exactly once for R and
+ * "fire:reset-ready" logged exactly once for R (the 60 s sync-poller must
+ * not re-plan the same reset). A new reset R' then authorizes exactly one
+ * more fire (repeat semantics preserved).
+ */
+async function testFireDedupPerReset(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-wd-dedup-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(20);
+  __resetStaleStateForTests();
+  try {
+    seedFreshWindow();
+    // Stale-throwing mock: only a FAILED send leaves the arm in the
+    // "armed" phase where a re-planned fire would be observable.
+    const { pi, handlers, commands, sends } = makeMockPi(true);
+    piBillingWindowFactory(pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-9.jsonl"));
+    await handlerOf(handlers, "session_start")({}, ctx);
+    await commandOf(commands, "cont-after-reset")("", ctx);
+
+    // Backdate a reset R (grace already elapsed).
+    await mutateState((cur) => {
+      if (cur === null) throw new Error("state file missing");
+      return { next: { ...cur, lastResetAt: Date.now() - 60_000 } };
+    });
+
+    // One watchdog fire: attempt #1 for R.
+    await __fireWatchdogForTests();
+    await sleep(150);
+
+    // Three sync-poller ticks must NOT re-plan the fire for R.
+    await __syncWatchdogForTests();
+    await sleep(50);
+    await __syncWatchdogForTests();
+    await sleep(50);
+    await __syncWatchdogForTests();
+    await sleep(150);
+
+    assert(
+      sends.length === 1,
+      `dedup: «продолжи» попытан ровно один раз для R (sends=${sends.length})`,
+    );
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    const fireReadyCount = log
+      .split("\n")
+      .filter((l) => l.includes("fire:reset-ready")).length;
+    assert(
+      fireReadyCount === 1,
+      `dedup: fire:reset-ready для R записан один раз (got ${fireReadyCount})`,
+    );
+
+    // A NEW reset R' re-authorizes exactly one more fire.
+    await mutateState((cur) => {
+      if (cur === null) throw new Error("state file missing");
+      return { next: { ...cur, lastResetAt: Date.now() - 60_000 } };
+    });
+    setStaleRetryMsForTests(0); // force pacing open (backoff after attempt #1)
+    await __syncWatchdogForTests();
+    await sleep(150);
+
+    assert(
+      sends.length === 2,
+      `dedup: новый сброс R' даёт ровно ещё один fire (sends=${sends.length})`,
+    );
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    __resetStaleStateForTests();
+    cleanupPaths(tmp);
+  }
+}
+
 // --- runner ---------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -735,6 +820,7 @@ async function main(): Promise<void> {
   await testExternalArmsWriteAdoptedBySync();
   await testShutdownStopsEverything();
   await testContAfterResetOff();
+  await testFireDedupPerReset();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);
