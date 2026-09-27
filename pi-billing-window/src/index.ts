@@ -397,6 +397,33 @@ function stopGraceTimer(): void {
   }
 }
 
+/**
+ * Spec 002 (T15, инцидент 2026-09-27): a "продолжи" delivery is in flight
+ * for a reset that has already been planned a fire (armed arm,
+ * state.lastResetAt === lastFiredResetAt). Sync ticks and the retry loop
+ * must NOT drop that send: the D-203 dedup will never re-plan this reset
+ * (the old noisy 60 s re-fire loop was the incident's only "healer"), so
+ * the grace timer survives if armed and is restored from
+ * lastResetAt + grace if lost (delay is naturally 0 after the grace has
+ * already elapsed). No-op without a planned reset or without a live state.
+ */
+function ensureGraceTimer(): void {
+  if (graceTimer !== null) return;
+  const st = readStateSync();
+  if (st === null || st.lastResetAt <= 0) return;
+  if (lastFiredResetAt === null || st.lastResetAt !== lastFiredResetAt) {
+    return;
+  }
+  const ep = sessionEpoch;
+  const delay = Math.max(0, st.lastResetAt + resetGraceMs - Date.now());
+  graceTimer = setTimeout(() => {
+    graceTimer = null;
+    if (ep !== sessionEpoch) return;
+    void runGuarded(fireContinue);
+  }, delay);
+  graceTimer.unref();
+}
+
 function stopSyncPoller(): void {
   if (syncTimer !== null) {
     clearInterval(syncTimer);
@@ -479,7 +506,10 @@ function runGuarded(fn: () => Promise<void>): Promise<void> {
  *  - arm "armed": watchdog on the window boundary -- or, when a reset
  *    already happened after arming (missed boundary / another process /
  *    a failed send), on reset+grace, which fires immediately once the grace
- *    has elapsed;
+ *    has elapsed. A delivery already in flight for a planned reset (T15)
+ *    keeps its own grace timer (never dropped by sync ticks) and is
+ *    re-driven by the retry interval; the watchdog points at the NEXT
+ *    window boundary for that case;
  *  - arm "pending": retry interval; watchdog/grace cleared.
  */
 function syncWatchdog(): void {
@@ -511,13 +541,33 @@ function syncWatchdog(): void {
     );
   }
 
-  stopGraceTimer();
   if (arm.phase === "pending") {
     clearWatchdog();
+    stopGraceTimer();
     ensureRetryInterval();
     return;
   }
 
+  // Spec 002 (T15, H0): a "продолжи" delivery is in flight for a reset
+  // this process has already planned a fire for. The incident of
+  // 2026-09-27: an unconditional stopGraceTimer() here killed the pending
+  // grace send when a 60 s sync tick landed inside the grace window, and
+  // the D-203 dedup then forbade re-planning it -- 27 minutes of silence.
+  // The delivery must survive sync ticks on its own timers instead.
+  if (
+    st !== null &&
+    st.lastResetAt > arm.lastResetAtAtArm &&
+    lastFiredResetAt === st.lastResetAt
+  ) {
+    ensureGraceTimer(); // keep / restore the pending grace send
+    ensureRetryInterval(); // H1: re-drive while the agent streams
+    // The watchdog points at the next window boundary (the fire dedup
+    // keeps sync ticks from re-planning this reset).
+    armWatchdog(computeFireAt(st), onWatchdogFire);
+    return;
+  }
+
+  stopGraceTimer();
   // Spec 002 (D-204): an armed arm with a stale delivery in flight is
   // re-driven by the bounded retry interval, not by re-firing the watchdog
   // (the fire dedup below keeps sync ticks from re-planning the send).
@@ -554,8 +604,8 @@ async function retryTick(): Promise<void> {
   return runGuarded(async () => {
     const arm = armsGetArm();
     if (!arm) return;
+    const st = readStateSync();
     if (arm.phase === "pending") {
-      const st = readStateSync();
       const retryAfter = Math.max(arm.lastFireAt ?? 0, st?.last429At ?? 0);
       if (Date.now() - retryAfter < RETRY_AFTER_FIRE_MS) return;
       await fireContinue();
@@ -564,7 +614,17 @@ async function retryTick(): Promise<void> {
     // Spec 002 (D-204): armed phase with a stale delivery in flight -- the
     // bounded retry loop re-attempts fireContinue (paced internally by
     // staleRetryNotBefore with exponential backoff).
-    if (staleAttempts > 0) {
+    // Spec 002 (T15, H1): any OTHER delivery in flight (the reset was
+    // fired but the send has not gone through: streaming agent, no piApi
+    // yet, paced stale retry) is re-driven here too -- the D-203 dedup
+    // will never re-plan this reset, so this loop is the only thing left
+    // to deliver the "продолжи" (the incident's "not-idle returns silently
+    // and nobody retries" hole).
+    const deliveryInFlight =
+      st !== null &&
+      st.lastResetAt > arm.lastResetAtAtArm &&
+      lastFiredResetAt === st.lastResetAt;
+    if (deliveryInFlight || staleAttempts > 0) {
       await fireContinue();
     }
   });

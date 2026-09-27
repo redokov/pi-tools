@@ -806,6 +806,126 @@ async function testFireDedupPerReset(): Promise<void> {
   }
 }
 
+// --- 10. Тик sync-poller внутри grace не убивает доставку (T15, H0) -----------
+
+/**
+ * Scenario 10 (spec 002 T15 / H0): the production incident of 2026-09-27.
+ * A sync-poller tick (60 s) landing INSIDE the grace window used to kill
+ * the pending "продолжи" send (unconditional stopGraceTimer in
+ * syncWatchdog), while the D-203 dedup forbade re-planning it -- 27
+ * minutes of silence. The delivery must survive sync ticks: the grace
+ * send still fires exactly once, "fire:reset-ready" is logged exactly once.
+ */
+async function testSyncTickInsideGraceKeepsDelivery(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-wd-h0-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(250);
+  __resetStaleStateForTests();
+  try {
+    seedFreshWindow();
+    const { pi, handlers, commands, sends } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-10.jsonl"));
+    await handlerOf(handlers, "session_start")({}, ctx);
+    await commandOf(commands, "cont-after-reset")("", ctx);
+    assert(armsIsArmed(), "H0: флаг взведён");
+
+    await expireWindow();
+    // Fire: the reset happens NOW, grace (250 ms) is scheduled for the future.
+    await __fireWatchdogForTests();
+    assert(sends.length === 0, "H0: внутри grace отправки ещё не было");
+
+    // THE incident: a sync-poller tick lands INSIDE the grace window.
+    await __syncWatchdogForTests();
+
+    // The grace send must survive the sync tick and deliver exactly once.
+    await sleep(400);
+    assert(
+      sends.length === 1,
+      `H0: «продолжи» доставлен несмотря на sync-тик внутри grace (sends=${sends.length})`,
+    );
+    assert(
+      armsGetArm()?.phase === "pending",
+      "H0: флаг в фазе pending после доставки",
+    );
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    const fireReadyCount = log
+      .split("\n")
+      .filter((l) => l.includes("fire:reset-ready")).length;
+    assert(
+      fireReadyCount === 1,
+      `H0: fire:reset-ready записан один раз (got ${fireReadyCount})`,
+    );
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    __resetStaleStateForTests();
+    cleanupPaths(tmp);
+  }
+}
+
+// --- 11. Not-idle не теряет доставку: paced retry до успеха (T15, H1) --------
+
+/**
+ * Scenario 11 (spec 002 T15 / H1): when the agent is streaming at the
+ * moment the grace fires, fireContinue returns silently; after the D-203
+ * dedup removed the noisy re-fire loop nothing re-drove the delivery --
+ * the send was lost forever. The delivery-in-flight retry loop must
+ * re-attempt once the agent goes idle.
+ */
+async function testNotIdleKeepsDeliveryUntilIdle(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-wd-h1-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(20);
+  __resetStaleStateForTests();
+  try {
+    seedFreshWindow();
+    const { pi, handlers, commands, sends } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    let idle = false;
+    const ctx = {
+      ...(makeCtx(join(tmp, "sess-11.jsonl")) as object),
+      isIdle: () => idle,
+    };
+    await handlerOf(handlers, "session_start")({}, ctx);
+    await commandOf(commands, "cont-after-reset")("", ctx);
+    assert(armsIsArmed(), "H1: флаг взведён");
+
+    await expireWindow();
+    await __fireWatchdogForTests();
+    await sleep(150); // grace (20 ms) fires while the agent is streaming
+    assert(
+      sends.length === 0,
+      "H1: стримящийся агент — отправка отложена (не потеряна)",
+    );
+    assert(
+      armsGetArm()?.phase !== "pending",
+      "H1: флаг всё ещё в фазе armed (доставка не состоялась)",
+    );
+
+    // A sync tick must not lose the pending delivery either (H0+H1 combo).
+    await __syncWatchdogForTests();
+
+    // The agent goes idle -> the retry tick must deliver.
+    idle = true;
+    await __retryTickForTests();
+    await sleep(50);
+    assert(
+      sends.length === 1,
+      `H1: paced retry доставил «продолжи» после idle (sends=${sends.length})`,
+    );
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    __resetStaleStateForTests();
+    cleanupPaths(tmp);
+  }
+}
+
 // --- runner ---------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -821,6 +941,8 @@ async function main(): Promise<void> {
   await testShutdownStopsEverything();
   await testContAfterResetOff();
   await testFireDedupPerReset();
+  await testSyncTickInsideGraceKeepsDelivery();
+  await testNotIdleKeepsDeliveryUntilIdle();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

@@ -196,12 +196,21 @@ npm run build
 - Files: — (деплой + git; при проблемах — обратно в T02/T04/T06/T08/T10)
 - Dependencies: T12, T13
 
+### T15 — Хотфикс: доставка переживает sync-тики и занятого агента (H0/H1) — P0 · 1h
+- [x] Диагностика инцидента №2 (2026-09-27 11:21–11:54 UTC): `fire:reset-ready … через 53 с` в 11:35:04, далее тишина до 11:54 — тик sync-poller (11:35:53) внутри grace-окна убил отложенный send (`stopGraceTimer` в `syncWatchdog`), дедуп D-203 запретил перепланирование.
+- [x] Сценарий 10 (H0): arm → сброс → fire → `__syncWatchdogForTests()` ВНУТРИ grace → «продолжи» доставлен, `fire:reset-ready` ровно один.
+- [x] Сценарий 11 (H1): arm → сброс → fire при `isIdle()=false` → paced retry доставляет после idle.
+- [x] `syncWatchdog`: delivery-in-flight (armed + `lastResetAt === lastFiredResetAt`) — grace не останавливается/восстанавливается, retry-интервал гонит доставку; `retryTick`/`fireContinue` (not-idle, no-pi) доносят send.
+- Files: `src/index.ts`, `tests/watchdog.e2e.test.mts`, `docs/watchdog-redesign.md`, `README.md`
+- Verify: `npx tsx tests/watchdog.e2e.test.mts` (51 asserts, 0 FAIL); полный регресс 8 сьютов — 414 asserts, 0 FAIL; `npm run build` — 0 ошибок
+- Dependencies: T04, T08
+
 ## Requirement Coverage
 
 | Requirement | Task IDs |
 |---|---|
 | FR-001 (replacement не теряет флаг молча) | T01, T02, T05, T06 |
-| FR-002 (fire 1× на сброс) | T03, T04 |
+| FR-002 (fire 1× на сброс) | T03, T04, T15 |
 | FR-003 (bounded stale-retry, N=6, disarm) | T07, T08 |
 | FR-004 (notify при капитуляции) | T09, T10 |
 | FR-005 (armslog диаг.: waiting/adopted/capitulation) | T01, T02, T07, T08 |
@@ -248,3 +257,4 @@ npm run build
 | T12 | done | регресс 8 сьютов: 136+66+52+43+14+42+8+44 = 405 asserts, 0 FAIL; tsc 0 ошибок |
 | T13 | done | кросс-ревью: 3 риска закрыты тестами; правки — перенос док-комментариев, дублет описания fireContinue; повторный полный прогон зелёный |
 | T14 | done | deploy.ps1 OK (diff рабочей копии идентичен); коммит cc3f43b (regress: lifecycle-тест переведён на retry-interval контракт спеки) |
+| T15 | done | хотфикс H0/H1 (инцидент 2026-09-27): sync-тик внутри grace убивал доставку, дедуп запрещал перепланирование; введён delivery-in-flight (grace переживает/восстанавливается, retry доносит); сценарии 10-11 в watchdog.e2e (RED→GREEN), полный регресс 8 сьютов 414 asserts 0 FAIL; deploy + коммит |
