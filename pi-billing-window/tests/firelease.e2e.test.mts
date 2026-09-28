@@ -101,6 +101,10 @@ import {
 const a = JSON.parse(process.argv[process.argv.length - 1]);
 setFiresDirPath(a.dir);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+// Реальный pid внутреннего 1С-процесса (tsx-обёртка child.pid не совпадает
+// с process.pid внутри модуля) — репортим его, чтобы харнесс сравнивал
+// маркерный pid с faktическим pid держателя.
+console.log("__FIRERELEASE_PID__" + process.pid);
 let out: unknown = null;
 if (a.action === "acquire") {
   const res = acquireFireLease(a.key, Number(a.reset));
@@ -127,6 +131,16 @@ function parseRes(raw: string): Record<string, unknown> | null {
   }
 }
 
+/** Реальный pid дочернего процесса из его stdout (не child.pid обёртки tsx). */
+function parseRealPid(raw: string): number {
+  const line = raw
+    .split(/\r?\n/)
+    .find((l) => l.startsWith("__FIRERELEASE_PID__"));
+  if (!line) return 0;
+  const n = Number(line.slice("__FIRERELEASE_PID__".length));
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
 /** Запуск инстанции как асинхронный фоновый процесс (возвращает pid сразу). */
 function spawnInstance(payload: Record<string, unknown>): Promise<{ pid: number; res: Record<string, unknown> | null }> {
   return new Promise((resolve) => {
@@ -138,7 +152,7 @@ function spawnInstance(payload: Record<string, unknown>): Promise<{ pid: number;
       out += `[spawn err ${String(e)}]`;
       resolve({ pid: 0, res: null });
     });
-    child.on("close", () => resolve({ pid: child.pid ?? 0, res: parseRes(out) }));
+    child.on("close", () => resolve({ pid: parseRealPid(out) || (child.pid ?? 0), res: parseRes(out) }));
   });
 }
 
@@ -150,7 +164,7 @@ function runInstanceSync(payload: Record<string, unknown>): { pid: number; res: 
     timeout: 30_000,
   });
   const raw = (r.stdout ?? "") + (r.stderr ?? "");
-  return { pid: (r.pid as number) ?? 0, res: parseRes(raw), raw };
+  return { pid: parseRealPid(raw) || ((r.pid as number) ?? 0), res: parseRes(raw), raw };
 }
 
 /** Пара «держатель A (фоновый, держит аренду) + конкурент B (блокирующе)». */

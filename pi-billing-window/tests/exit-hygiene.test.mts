@@ -84,6 +84,11 @@ const SUITES = [
   "watchdog.e2e",
   "replacement",
   "stale-capitulation",
+  "pending-window-retry",
+  "attribution",
+  "session-isolation",
+  "firelease",
+  "firelease.e2e",
 ] as const;
 
 const SPAWN_TIMEOUT_MS = 120_000;

@@ -25,6 +25,8 @@
  */
 
 import * as os from "node:os";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -67,6 +69,11 @@ import {
   RETRY_AFTER_FIRE_MS,
 } from "./arms.js";
 import { armsLog, setArmsLogPath } from "./armslog.js";
+import {
+  acquireFireLease,
+  releaseFireLease,
+  setFiresDirPath,
+} from "./firelease.js";
 import {
   armWatchdog,
   clearWatchdog,
@@ -328,6 +335,9 @@ function staleBackoffMs(attempt: number): number {
   );
 }
 
+/** Каталог маркеров firelease для тестов (пер-процесс, под системный tmp). */
+let testFiresDir: string | null = null;
+
 /**
  * Test hook: reset the stale-retry counter / pacing / fire dedup marker so
  * scenarios in one process do not leak attempts into each other.
@@ -338,6 +348,16 @@ export function __resetStaleStateForTests(): void {
   lastFiredResetAt = null;
   pendingFiredResetAt = null;
   ownerKey = null;
+  // Spec 006 (D-604): маркеры firelease в тестах — изолированный каталог в
+  // системном tmp (пересоздаётся на каждый сброс), чтобы планирования fire из
+  // разных сценариев не пересекались и не писали в ~/.pi/agent/...-fires.
+  if (testFiresDir === null) {
+    testFiresDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibw-fires-"));
+  } else {
+    fs.rmSync(testFiresDir, { recursive: true, force: true });
+  }
+  fs.mkdirSync(testFiresDir, { recursive: true });
+  setFiresDirPath(testFiresDir);
 }
 
 /** Test hook: read the current stale-retry pacing moment. */
@@ -390,6 +410,44 @@ export function __retryTickForTests(): Promise<void> {
  * "arm-gone" only on the transition, not on every sync tick.
  */
 let lastArmSeenKey: string | null = null;
+
+// --- firelease helpers (spec 006, D-604) --------------------------------------
+
+/**
+ * Освободить аренду сброса `reset` для текущего ключа (compare-and-remove по
+ * нашему pid; идемпотентен, never-throws). No-op при невалидном reset/ключе.
+ */
+function releaseFireForReset(reset: number): void {
+  if (reset <= 0) return;
+  const key = armsGetKey();
+  if (!key) return;
+  releaseFireLease(key, reset, process.pid);
+}
+
+/**
+ * Spec 006 (D-604): единственная точка планирования fire — берёт аренду
+ * (key, st.lastResetAt) ДО того, как сброс зарегистрирован запланированным
+ * (lastFiredResetAt) и ДО лога fire:reset-ready / grace. Возвращает true, когда
+ * аренда наша (занята сейчас ИЛИ мы держим её в этом процессе — повторный
+ * acquire собственного живого маркера даёт holderPid === process.pid, что
+ * равнозначно «аренда всё ещё моя»); false — маркер занят ЧУЖИМ живым
+ * процессом: молчаливый дедуп (ни fire:reset-ready, ни lastFiredResetAt),
+ * watchdog переводится на следующую границу окна (другой процесс доставит;
+ * после TTL/takeover следующая граница даст ещё шанс). Без осмысленного
+ * сброса или ключа дедуп невозможен — планируем как раньше (true).
+ */
+function planFireForReset(st: State | null): boolean {
+  const key = armsGetKey();
+  if (!key) return true;
+  const reset = st?.lastResetAt ?? 0;
+  if (reset <= 0) return true;
+  const lease = acquireFireLease(key, reset);
+  if (lease.ok || lease.holderPid === process.pid) return true;
+  // Чужой живой маркер: не планируем, watchdog на следующую границу.
+  // (st здесь гарантированно не null — выше reset>0 вернул true раньше.)
+  armWatchdog(computeFireAt(st as State), onWatchdogFire);
+  return false;
+}
 
 // --- cont-after-reset helpers -------------------------------------------------
 
@@ -670,6 +728,8 @@ function syncWatchdog(): void {
       lastArmSeenKey = null;
       armsLog("arm-gone", withAttr("флаг исчез/истёк (sync-poller продолжает жить)"));
     }
+    // Spec 006 (D-604): флаг снят (arm-gone) — освобождаем аренду сброса.
+    releaseFireForReset(st?.lastResetAt ?? 0);
     refreshMarker();
     return;
   }
@@ -732,6 +792,11 @@ function syncWatchdog(): void {
     st.lastResetAt > arm.lastResetAtAtArm &&
     st.lastResetAt !== lastFiredResetAt
   ) {
+    // Spec 006 (D-604): аренда маркера ДО регистрации плана. Чужой живой
+    // маркер = молчаливый дедуп (другой процесс доставит): план НЕ ставим,
+    // lastFiredResetAt НЕ трогаем — planFireForReset уже перевёл watchdog на
+    // следующую границу окна, а следующий sync-тик попробует снова.
+    if (!planFireForReset(st)) return;
     fireAt = Math.min(fireAt, st.lastResetAt + resetGraceMs);
     lastFiredResetAt = st.lastResetAt;
     // A fresh reset gives the delivery a clean slate (D-204 reset rules).
@@ -804,6 +869,11 @@ async function onWatchdogFire(): Promise<void> {
     if (armsGetArm() === null) return;
     const st = readStateSync();
     const base = st !== null && st.lastResetAt > 0 ? st.lastResetAt : Date.now();
+    // Spec 006 (D-604): lease-захват ДО регистрации fire. Если аренда у
+    // чужого живого процесса — молчаливый дедуп: без fire:reset-ready, без
+    // grace и lastFiredResetAt; watchdog уже на следующей границе (повторная
+    // попытка при TTL/takeover на ней естественна).
+    if (!planFireForReset(st)) return;
     // Spec 002 (D-203): this reset window has now been planned a fire for;
     // sync ticks must not re-plan it.
     lastFiredResetAt = base;
@@ -837,6 +907,8 @@ async function onWatchdogFire(): Promise<void> {
 async function capitulate(): Promise<void> {
   const key = armsGetKey();
   await armsDisarm();
+  // Spec 006 (D-604): капитуляция — release-точка аренды сброса.
+  releaseFireForReset(readStateSync()?.lastResetAt ?? 0);
   armsLog(
     `capitulation:after-${STALE_MAX_ATTEMPTS}`,
     withAttr(`«продолжи» не доставлен после ${STALE_MAX_ATTEMPTS} stale-попыток, ключ ${key?.split(/[\\/]/).pop() ?? "?"} — флаг снят, уведомление отправлено`),
@@ -867,6 +939,11 @@ async function noteStaleFailure(
   const backoff = staleBackoffMs(staleAttempts);
   staleRetryNotBefore = Date.now() + backoff;
   const event = kind === "waiting" ? "replacement:waiting" : "send-error:stale";
+  // Spec 006 (D-604): stale-провал — release-точка аренды (другой процесс
+  // получает шанс доставить первым), свой retry-цикл живёт и повторно
+  // acquire'ит перед следующей отправкой. kind="waiting" (epoch-guard) аренду
+  // НЕ снимает: доставка легитимно отложена до переусыновления (FR-203).
+  if (kind === "stale") releaseFireForReset(readStateSync()?.lastResetAt ?? 0);
   armsLog(
     event,
     withAttr(
@@ -929,6 +1006,18 @@ async function fireContinue(): Promise<void> {
     return;
   }
 
+  // Spec 006 (D-604): send-gating — отправляем, только пока аренда (key,
+  // reset) всё ещё НАША (пере-acquire). Чужая живая аренда вернёт ok:false с
+  // чужим holderPid -> не шлём (другой процесс доставит; retry/pacing живёт).
+  const gateSt = readStateSync();
+  const gateReset =
+    gateSt !== null && gateSt.lastResetAt > 0 ? gateSt.lastResetAt : 0;
+  const gateKey = armsGetKey();
+  if (gateKey && gateReset > 0) {
+    const lease = acquireFireLease(gateKey, gateReset);
+    if (!lease.ok && lease.holderPid !== process.pid) return;
+  }
+
   try {
     await p.sendUserMessage("продолжи");
     // Sent: switch the flag to "pending" instead of consuming it. The first
@@ -958,6 +1047,9 @@ async function fireContinue(): Promise<void> {
     }
     // Failed to send (e.g. bus busy). Keep the arm; the next tick retries.
     armsLog("send-error", withAttr(String((err as Error)?.message ?? err).slice(0, 200)));
+    // Spec 006 (D-604): non-stale send-ошибка тоже освобождает аренду —
+    // следующий retry re-acquire'ит перед новой отправкой.
+    releaseFireForReset(readStateSync()?.lastResetAt ?? 0);
   }
   refreshMarker();
 }
@@ -1420,6 +1512,11 @@ async function onAfterProviderResponse(
     lastResetAt: armState?.lastResetAt,
   });
   if (confirmed) {
+    // Spec 006 (D-604): fire:confirmed — release-точка аренды. Освобождаем
+    // и сброс подтверждения, и сброс последней отправки (могут разойтись при
+    // долгой доставке между двумя сбросами окна).
+    releaseFireForReset(armState?.lastResetAt ?? 0);
+    releaseFireForReset(pendingFiredResetAt ?? 0);
     // Spec 002 (D-203): a repeat re-arm waits for the NEXT reset; give the
     // dedup marker a fresh window.
     lastFiredResetAt = null;
@@ -1812,6 +1909,9 @@ function registerContAfterReset(pi: ExtensionAPI): void {
           const removed = await armsDisarm();
           // Spec 005: снятие флага снимает и маркер последней отправки.
           pendingFiredResetAt = null;
+          // Spec 006 (D-604): ручное снятие флага (disarm) — release-точка
+          // аренды сброса (флаг снят, «продолжи» больше не имеет смысла).
+          releaseFireForReset(readStateSync()?.lastResetAt ?? 0);
           syncWatchdog();
           ctx.ui.notify(
             removed
