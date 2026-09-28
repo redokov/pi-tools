@@ -95,3 +95,57 @@ Watchdog взводится по известной границе окна **в
 - инвариант FR-002 сохранён: дедуп относится к ПЛАНИРОВАНИЮ fire (`fire:reset-ready` — ровно один на сброс), а НЕ к попыткам доставки — доставка может ретраиться свободно.
 
 Покрытие: сценарии 10 (sync-тик внутри grace) и 11 (not-idle → paced retry) в `tests/watchdog.e2e.test.mts`.
+
+## Spec 006: механика ночной устойчивости (addition, сводка)
+
+Спека `006-night-resilience` добавляет к watchdog-модели четыре механизма.
+Полный формат токенов и маркеров — `FORMAT.md` в каталоге спеки
+(`.ai/sdd/specs/006-night-resilience/`); здесь — краткая сводка для читателей.
+
+### 1. Аддитивная атрибуция armslog (F3, D-606)
+
+Каждая строка fire-пути доставки «продолжи» дописывает В КОНЕЦ detail-строки блок:
+
+```
+ key=<basename> pid=<pid> host=<host> ep=<эпоха> [ctx=stale src=<probe|epoch-guard|drain>] [epoch-mismatch=1]
+```
+
+- helper `withAttr()` в `src/index.ts` **только добавляет** отсутствующие токены
+  (`key=`/`pid=`/`host=`/`ep=`), существующие не дублирует и не переписывает;
+- несущие строки — fire-путь (FR-301): `fire:reset-ready`, `fire:send-ok`,
+  `fire:confirmed`, `send-error`, `send-error:stale`, `replacement:waiting`,
+  `replacement:adopted`, `capitulation:after-N`, `session-start`, `arm-seen`,
+  `arm-gone`; служебные (`watchdog:eval-error`, `watchdog:reset-error`,
+  `block:no-pi`) — НЕ несут токенов;
+- `host=` — `os.hostname()` до первого `.`/`/`; `ep=` — `sessionEpoch`;
+  полный путь (`path=`) — только в `session-start`;
+- склейка цепочки fire→send-ok→confirmed/вердикт идёт по тройке `(key, host, ep)`;
+  смена `ep=`/`pid=` внутри цепочки = межпроцессная смена владельца (FR-103).
+
+### 2. Межпроцессный дедуп сброса (F2, D-604/D-605, `src/firelease.ts`)
+
+Аренда «планирования fire для конкретного сброса» = атомарно создаваемый файл
+`~/.pi/agent/pi-billing-window-fires/<keyId>/<lastResetAt>.mark`
+(`keyId = sha1(key).slice(0,16)`, JSON: `locked_at/pid/host/ep/reset/key/mode`):
+
+- `acquire` через `wx` (O_EXCL); живой чужой маркер (TTL 10 мин И pid жив) → skip;
+  мёртвый → takeover (`rm` + повтор `wx`, ≤3);
+- `release` — compare-and-remove (только свой `pid`+`ep`); release-точки: успех,
+  капитуляция, disarm/arm-gone, первый stale-провал, не-stale send-error;
+- «продолжи» шлёт только держатель аренды (send-gating); один живой fire на
+  (key, reset) на ВСЕХ процессах (FR-201/202/203).
+
+### 3. Owner-shift / guard (F4, D-607/D-608)
+
+- `ownerKey` — сессия-владелец глобального состояния/таймеров. Чужой `session-start`
+  логируется как `owner-shift: old->new` (единственный журнальный признак FR-401);
+- guard (D-608): если чужой ключ + `remapKey(reason) === "repoint"` + у владельца
+  живой интерес (armed/pending/in-flight) — `currentCtx`/таймеры/эпоха владельца НЕ
+  трогаются, пишется `owner-shift(blocked)` — дочерняя `session_shutdown` рано
+  выходит и не мутирует родителя (гипотеза (c), до E1).
+
+### 4. Stale-probe (F1, D-601/D-602)
+
+`probePiAlive()` — дешёвый `O(1)` probe смерти ссылки pi; результат прошивается
+в fire-строки как `ctx=stale src=probe`; при расхождении эпох — `src=epoch-guard`
+`epoch-mismatch=1`; на планировании fire при мёртвых ссылках — `src=drain`.
