@@ -24,6 +24,8 @@
  * ExtensionEvent names, not arbitrary channel names.
  */
 
+import * as os from "node:os";
+
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   readStateSync,
@@ -164,6 +166,90 @@ let sessionEpoch = 0;
  * (new/fork/switch/reload) and `piApi` must not be used.
  */
 let piApiEpoch = 0;
+
+// --- Spec 006 (F1 probe + F3 attr): аддитивная атрибуция armslog -------------
+
+/**
+ * Spec 006 (D-601): last result of probePiAlive(). "unknown" before the
+ * first probe. Read by withAttr() to stamp `ctx=stale src=probe` on fire-
+ * path lines while the captured pi reference is dead. Never persisted.
+ */
+let probeState: "live" | "stale" | "unknown" = "unknown";
+
+/**
+ * Spec 006 (D-601): cheap dead-reference probe. Any runtime method on the
+ * ExtensionAPI is wrapped in `assertActive()` (fact e), so calling
+ * `getSessionName?.()` is an O(1) read of staleness that throws "ctx is
+ * stale" when the captured `piApi` no longer belongs to the live session.
+ * Never sends anything and never throws.
+ */
+function probePiAlive(): "live" | "stale" {
+  if (piApi === null) return "stale";
+  try {
+    const p = piApi as unknown as { getSessionName?: () => unknown };
+    p.getSessionName?.(); // any runtime method is wrapped in assertActive
+    probeState = "live";
+  } catch {
+    probeState = "stale"; // "ctx is stale" -- reference invalidated
+  }
+  return probeState;
+}
+
+/**
+ * Spec 006 (Q-004): `host=` token -- os.hostname() truncated at the first
+ * "." or "/" so it stays a single ASCII label (parser's \S+ stays valid).
+ */
+const hostId = (() => {
+  try {
+    return os.hostname().split(/[./]/)[0] || "?";
+  } catch {
+    return "?";
+  }
+})();
+
+/** Spec 006 (D-606): basename of the current arms key (grammar `key=`). */
+function baseKey(): string {
+  const k = armsGetKey();
+  if (!k) return "?";
+  return k.split(/[\\/]/).pop() ?? "?";
+}
+
+/**
+ * Spec 006 (D-606): append the attribution token block to a fire-path
+ * armslog detail, at the very END (monitors' `.*` and `.includes()`-tests
+ * stay intact). Grammar:
+ *   <detail>  key=<basename> pid=<pid> host=<host> ep=<epoch>
+ *            [ctx=stale src=<probe|epoch-guard|drain>] [epoch-mismatch=1]
+ * Never duplicates a token already present in `detail` (session-start /
+ * arm-seen already carry `key=`). The stale-signal is either passed
+ * explicitly by the caller (`stale`) or derived from the current probe /
+ * epoch state (D-602). Pure, never throws.
+ */
+function withAttr(
+  detail: string,
+  stale?: { ctx: "probe" | "epoch-guard" | "drain"; mismatch?: boolean },
+): string {
+  let out = detail;
+  if (!/\bkey=/.test(out)) out += ` key=${baseKey()}`;
+  if (!/\bpid=/.test(out)) out += ` pid=${process.pid}`;
+  if (!/\bhost=/.test(out)) out += ` host=${hostId}`;
+  if (!/\bep=/.test(out)) out += ` ep=${sessionEpoch}`;
+  let src: "probe" | "epoch-guard" | "drain" | null = null;
+  let mismatch = false;
+  if (stale) {
+    src = stale.ctx;
+    mismatch = !!stale.mismatch;
+  } else if (probeState === "stale") {
+    src = "probe";
+  } else if (piApiEpoch !== sessionEpoch) {
+    src = "epoch-guard";
+    mismatch = true;
+  }
+  if (src !== null && !/\bctx=stale/.test(out)) {
+    out += ` ctx=stale src=${src}${mismatch ? " epoch-mismatch=1" : ""}`;
+  }
+  return out;
+}
 
 /**
  * cont-after-reset timers. The armed FLAG survives /new (it is file-backed in
@@ -527,6 +613,7 @@ function runGuarded(fn: () => Promise<void>): Promise<void> {
  *  - arm "pending": retry interval; watchdog/grace cleared.
  */
 function syncWatchdog(): void {
+  probePiAlive(); // D-601: регулярная картина на каждом sync-тике
   const arm = armsGetArm();
   const st = readStateSync();
   const key = armsGetKey();
@@ -541,7 +628,7 @@ function syncWatchdog(): void {
     stopGraceTimer();
     if (lastArmSeenKey !== null) {
       lastArmSeenKey = null;
-      armsLog("arm-gone", "флаг исчез/истёк (sync-poller продолжает жить)");
+      armsLog("arm-gone", withAttr("флаг исчез/истёк (sync-poller продолжает жить)"));
     }
     refreshMarker();
     return;
@@ -551,7 +638,7 @@ function syncWatchdog(): void {
     lastArmSeenKey = key;
     armsLog(
       "arm-seen",
-      `repeat=${arm.repeat ?? 1} phase=${arm.phase ?? "armed"} key=${key?.split(/[\\/]/).pop() ?? "?"}`
+      withAttr(`repeat=${arm.repeat ?? 1} phase=${arm.phase ?? "armed"} key=${key?.split(/[\\/]/).pop() ?? "?"}`),
     );
   }
 
@@ -681,9 +768,16 @@ async function onWatchdogFire(): Promise<void> {
     // sync ticks must not re-plan it.
     lastFiredResetAt = base;
     const delay = Math.max(0, base + resetGraceMs - Date.now());
+    // Spec 006 (D-602): признак «fire планируется при мёртвых ссылках» —
+    // drain-маркер, если probe видит смерть piApi ИЛИ эпохи разошлись.
+    const drainStale =
+      piApi === null || probePiAlive() === "stale" || piApiEpoch !== sessionEpoch;
     armsLog(
       "fire:reset-ready",
-      `watchdog: сброс окна ${new Date(base).toISOString()}, отправляю «продолжи» через ${Math.round(delay / 1000)} с`
+      withAttr(
+        `watchdog: сброс окна ${new Date(base).toISOString()}, отправляю «продолжи» через ${Math.round(delay / 1000)} с`,
+        drainStale ? { ctx: "drain", mismatch: true } : undefined,
+      ),
     );
     graceTimer = setTimeout(() => {
       graceTimer = null;
@@ -705,7 +799,7 @@ async function capitulate(): Promise<void> {
   await armsDisarm();
   armsLog(
     `capitulation:after-${STALE_MAX_ATTEMPTS}`,
-    `«продолжи» не доставлен после ${STALE_MAX_ATTEMPTS} stale-попыток, ключ ${key?.split(/[\\/]/).pop() ?? "?"} — флаг снят, уведомление отправлено`,
+    withAttr(`«продолжи» не доставлен после ${STALE_MAX_ATTEMPTS} stale-попыток, ключ ${key?.split(/[\\/]/).pop() ?? "?"} — флаг снят, уведомление отправлено`),
   );
   void sendNotify({
     type: "billing:cont-after-reset-capitulation",
@@ -735,7 +829,14 @@ async function noteStaleFailure(
   const event = kind === "waiting" ? "replacement:waiting" : "send-error:stale";
   armsLog(
     event,
-    `${detail} — попытка ${staleAttempts}/${STALE_MAX_ATTEMPTS}, повтор через ${Math.round(backoff / 60000)} мин`,
+    withAttr(
+      `${detail} — попытка ${staleAttempts}/${STALE_MAX_ATTEMPTS}, повтор через ${Math.round(backoff / 60000)} мин`,
+      // Spec 006 (D-602): "stale"-ветка — send упал по факту (probe);
+      // "waiting"-ветка — epoch-guard (ссылки из прошлой эпохи).
+      kind === "stale"
+        ? { ctx: "probe" }
+        : { ctx: "epoch-guard", mismatch: true },
+    ),
   );
   ensureRetryInterval();
   if (staleAttempts >= STALE_MAX_ATTEMPTS) {
@@ -754,6 +855,8 @@ async function noteStaleFailure(
  * first successful provider response confirms it (confirmSuccess).
  */
 async function fireContinue(): Promise<void> {
+  // Spec 006 (D-601): свежий статус на момент попытки, перед epoch-guard.
+  probePiAlive();
   if (Date.now() < staleRetryNotBefore) {
     // Paced retry after a stale failure -- the arm and the timers stay.
     return;
@@ -801,7 +904,7 @@ async function fireContinue(): Promise<void> {
     // branch of retryTick re-sends only on a NEW reset, not on a 5-min
     // timeout (FR1).
     pendingFiredResetAt = readStateSync()?.lastResetAt ?? null;
-    armsLog("fire:send-ok", "«продолжи» отправлен, флаг в pending до первого успешного ответа");
+    armsLog("fire:send-ok", withAttr("«продолжи» отправлен, флаг в pending до первого успешного ответа"));
   } catch (err) {
     if (/stale/i.test(String((err as Error)?.message ?? err))) {
       // pi went stale mid-send. Spec 002 (D-204): bounded retry with
@@ -814,7 +917,7 @@ async function fireContinue(): Promise<void> {
       return;
     }
     // Failed to send (e.g. bus busy). Keep the arm; the next tick retries.
-    armsLog("send-error", String((err as Error)?.message ?? err).slice(0, 200));
+    armsLog("send-error", withAttr(String((err as Error)?.message ?? err).slice(0, 200)));
   }
   refreshMarker();
 }
@@ -1040,6 +1143,8 @@ async function onSessionStart(
   ctx: ExtensionContext,
 ): Promise<void> {
   currentCtx = ctx;
+  // Spec 006 (D-601): мгновенная картина сразу после любого session_start.
+  probePiAlive();
 
   // Spec 002 (D-201): after a session replacement the factory may NOT have
   // re-run, so piApi/eventBus may still belong to the replaced session and
@@ -1056,12 +1161,15 @@ async function onSessionStart(
       staleRetryNotBefore = 0;
       armsLog(
         "replacement:adopted",
-        "session_start переснял ссылки на pi/events — отправка «продолжи» снова возможна",
+        withAttr("session_start переснял ссылки на pi/events — отправка «продолжи» снова возможна"),
       );
     } else {
       armsLog(
         "replacement:waiting",
-        "свежие ссылки не найдены в session_start — жду переусыновления (после 6 попыток капитуляция с уведомлением)",
+        withAttr(
+          "свежие ссылки не найдены в session_start — жду переусыновления (после 6 попыток капитуляция с уведомлением)",
+          { ctx: "epoch-guard", mismatch: true },
+        ),
       );
     }
   }
@@ -1142,7 +1250,7 @@ async function onSessionStart(
   }
   armsLog(
     "session-start",
-    `reason=${String((event as { reason?: string } | null)?.reason ?? "?")} key=${armsGetKey()?.split(/[\\/]/).pop() ?? "?"} armed=${armsIsArmed()}`,
+    withAttr(`reason=${String((event as { reason?: string } | null)?.reason ?? "?")} key=${armsGetKey()?.split(/[\\/]/).pop() ?? "?"} armed=${armsIsArmed()}`),
   );
 }
 
@@ -1245,7 +1353,7 @@ async function onAfterProviderResponse(
     // Spec 005: confirmation clears the pending-send marker (FR3) so a
     // freshly re-armed repeat flag starts from a clean slate.
     pendingFiredResetAt = null;
-    armsLog("fire:confirmed", "успешный ответ после «продолжи» — флаг снят/перевзведён");
+    armsLog("fire:confirmed", withAttr("успешный ответ после «продолжи» — флаг снят/перевзведён"));
     // Re-arm the watchdog for the next boundary (repeat>1) or drop it
     // (the one-shot arm was removed by confirmSuccess).
     syncWatchdog();
