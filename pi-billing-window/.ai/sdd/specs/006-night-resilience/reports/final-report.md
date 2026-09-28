@@ -57,9 +57,11 @@ E1 вердикт **NO** → полная изоляция по ключу (FR-4
 
 - T-13 (83b4a15): 14 сьютов, 577 asserts, 0 FAIL, build чистый
   (reports/t13-regression-2026-09-28.md).
-- После добавления `/pbr-reload` (a867fa1): build чистый, сьюты зелёные;
-  финальный прогон — см. /tmp/regress-final.log (результат дублируется утром
-  в этот отчёт).
+- После добавления `/pbr-reload` (a867fa1): финальный прогон оркестратора
+  лично — 14 сьютов, **588 asserts, 0 FAIL** (все 0 по каждому), build чистый.
+  arms/attribution/exit-hygiene/firelease(.e2e)/firelease/history/lifecycle/
+  pending-window-retry/replacement/session-isolation/stale-capitulation/
+  watchdog(.e2e)/watchdog/test — 0 FAIL у всех.
 - exit-hygiene: 17/17 (SUTES-лист проверяет process.exit у всех сьютов).
 
 ## Статус деплоя
@@ -75,4 +77,3 @@ E1 вердикт **NO** → полная изоляция по ключу (FR-4
 - Stage Z: morning-проверка PASS-критериев по stage-z-status.log /
   STAGE-Z-heartbeat.txt / armslog (fire:confirmed на каждой границе, heartbeat
   растёт, окна ×2+, доставка ≤1 backoff-шага после сброса) → дописать сюда.
-- Финальный прогон регресса (если /tmp/regress-final.log ещё не завершён).
