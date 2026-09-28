@@ -1923,6 +1923,26 @@ function registerSettimer(pi: ExtensionAPI): void {
 }
 
 /**
+ * /pbr-reload -- self-reload of the extension module via ctx.reload()
+ * (session.reload(), session_start reason="reload"). Useful for ops (pick up
+ * freshly deployed extension code without killing the session) and for live
+ * scenario B2 (spec 006 T-14): arm -> reload BEFORE the boundary -> delivery
+ * AFTER session-start(reload) with exactly one fire per reset (D-604 dedup).
+ * The captured ctx becomes stale after await ctx.reload() -- the handler
+ * must not touch it afterwards (docs: Session replacement lifecycle).
+ */
+function registerSelfReload(pi: ExtensionAPI): void {
+  pi.registerCommand("pbr-reload", {
+    description:
+      "Перезагрузить расширение pi-billing-window (новый модуль, тот же session-file)",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify("Перезагрузка расширения pi-billing-window…", "info");
+      await ctx.reload();
+    },
+  });
+}
+
+/**
  * /cont-after-reset -- arm (default) or disarm ("off") the automatic
  * "continue after reset" for THIS conversation. When armed, the footer timer
  * shows " [cont-after-reset]"; on the next window reset (after ~1 min) the
@@ -2055,6 +2075,7 @@ export default function (pi: ExtensionAPI): void {
   registerBillingReset(pi);
   registerSettimer(pi);
   registerContAfterReset(pi);
+  registerSelfReload(pi);
 
   // Touch renderStatusBar so the import is retained for downstream tools
   // and linters that flag unused imports. The function is also exposed for

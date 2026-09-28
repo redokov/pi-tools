@@ -126,7 +126,8 @@ try:
     t_arm = time.time()
     arm_seen = sc.wait_event("arm-seen", START_LINE, 90, key_basename=key_basename)
     ev("arm_seen", arm_seen[0] if arm_seen else "MISSING", arm_seen[2] if arm_seen else "")
-    ev("arm_seen_sec", round(time.time() - t_arm, 1) if arm_seen else None)
+    arm_seen_sec = round(time.time() - t_arm, 1) if arm_seen else None
+    ev("arm_seen_sec", arm_seen_sec)
     time.sleep(2)
     a1 = sc.arms_snapshot()
     ev("arms_after_external_arm", json.dumps(a1, ensure_ascii=False))
@@ -151,7 +152,14 @@ try:
             pend = cur
             break
         time.sleep(5)
+    # fix(race): доставка может уложиться ДО запуска опроса (fire прямо на
+    # arm-seen, когда окно уже было сброшено) и флаг успевает сгореть —
+    # тогда phase==pending уже не увидеть. Считаем доказательством и строку
+    # fire:send-ok в armslog по нашему key.
+    send_ok_lines = [d for d in sc.read_delta(START_LINE)
+                     if d[1] == "fire:send-ok" and key_basename in (d[2] or "")]
     ev("send_ok_pending", json.dumps(pend, ensure_ascii=False) if pend else "MISSING")
+    ev("send_ok_armslog_lines", [f"{d[0]} {d[2][:80]}" for d in send_ok_lines] or "none")
     t_so = time.time()
 
     # ждём подтверждение: агент ответил RESUMED -> fire:confirmed, флаг снят
@@ -186,8 +194,8 @@ try:
 
     checks = {
         "external arm accepted (key)": rec_after is not None and rec_after.get("repeat") == 1,
-        "arm-seen <=60s": arm_seen is not None and (time.time() - t_arm) <= 60,
-        "send-ok (phase pending)": pend is not None,
+        "arm-seen <=60s": arm_seen is not None and arm_seen_sec is not None and arm_seen_sec <= 60,
+        "send-ok (phase pending)": pend is not None or len(send_ok_lines) > 0,
         "flag removed (confirmed)": gone,
         "RESUMED in heartbeat": len(resumed) >= 1,
         "no negatives": len(neg) == 0,
