@@ -60,6 +60,7 @@ import {
   confirmSuccess as armsConfirmSuccess,
   isArmed as armsIsArmed,
   getArm as armsGetArm,
+  getArmForKey as armsGetArmForKey,
   getKey as armsGetKey,
   remapKey,
   RESET_GRACE_MS,
@@ -105,6 +106,17 @@ let tickerStarted = false;
  * closure argument (the listener is registered once via pi.events.on()).
  */
 let currentCtx: ExtensionContext | null = null;
+
+/**
+ * Spec 006 (D-607/D-608): the owner conversation -- the session-file key
+ * whose arm / delivery currentCtx/currentKey/timers serve. It is the
+ * conversation that last (re)started this window on a non-blocked path, and
+ * it survives foreign (child subagent) session-start/session-shutdown events.
+ * Updated ONLY on: first session-start, a same-key session-start, a
+ * carry-reason session-start, and /cont-after-reset. Never on a blocked
+ * foreign repoint (the guard leaves it with the live owner).
+ */
+let ownerKey: string | null = null;
 
 /**
  * The shared EventBus captured from `pi.events` in the factory. All
@@ -325,6 +337,7 @@ export function __resetStaleStateForTests(): void {
   staleRetryNotBefore = 0;
   lastFiredResetAt = null;
   pendingFiredResetAt = null;
+  ownerKey = null;
 }
 
 /** Test hook: read the current stale-retry pacing moment. */
@@ -388,6 +401,33 @@ function sessionKeyOf(ctx: ExtensionContext | null): string {
   } catch {
     return `ephemeral:${process.pid}`;
   }
+}
+
+/** Grammar `key=` from D-606: basename of an arbitrary session-file key. */
+function sessionKeyBase(k: string): string {
+  return k.split(/[\\/]/).pop() || k;
+}
+
+/**
+ * Spec 006 (D-608): is the OWNER's interest live? True when the owner's
+ * conversation has a live (unexpired, armed/pending) arm under `ownerKey`
+ * OR an in-flight delivery for it (state.lastResetAt has already advanced
+ * past the reset the owner's arm was set for -- a fire is due/pending).
+ * Both clauses are read by key from arms.json WITHOUT touching currentKey.
+ * Without a live interest the guard does not block: orphan/foreign sessions
+ * must not prevent a legitimate identical re-establishment.
+ */
+function hasLiveOwnerInterest(): boolean {
+  if (ownerKey === null) return false;
+  const arm = armsGetArmForKey(ownerKey);
+  if (arm === null) return false;
+  try {
+    const st = readStateSync();
+    if (st !== null && st.lastResetAt > arm.lastResetAtAtArm) return true;
+  } catch {
+    // unreadable state below is non-fatal -- the live arm alone is enough
+  }
+  return true;
 }
 
 // --- history.ts helpers -------------------------------------------------------
@@ -1142,6 +1182,30 @@ async function onSessionStart(
   event: unknown,
   ctx: ExtensionContext,
 ): Promise<void> {
+  const incomingKey = sessionKeyOf(ctx);
+  const reason = String((event as { reason?: string } | null)?.reason ?? "");
+  // Spec 006 (D-608): foreign session-start (repoint + другой session-file
+  // key) при живом интересе ВЛАДЕЛЬЦА. КРИТИЧНО строго до `currentCtx = ctx`:
+  // currentCtx остаётся ctx владельца, иначе shutdown-гвард
+  // (_ctx !== currentCtx) пропустит смерть дочерней сессии и убьёт
+  // таймеры/epoch владельца. Здесь НЕ делаем: currentCtx = ctx, НЕ
+  // armsSwitchKey(incomingKey), НЕ переснятие piApi/eventBus, НЕ сброс
+  // staleAttempts/таймеров по чужому поводу — доставка владельца нетронута.
+  const ownerBlocked =
+    ownerKey !== null &&
+    incomingKey !== ownerKey &&
+    remapKey(reason) === "repoint" &&
+    hasLiveOwnerInterest();
+  if (ownerBlocked) {
+    armsLog(
+      "session-start",
+      withAttr(
+        `reason=${reason} key=${sessionKeyBase(incomingKey)} armed=${armsIsArmed()} owner-shift(blocked): ${sessionKeyBase(ownerKey as string)}->${sessionKeyBase(incomingKey)}`,
+      ),
+    );
+    return;
+  }
+
   currentCtx = ctx;
   // Spec 006 (D-601): мгновенная картина сразу после любого session_start.
   probePiAlive();
@@ -1248,9 +1312,18 @@ async function onSessionStart(
   } catch (err) {
     console.warn("pi-billing-window: arms session init failed:", err);
   }
+  // Spec 006 (D-607): неблокированный session-start принимает владельца.
+  // ownerKey обновляется на первом старте (null), совпадающем ключе и
+  // carry-причине; owner-shift: <old>-><new> только когда ключ реально сменился.
+  const prevOwner = ownerKey;
+  ownerKey = incomingKey;
+  const ownerShift =
+    prevOwner !== null && prevOwner !== incomingKey
+      ? ` owner-shift: ${sessionKeyBase(prevOwner)}->${sessionKeyBase(incomingKey)}`
+      : "";
   armsLog(
     "session-start",
-    withAttr(`reason=${String((event as { reason?: string } | null)?.reason ?? "?")} key=${armsGetKey()?.split(/[\\/]/).pop() ?? "?"} armed=${armsIsArmed()}`),
+    withAttr(`reason=${String((event as { reason?: string } | null)?.reason ?? "?")} key=${armsGetKey()?.split(/[\\/]/).pop() ?? "?"} armed=${armsIsArmed()}${ownerShift}`),
   );
 }
 
@@ -1713,6 +1786,9 @@ function registerContAfterReset(pi: ExtensionAPI): void {
       currentCtx = ctx;
       try {
         const key = sessionKeyOf(ctx);
+        // Spec 006 (D-607 iv): /cont-after-reset сознательно привязывает
+        // владельца к активному conversation.
+        ownerKey = key;
         armsSwitchKey(key);
 
         const arg = String(args ?? "").trim().toLowerCase();

@@ -235,6 +235,21 @@ export function getArm(now: number = Date.now()): Arm | null {
 }
 
 /**
+ * A conversation's arm under a SPECIFIC key (unexpired) or null. Spec 006
+ * (D-608): the owner-shift guard needs to know whether the OWNER's flag is
+ * live without mutating `currentKey` (the record stays under the owner's
+ * key even while a foreign session-start is being evaluated).
+ */
+export function getArmForKey(key: string, now: number = Date.now()): Arm | null {
+  return entryForKey(key, now);
+}
+
+/** Is a SPECIFIC conversation key armed (record present and unexpired)? */
+export function isArmedForKey(key: string, now: number = Date.now()): boolean {
+  return getArmForKey(key, now) !== null;
+}
+
+/**
  * Arm "continue after reset" for the current conversation. Records the
  * current state.lastResetAt so only a reset happening AFTER this point fires.
  * `repeat` (optional) is the TOTAL number of fires the flag is good for; omit
