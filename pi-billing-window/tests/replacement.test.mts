@@ -12,6 +12,11 @@
  *  2. No fresh refs available in the event/ctx (today's real pi shapes) ->
  *     "replacement:waiting" in armslog, the OLD epoch's sendUserMessage is
  *     NOT called (epoch guard), the arm survives.
+ *  3. (spec 006, D-603 / FR-102) stale на границе -> replacement:adopted ->
+ *     первый же __retryTickForTests() даёт fire:send-ok на НОВОЙ эпохе
+ *     (форс-перерис доставки); после adopted нет send-error:stale со старой
+ *     эпохой. РЕД-тест: текущий код pending-веткой ждёт нового сброса окна
+ *     и не перерисовывает -- assert падает.
  */
 
 import {
@@ -24,6 +29,11 @@ import { join } from "node:path";
 
 import piBillingWindowFactory, {
   setArmsLogPath,
+  __syncWatchdogForTests,
+  __fireWatchdogForTests,
+  __retryTickForTests,
+  __resetStaleStateForTests,
+  setResetGraceMsForTests,
 } from "../src/index.ts";
 import {
   mutateState,
@@ -34,6 +44,8 @@ import {
   setPaths as armsSetPaths,
   resetPaths as armsResetPaths,
   isArmed as armsIsArmed,
+  getArm as armsGetArm,
+  RESET_GRACE_MS,
 } from "../src/arms.ts";
 import {
   setPaths as historySetPaths,
@@ -58,6 +70,17 @@ function assert(cond: boolean, name: string): void {
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
+
+/** Все строки armslog, содержащие искомое событие (армлог-событие во 2-й колонке). */
+function linesWith(log: string, event: string): string[] {
+  return log.split("\n").filter((l) => l.includes(event));
+}
+
+/** Токен ep=<N> (D-606 грамматика) из строки armslog. */
+function epOf(line: string): number | null {
+  const m = line.match(/\bep=(\d+)/);
+  return m ? Number(m[1]) : null;
+}
 
 // --- mock pi / ctx --------------------------------------------------------------
 
@@ -299,12 +322,114 @@ async function testReplacementWaitingWithoutFreshRefs(): Promise<void> {
   }
 }
 
+// --- 3. Форс-перерис после переусыновления (spec 006, D-603 / FR-102) --------
+
+/**
+ * Scenario 3 (design §5.4, D-603(b) / FR-102): форс-перерис доставки после
+ * переусыновления. Доставка дошла до pending НА СТАРОЙ сессии (fire:send-ok
+ * старой эпохи, флаг ждёт подтверждения), сессия заменена и ссылки пересняты
+ * (replacement:adopted на НОВОЙ эпохе). ПЕРВЫЙ же __retryTickForTests() после
+ * adopted обязан выдать fire:send-ok на новой эпохе (перерис на первом же
+ * тике, FR-102), а НЕ ждать нового сброса окна; stale-цепочки старой эпохи
+ * после adopted не должно быть.
+ *
+ * РЕД: текущий код в pending-ветке retryTick не перерисовывает без нового
+ * сброса (st.lastResetAt === pendingFiredResetAt -> return) -- assert падает.
+ */
+async function testReplacementForcesReFireAfterAdopted(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-repl-rerun-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(20);
+  try {
+    await seedFreshWindow();
+    const a = makeMockPi();
+    piBillingWindowFactory(a.pi as never);
+
+    const sessionFile = join(tmp, "sess-3.jsonl");
+    const ctxA = makeCtx(sessionFile);
+    await handlerOf(a.handlers, "session_start")({}, ctxA);
+    await commandOf(a.commands, "cont-after-reset")("", ctxA);
+    assert(armsIsArmed(), "perm3: флаг взведён");
+    await backdateReset();
+
+    // Граница: доставка на СТАРОЙ сессии (эпоха-старая) -> флаг в pending.
+    await __syncWatchdogForTests();
+    await __fireWatchdogForTests();
+    await sleep(150);
+    assert(
+      a.sends.length === 1 && armsGetArm()?.phase === "pending",
+      "perm3: старая сессия доставила «продолжи» — флаг в pending (in-flight доставка)",
+    );
+    const log0 = readFileSync(join(tmp, "armslog.log"), "utf8");
+    const oldLine = linesWith(log0, "fire:send-ok")[0] ?? "";
+    const oldEp = epOf(oldLine);
+    assert(
+      oldLine !== "" && oldEp !== null,
+      `perm3: fire:send-ok старой эпохи в armslog (ep=${oldEp})`,
+    );
+
+    // Переусыновление со свежими ссылками -> replacement:adopted (эпоха+1).
+    await handlerOf(a.handlers, "session_shutdown")({}, ctxA);
+    const fresh = makeMockPi();
+    const ctxB = makeCtx(sessionFile, {
+      api: fresh.pi,
+      events: (fresh.pi as { events: unknown }).events,
+    });
+    await handlerOf(a.handlers, "session_start")(
+      { reason: "replacement" },
+      ctxB,
+    );
+    const log1 = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      log1.includes("replacement:adopted"),
+      "perm3: armslog содержит replacement:adopted",
+    );
+    const adoptedEp = epOf(linesWith(log1, "replacement:adopted")[0] ?? "");
+    assert(
+      adoptedEp !== null && adoptedEp === (oldEp ?? -1) + 1,
+      `perm3: replacement:adopted на новой эпохе (ep=${adoptedEp}, ждал ${(oldEp ?? -1) + 1})`,
+    );
+
+    // РЕД: первый же retry-тик после adopted обязан форс-перерисовать.
+    await __retryTickForTests();
+    await sleep(150);
+    const log2 = readFileSync(join(tmp, "armslog.log"), "utf8");
+    const afterAdopted = log2.slice(log2.lastIndexOf("replacement:adopted"));
+    const newLine = linesWith(afterAdopted, "fire:send-ok")[0] ?? "";
+    const newEp = epOf(newLine);
+    assert(
+      newLine !== "",
+      "perm3: __retryTickForTests() после adopted даёт fire:send-ok (форс-перерис)",
+    );
+    assert(
+      newEp !== null && newEp === adoptedEp,
+      `perm3: send-ok на новой эпохе (ep=${newEp}, ждал ${adoptedEp})`,
+    );
+    const staleOld = afterAdopted
+      .split("\n")
+      .filter((l) => l.includes("send-error:stale") && l.includes(`ep=${oldEp}`));
+    assert(
+      staleOld.length === 0,
+      "perm3: после adopted нет send-error:stale со старой эпохой",
+    );
+
+    await handlerOf(a.handlers, "session_shutdown")({}, ctxB);
+  } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    cleanupPaths(tmp);
+  }
+}
+
 // --- runner ----------------------------------------------------------------------
 
 // Spec-002 test hook: reset the module-level stale-retry/dedup state between
-// scenarios. Tolerates the pre-T02 build where the hook does not exist yet
-// (optional chaining keeps the RED run an assertion failure, not a crash).
+// scenarios. Since T-02 the hook is a NAMED export -- the factory-property
+// probe below is kept only for the pre-T02 build where the hook did not
+// exist yet (optional chaining keeps the RED run an assertion failure, not
+// a crash). Without the reset the previous scenario's stale pacing leaks
+// into the next one (backoff silently paces the fire).
 function resetStaleStateForTests(): void {
+  __resetStaleStateForTests?.();
   const hooks = piBillingWindowFactory as unknown as {
     __resetStaleStateForTests?: () => void;
   };
@@ -320,6 +445,8 @@ async function main(): Promise<void> {
   await testReplacementAdoptsFreshRefs();
   resetStaleStateForTests();
   await testReplacementWaitingWithoutFreshRefs();
+  resetStaleStateForTests();
+  await testReplacementForcesReFireAfterAdopted();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

@@ -18,6 +18,11 @@
  * (it must still do a precise reset) -- it only stops pointing at
  * reset+grace. The tests therefore assert pendingFireAt() === the boundary,
  * not hasWatchdog() === false.
+ *
+ * Scenario 12 (spec 006 D-603c / FR-102, RED-test): переход probe stale→live
+ * при in-flight доставке обязан на ПЕРВОМ же sync/retry тике дать
+ * форс-"перерис" (fire:send-ok, не дожидаясь backoff). Текущий src не
+ * активирует перерис на переходе — кейс падает (RED).
  */
 
 import {
@@ -85,6 +90,17 @@ function assert(cond: boolean, name: string): void {
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 
+/** Все строки armslog, содержащие искомое событие. */
+function linesWith(log: string, event: string): string[] {
+  return log.split("\n").filter((l) => l.includes(event));
+}
+
+/** Токен ep=<N> (D-606 грамматика) из строки armslog. */
+function epOf(line: string): number | null {
+  const m = line.match(/\bep=(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
 // --- mock pi / ctx (lifecycle.test.mts pattern) --------------------------------
 
 type SessionHandler = (event: unknown, ctx: unknown) => unknown;
@@ -133,6 +149,78 @@ function makeMockPi(rejectSends = false): {
     },
   };
   return { pi, handlers, commands, sends };
+}
+
+/**
+ * Mock ExtensionAPI с управляемым probe мёртвой/живой ссылки (spec 006
+ * D-601): пока `ctl.stale` — getSessionName() бросает "ctx is stale"
+ * (probePiAlive() -> stale) И sendUserMessage() падает тем же (доставка не
+ * идёт). `setStale(false)` эмулирует появление свежих ссылок / новой
+ * фабрики (probe -> live). Форма та же, что у makeMockPi.
+ */
+function makeProbeMock(initialStale = true): {
+  pi: unknown;
+  handlers: Map<string, SessionHandler[]>;
+  commands: Map<string, CommandHandler>;
+  sends: Array<{ content: unknown; opts: unknown }>;
+  setStale: (v: boolean) => void;
+} {
+  const handlers = new Map<string, SessionHandler[]>();
+  const commands = new Map<string, CommandHandler>();
+  const sends: Array<{ content: unknown; opts: unknown }> = [];
+  const busSubs = new Map<string, Array<(d: unknown) => void>>();
+  const ctl = { stale: initialStale };
+
+  const pi = {
+    events: {
+      emit: (_ch: string, _data: unknown) => {},
+      on: (ch: string, h: (d: unknown) => void) => {
+        const arr = busSubs.get(ch) ?? [];
+        arr.push(h);
+        busSubs.set(ch, arr);
+        return () => {
+          const i = arr.indexOf(h);
+          if (i >= 0) arr.splice(i, 1);
+        };
+      },
+    },
+    on: (ev: string, h: SessionHandler) => {
+      const arr = handlers.get(ev) ?? [];
+      arr.push(h);
+      handlers.set(ev, arr);
+    },
+    registerCommand: (name: string, spec: { handler: CommandHandler }) => {
+      commands.set(name, spec.handler);
+    },
+    // Любой метод pi обёрнут assertActive и бросает на мёртвой ссылке —
+    // именно через него probePiAlive() читает staleness (D-601).
+    getSessionName: () => {
+      if (ctl.stale) {
+        throw new Error(
+          "This extension ctx is stale after session replacement or reload.",
+        );
+      }
+      return "probe-session";
+    },
+    sendUserMessage: async (content: unknown, opts?: unknown) => {
+      if (ctl.stale) {
+        throw new Error(
+          "This extension ctx is stale after session replacement or reload.",
+        );
+      }
+      sends.push({ content, opts });
+      return undefined;
+    },
+  };
+  return {
+    pi,
+    handlers,
+    commands,
+    sends,
+    setStale: (v: boolean) => {
+      ctl.stale = v;
+    },
+  };
 }
 
 function makeCtx(sessionFile: string): unknown {
@@ -952,6 +1040,89 @@ async function testNotIdleKeepsDeliveryUntilIdle(): Promise<void> {
   }
 }
 
+// --- 12. probe stale→live при in-flight доставке → форс-перерис (D-603c) -----
+
+/**
+ * Scenario 12 (spec 006, design §5.4 D-603(c) / FR-102): переход probe
+ * stale→live при in-flight доставке даёт форс-"перерис" на первом же
+ * sync/retry тике. Пока "ссылки мертвы" (probe stale) доставка на границе
+ * упирается в send-error:stale и экспоненциальный backoff — не идёт.
+ * Появляются свежие ссылки (probe → live) — ПЕРВЫЙ же тик обязан
+ * сбросить backoff и форс-выдать fire:send-ok (не ждать 5-минутного
+ * pacing), на свежей эпохе, без новых send-error:stale.
+ *
+ * РЕД: текущий код не активирует перерис на переходе stale→live — первый
+ * sync/retry тик тихо упирается в staleRetryNotBefore (backoff) — assert
+ * падает.
+ */
+async function testProbeStaleToLiveForcesReFire(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-wd-probe-live-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(20);
+  __resetStaleStateForTests();
+  try {
+    seedFreshWindow();
+    // Стартуем с мёртвой ссылки: probe stale, доставка блокируется.
+    const probe = makeProbeMock(true);
+    piBillingWindowFactory(probe.pi as never);
+
+    const sessionFile = join(tmp, "sess-12.jsonl");
+    const ctx = makeCtx(sessionFile);
+    await handlerOf(probe.handlers, "session_start")({}, ctx);
+    await commandOf(probe.commands, "cont-after-reset")("", ctx);
+    assert(armsIsArmed(), "probe→live: флаг взведён");
+
+    // Граница при мёртвых ссылках: доставка не идёт (send-error:stale).
+    await expireWindow();
+    await __syncWatchdogForTests();
+    await __fireWatchdogForTests();
+    await sleep(150);
+    const logA = readFileSync(join(tmp, "armslog.log"), "utf8");
+    const okBefore = linesWith(logA, "fire:send-ok").length;
+    const staleBefore = linesWith(logA, "send-error:stale").length;
+    const staleLine0 = linesWith(logA, "send-error:stale")[0] ?? "";
+    const staleEp = epOf(staleLine0);
+    assert(
+      okBefore === 0 && staleBefore === 1,
+      `probe→live: пока ссылки мертвы, доставка не идёт (send-error:stale ${staleBefore}, fire:send-ok ${okBefore})`,
+    );
+    assert(
+      staleEp !== null,
+      `probe→live: send-error:stale несёт ep= (${staleEp}) — база для "свежей эпохи"`,
+    );
+
+    // Свежие ссылки появились (probe → live) — ПЕРВЫЙ же sync/retry тик
+    // обязан форс-перерисовать, не дожидаясь backoff (FR-102).
+    probe.setStale(false);
+    await __syncWatchdogForTests();
+    await __retryTickForTests();
+    await sleep(250);
+    const logB = readFileSync(join(tmp, "armslog.log"), "utf8");
+    const okAfter = linesWith(logB, "fire:send-ok").length;
+    const newLine = linesWith(logB, "fire:send-ok")[0] ?? "";
+    const newEp = epOf(newLine);
+    const staleAfter = linesWith(logB, "send-error:stale").length;
+    assert(
+      okAfter > okBefore,
+      `probe→live: первый же sync/retry тик даёт fire:send-ok (форс-перерис, не ждёт backoff; ok ${okBefore}->${okAfter})`,
+    );
+    assert(
+      newEp !== null && newEp === staleEp,
+      `probe→live: ep на send-ok = свежая эпоха (ep=${newEp}, ждал ${staleEp})`,
+    );
+    assert(
+      staleAfter === staleBefore,
+      `probe→live: новых send-error:stale после перехода нет (${staleBefore}->${staleAfter})`,
+    );
+
+    await handlerOf(probe.handlers, "session_shutdown")({}, ctx);
+  } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    __resetStaleStateForTests();
+    cleanupPaths(tmp);
+  }
+}
+
 // --- runner ---------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -969,6 +1140,7 @@ async function main(): Promise<void> {
   await testFireDedupPerReset();
   await testSyncTickInsideGraceKeepsDelivery();
   await testNotIdleKeepsDeliveryUntilIdle();
+  await testProbeStaleToLiveForcesReFire();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

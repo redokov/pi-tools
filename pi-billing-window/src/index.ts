@@ -196,6 +196,22 @@ let piApiEpoch = 0;
 let probeState: "live" | "stale" | "unknown" = "unknown";
 
 /**
+ * Spec 006 (D-603c / FR-102): the previous sync tick observed a dead
+ * reference (probe "stale"). Read at the top of each syncWatchdog() to
+ * detect the stale→live edge on the current tick. Never persisted.
+ */
+let probeWasStale = false;
+
+/**
+ * Spec 006 (D-603c / FR-102): the previous sync tick observed an epoch
+ * mismatch (piApiEpoch !== sessionEpoch). Used to detect the FIRST
+ * successful epoch-guard after a stale chain ("впервые получен успешный
+ * epoch-guard"), distinct from a plain staleAttempts>0 accident where the
+ * guard never failed (that must not force). Never persisted.
+ */
+let epochGuardWasFailing = false;
+
+/**
  * Spec 006 (D-601): cheap dead-reference probe. Any runtime method on the
  * ExtensionAPI is wrapped in `assertActive()` (fact e), so calling
  * `getSessionName?.()` is an O(1) read of staleness that throws "ctx is
@@ -347,6 +363,8 @@ export function __resetStaleStateForTests(): void {
   staleRetryNotBefore = 0;
   lastFiredResetAt = null;
   pendingFiredResetAt = null;
+  probeWasStale = false;
+  epochGuardWasFailing = false;
   ownerKey = null;
   // Spec 006 (D-604): маркеры firelease в тестах — изолированный каталог в
   // системном tmp (пересоздаётся на каждый сброс), чтобы планирования fire из
@@ -714,6 +732,34 @@ function syncWatchdog(): void {
   probePiAlive(); // D-601: регулярная картина на каждом sync-тике
   const arm = armsGetArm();
   const st = readStateSync();
+
+  // Spec 006 (D-603c / FR-102): форс-перерис доставки на ПЕРВОМ же sync-тике,
+  // где доставка оживает — probe перешёл stale→live ИЛИ впервые после
+  // stale-цепочки (staleAttempts > 0) успешен epoch-guard (piApiEpoch ===
+  // sessionEpoch). Только при armed/in-flight доставке (lastFiredResetAt ===
+  // st.lastResetAt): сброс backoff и немедленный fireContinue, не ждать
+  // 5-минутного pacing. probeState === "live" обязателен — иначе форс при
+  // мёртвой ссылке породил бы новые send-error:stale (churn каунтера).
+  const wasProbeStale = probeWasStale;
+  probeWasStale = probeState === "stale";
+  const wasEpochMismatch = epochGuardWasFailing;
+  epochGuardWasFailing = piApiEpoch !== sessionEpoch;
+  const staleRecovered =
+    probeState === "live" &&
+    (wasProbeStale ||
+      (staleAttempts > 0 && wasEpochMismatch && piApiEpoch === sessionEpoch));
+  if (
+    arm !== null &&
+    st !== null &&
+    staleRecovered &&
+    lastFiredResetAt === st.lastResetAt
+  ) {
+    staleAttempts = 0;
+    staleRetryNotBefore = 0;
+    ensureRetryInterval();
+    void runGuarded(fireContinue);
+  }
+
   const key = armsGetKey();
 
   if (arm === null) {
@@ -1319,6 +1365,16 @@ async function onSessionStart(
         "replacement:adopted",
         withAttr("session_start переснял ссылки на pi/events — отправка «продолжи» снова возможна"),
       );
+      // Spec 006 (D-603 / FR-102): if a delivery is in flight for the
+      // current reset (planned & not yet confirmed), force the redraw on
+      // the FIRST moment we own fresh refs instead of waiting for the next
+      // tick. Safe when in flight: runGuarded's watchdogEvalInFlight guard
+      // serializes with any other delivery, and fireContinue re-checks idle
+      // + lease (send-gating) internally -- nothing duplicated here.
+      const adoptSt = readStateSync();
+      if (adoptSt !== null && lastFiredResetAt === adoptSt.lastResetAt) {
+        void runGuarded(fireContinue);
+      }
     } else {
       armsLog(
         "replacement:waiting",
