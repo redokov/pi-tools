@@ -39,6 +39,7 @@ import piBillingWindowFactory, {
   setResetGraceMsForTests,
   __syncWatchdogForTests,
   __retryTickForTests,
+  setVerifyDeliveredForTests,
 } from "../src/index.ts";
 import {
   writeStateSync,
@@ -473,6 +474,10 @@ function resetStaleStateForTests(): void {
 }
 
 async function main(): Promise<void> {
+  // Spec 007: unit-test mocks do not write session-file entries -- stub
+  // the D1 delivery verification to always-true (the new delivery-gating
+  // tests drive the real verification with a faithful mock).
+  setVerifyDeliveredForTests(() => true);
   console.log(
     "\n=== Session isolation (spec 006, T-06: owner-shift FR-401/D-607 + guard D-608) ===",
   );

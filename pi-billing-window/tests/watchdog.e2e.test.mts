@@ -42,6 +42,7 @@ import piBillingWindowFactory, {
   __fireWatchdogForTests,
   __retryTickForTests,
   __resetStaleStateForTests,
+  setVerifyDeliveredForTests,
 } from "../src/index.ts";
 import {
   writeStateSync,
@@ -223,6 +224,16 @@ function makeProbeMock(initialStale = true): {
   };
 }
 
+/**
+ * Spec 007 (D2): default token-bearing assistant entries for the response
+ * handler -- a successful wormsoft call with token burn confirms the
+ * pending cont-after-reset arm. (0-token negative cases are covered in
+ * tests/delivery-gating.test.mts.)
+ */
+const TOKEN_ENTRIES = [
+  { type: "message", message: { role: "assistant", usage: { input: 1200, output: 300 } } },
+];
+
 function makeCtx(sessionFile: string): unknown {
   return {
     mode: "tui",
@@ -235,7 +246,7 @@ function makeCtx(sessionFile: string): unknown {
     sessionManager: {
       getSessionFile: () => sessionFile,
       getCwd: () => "C:/tmp/fake-project",
-      getEntries: () => [],
+      getEntries: () => TOKEN_ENTRIES,
     },
   };
 }
@@ -1126,6 +1137,10 @@ async function testProbeStaleToLiveForcesReFire(): Promise<void> {
 // --- runner ---------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  // Spec 007: unit-test mocks do not write session-file entries -- stub
+  // the D1 delivery verification to always-true (the new delivery-gating
+  // tests drive the real verification with a faithful mock).
+  setVerifyDeliveredForTests(() => true);
   console.log(
     "\n=== Watchdog e2e tests (watchdog-driven cont-after-reset) ===",
   );

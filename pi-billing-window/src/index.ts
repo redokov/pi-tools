@@ -81,6 +81,8 @@ import {
 } from "./watchdog.js";
 
 export { setArmsLogPath };
+// Spec 007: direct unit-test exports for the new delivery/gating helpers.
+export { verifyDelivered, isTokenBearing, ownerQuiet };
 
 const PROVIDER = "wormsoft";
 const WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -343,6 +345,55 @@ let lastFiredResetAt: number | null = null;
  */
 let pendingFiredResetAt: number | null = null;
 
+/**
+ * Spec 007 (D1): bounded misroute attempts. A send that resolved but never
+ * appeared in the owner session jsonl is re-driven by the existing retry
+ * loop; after MISROUTE_MAX_ATTEMPTS the mechanism capitulates (disarm +
+ * notify) instead of looping silently forever.
+ */
+let misrouteAttempts = 0;
+const MISROUTE_MAX_ATTEMPTS = 6;
+
+/**
+ * Spec 007 (test hook): verification override for unit tests. Unit-test
+ * mocks do not write session-file entries, so the real verification would
+ * mark every mock send as misroute; tests that keep the old asserts stub
+ * this to always-true. Null (default) = real verification. The new
+ * delivery-gating tests drive the REAL verification with a faithful mock.
+ */
+let verifyDeliveredOverride:
+  | ((
+      ownerKey: string | null,
+      sendTimeMs: number,
+      text: string,
+    ) => boolean)
+  | null = null;
+export function setVerifyDeliveredForTests(
+  fn: ((
+    ownerKey: string | null,
+    sendTimeMs: number,
+    text: string,
+  ) => boolean) | null,
+): void {
+  verifyDeliveredOverride = fn;
+}
+
+/**
+ * Spec 007 (D1): tolerance between the wall clock (Date.now() at send) and
+ * the jsonl entry timestamp when matching the delivered user entry.
+ */
+const DELIVERED_TOLERANCE_MS = 1500;
+
+/**
+ * Spec 007 (live observations 19:38:32Z / 21:38:35Z): pi appends the jsonl
+ * entry a few ms -- or more -- after sendUserMessage resolves (the entry's
+ * timestamp is set at message creation, the file flush lags behind). Up to
+ * DELIVERED_REVERIFY_ROUNDS re-reads with increasing delays catch a
+ * slow-but-real delivery before a false misroute is declared.
+ */
+const DELIVERED_REVERIFY_MS = 2500;
+const DELIVERED_REVERIFY_ROUNDS = 3;
+
 /** Exponential backoff: RETRY_AFTER_FIRE_MS * 2^(attempt-1), capped. */
 function staleBackoffMs(attempt: number): number {
   return Math.min(
@@ -353,6 +404,104 @@ function staleBackoffMs(attempt: number): number {
 
 /** Каталог маркеров firelease для тестов (пер-процесс, под системный tmp). */
 let testFiresDir: string | null = null;
+
+/**
+ * Spec 007 (D1): did the sent text actually reach the OWNER conversation?
+ * Reads the owner session jsonl and looks for a user entry whose text
+ * contains the sent text and whose timestamp is >= sendTimeMs - tolerance.
+ * Returns false when the owner key is unknown/ephemeral or the file is
+ * unreadable -- the caller keeps the bounded retry path; this helper adds
+ * no counters of its own.
+ */
+function verifyDelivered(
+  ownerKey: string | null,
+  sendTimeMs: number,
+  text: string,
+): boolean {
+  if (!ownerKey || ownerKey.startsWith("ephemeral:")) return false;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(ownerKey, "utf8");
+  } catch {
+    return false;
+  }
+  const notBefore = sendTimeMs - DELIVERED_TOLERANCE_MS;
+  type EntryLike = {
+    type?: string;
+    timestamp?: string;
+    message?: {
+      role?: string;
+      content?: unknown;
+    };
+  };
+  for (const line of raw.split("\n")) {
+    if (!line.includes(text)) continue;
+    let entry: EntryLike | null = null;
+    try {
+      entry = JSON.parse(line) as EntryLike;
+    } catch {
+      continue;
+    }
+    const e: EntryLike | null = entry;
+    if (!e || e.type !== "message") continue;
+    if (e.message?.role !== "user") continue;
+    const c = e.message?.content;
+    const hasText =
+      (typeof c === "string" && c.includes(text)) ||
+      (Array.isArray(c) &&
+        c.some(
+          (p) =>
+            typeof p === "object" &&
+            p !== null &&
+            (p as { type?: string; text?: string }).type === "text" &&
+            typeof (p as { text?: string }).text === "string" &&
+            (p as { text?: string }).text!.includes(text),
+        ));
+    if (!hasText) continue;
+    const ts = e.timestamp ? Date.parse(e.timestamp) : NaN;
+    if (Number.isFinite(ts) && ts >= notBefore) return true;
+  }
+  return false;
+}
+
+/**
+ * Spec 007 (D4): file-based quiet check on the OWNER conversation. True
+ * when the owner session jsonl has not been touched for >= quietMs (the
+ * window grace -- a recently touched file means another conversation may
+ * be mid-turn, even when ctx.isIdle() lies through the shared refs).
+ * Unknown/ephemeral owner or unreadable file -> true (do not block the
+ * send path on missing evidence; D1/D3 remain the primary guards).
+ */
+function ownerQuiet(ownerKey: string | null, quietMs: number): boolean {
+  if (!ownerKey || ownerKey.startsWith("ephemeral:")) return true;
+  try {
+    const mtime = fs.statSync(ownerKey).mtimeMs;
+    return Date.now() - mtime >= quietMs;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Spec 007 (D2): token-bearing usage check. A successful wormsoft response
+ * with no reported token burn (0-token background call: title generation,
+ * provider retry probe) must not confirm the pending cont-after-reset arm.
+ * Any positive input/output/cache value counts as a real call.
+ */
+function isTokenBearing(u: {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+} | null): boolean {
+  if (!u) return false;
+  return (
+    (typeof u.input === "number" && u.input > 0) ||
+    (typeof u.output === "number" && u.output > 0) ||
+    (typeof u.cacheRead === "number" && u.cacheRead > 0) ||
+    (typeof u.cacheWrite === "number" && u.cacheWrite > 0)
+  );
+}
 
 /**
  * Test hook: reset the stale-retry counter / pacing / fire dedup marker so
@@ -366,6 +515,8 @@ export function __resetStaleStateForTests(): void {
   probeWasStale = false;
   epochGuardWasFailing = false;
   ownerKey = null;
+  // Spec 007 (D1): the misroute streak resets with the stale state.
+  misrouteAttempts = 0;
   // Spec 006 (D-604): маркеры firelease в тестах — изолированный каталог в
   // системном tmp (пересоздаётся на каждый сброс), чтобы планирования fire из
   // разных сценариев не пересекались и не писали в ~/.pi/agent/...-fires.
@@ -381,6 +532,15 @@ export function __resetStaleStateForTests(): void {
 /** Test hook: read the current stale-retry pacing moment. */
 export function __staleRetryNotBeforeForTests(): number {
   return staleRetryNotBefore;
+}
+
+/**
+ * Spec 007 (test hook): set the misroute/stale pacing marker directly. The
+ * misroute retry pace is RETRY_AFTER_FIRE_MS (5 min) -- unit tests compress
+ * it to 0 so retryTick re-drives immediately.
+ */
+export function setStaleRetryNotBeforeForTests(ms: number): void {
+  staleRetryNotBefore = ms;
 }
 
 /**
@@ -845,8 +1005,12 @@ function syncWatchdog(): void {
     if (!planFireForReset(st)) return;
     fireAt = Math.min(fireAt, st.lastResetAt + resetGraceMs);
     lastFiredResetAt = st.lastResetAt;
-    // A fresh reset gives the delivery a clean slate (D-204 reset rules).
+    // A fresh reset gives the delivery a clean slate (D-204 reset rules;
+    // Spec 007 review follow-up: the misroute streak resets too, so partial
+    // misroute streaks from earlier resets do not eat the budget of later
+    // ones -> no premature capitulation).
     staleAttempts = 0;
+    misrouteAttempts = 0;
   }
   armWatchdog(fireAt, onWatchdogFire);
 }
@@ -950,20 +1114,29 @@ async function onWatchdogFire(): Promise<void> {
  * capitulation is logged ("capitulation:after-N") and a notification goes
  * out through the existing notifier.ts channel (D-205, no new secrets).
  */
-async function capitulate(): Promise<void> {
+/**
+ * What exhausted the delivery attempts: a stale pi / epoch-mismatch chain
+ * ("stale") or a persistent misroute ("misroute"). Drives the log/notify
+ * label so the telemetry names the real cause.
+ */
+type CapitulationCause = "stale" | "misroute";
+
+async function capitulate(cause: CapitulationCause = "stale"): Promise<void> {
   const key = armsGetKey();
   await armsDisarm();
   // Spec 006 (D-604): капитуляция — release-точка аренды сброса.
   releaseFireForReset(readStateSync()?.lastResetAt ?? 0);
+  const causeLabel =
+    cause === "misroute" ? `${MISROUTE_MAX_ATTEMPTS} misroute-попыток` : `${STALE_MAX_ATTEMPTS} stale-попыток`;
   armsLog(
     `capitulation:after-${STALE_MAX_ATTEMPTS}`,
-    withAttr(`«продолжи» не доставлен после ${STALE_MAX_ATTEMPTS} stale-попыток, ключ ${key?.split(/[\\/]/).pop() ?? "?"} — флаг снят, уведомление отправлено`),
+    withAttr(`«продолжи» не доставлен после ${causeLabel}, ключ ${key?.split(/[\\/]/).pop() ?? "?"} — флаг снят, уведомление отправлено`),
   );
   void sendNotify({
     type: "billing:cont-after-reset-capitulation",
     provider: PROVIDER,
     title: "cont-after-reset: капитуляция",
-    body: `«продолжи» не удалось доставить после сброса окна (${STALE_MAX_ATTEMPTS} неудачных stale-попыток). Флаг снят, чтобы не молчать. Подробности: ~/.pi/agent/pi-billing-window-arms.log`,
+    body: `«продолжи» не удалось доставить после сброса окна (${causeLabel}). Флаг снят, чтобы не молчать. Подробности: ~/.pi/agent/pi-billing-window-arms.log`,
     timestamp: Date.now(),
   });
   staleAttempts = 0;
@@ -1035,6 +1208,20 @@ async function fireContinue(): Promise<void> {
     return;
   }
 
+  // Spec 007 (D4): file-based quiet check on the OWNER conversation. A
+  // recently touched owner jsonl means another conversation may be mid-turn
+  // even when ctx.isIdle() lies through the shared refs. Unknown/unreadable
+  // file does not block (ownerQuiet returns true).
+  if (!ownerQuiet(ownerKey, resetGraceMs)) {
+    armsLog(
+      "block:owner-busy",
+      withAttr(
+        "jsonl владельца менялся недавно — вероятно, чужой/родительский разговор в ходу, не шлю",
+      ),
+    );
+    return;
+  }
+
   const p = piApi;
   if (!p) {
     armsLog("block:no-pi", "piApi ещё не захвачен фабрикой — флаг сохранён");
@@ -1065,7 +1252,66 @@ async function fireContinue(): Promise<void> {
   }
 
   try {
+    const sendTime = Date.now();
     await p.sendUserMessage("продолжи");
+    // Spec 007 (D1): sendUserMessage resolved, but pi routes it through the
+    // SHARED runtime slot, which a live subagent session re-points at itself
+    // (bindCore plain slot assignment; assertActive does not detect it).
+    // Verify the owner jsonl actually received the entry; otherwise the
+    // message went to a foreign session -- do NOT switch to pending, keep
+    // the armed (delivery-in-flight) state so the retry loop re-drives, and
+    // pace it. After MISROUTE_MAX_ATTEMPTS, capitulate instead of looping.
+    let delivered = (verifyDeliveredOverride ?? verifyDelivered)(
+      ownerKey,
+      sendTime,
+      "продолжи",
+    );
+    // Spec 007 (live observation 19:38:32Z, session 17-27-11-381Z): pi
+    // appends the user entry to the session jsonl a few ms AFTER
+    // sendUserMessage resolves (the incident: entry at +17 ms) -- a fast
+    // file read misses a slow-but-real delivery and reports a false
+    // misroute. Re-verify once with a short bounded grace before declaring
+    // a misroute; only then count an attempt and pace the retry.
+    if (!delivered) {
+      // Pace IMMEDIATELY: during the re-verify grace this fireContinue is
+      // still awaiting, and the retry loop could re-drive a SECOND send in
+      // parallel (the pace is normally set after the misroute is declared).
+      staleRetryNotBefore = Date.now() + staleBackoffMs(misrouteAttempts + 1);
+      for (let round = 1; round <= DELIVERED_REVERIFY_ROUNDS && !delivered; round++) {
+        await new Promise((r) =>
+          setTimeout(r, DELIVERED_REVERIFY_MS * round),
+        );
+        delivered = (verifyDeliveredOverride ?? verifyDelivered)(
+          ownerKey,
+          sendTime,
+          "продолжи",
+        );
+        if (delivered) {
+          staleRetryNotBefore = 0; // delivered -> clean slate (D-204)
+          armsLog(
+            "fire:send-reverify",
+            withAttr(
+              `запись владельца появилась в jsonl после довписи (реверификация ${round}) — реверификация сняла ложный misroute`,
+            ),
+          );
+        }
+      }
+    }
+    if (!delivered) {
+      misrouteAttempts++;
+      armsLog(
+        "fire:send-misroute",
+        withAttr(
+          `sendUserMessage решилcя, но в jsonl владельца (${ownerKey ? ownerKey.split(/[\\/]/).pop() : "?"}) записи «продолжи» нет — сообщение ушло в чужую сессию, попытка ${misrouteAttempts}/${MISROUTE_MAX_ATTEMPTS}`,
+        ),
+      );
+      if (misrouteAttempts >= MISROUTE_MAX_ATTEMPTS) {
+        await capitulate("misroute");
+      } else {
+        staleRetryNotBefore = Date.now() + staleBackoffMs(misrouteAttempts);
+      }
+      return;
+    }
     // Sent: switch the flag to "pending" instead of consuming it. The first
     // successful provider response (confirmSuccess) clears it; a 429 means
     // the provider has not recovered yet and the retry loop re-sends every
@@ -1075,11 +1321,14 @@ async function fireContinue(): Promise<void> {
     // Spec 002 (D-204): a successful delivery resets the stale counter so
     // the next stale streak starts from scratch (no false capitulation).
     staleAttempts = 0;
+    // Spec 007 (D1): a delivered send starts the misroute streak from
+    // scratch (no false capitulation from a stale foreign session).
+    misrouteAttempts = 0;
     // Spec 005: record the reset this send was made for so the pending
     // branch of retryTick re-sends only on a NEW reset, not on a 5-min
     // timeout (FR1).
     pendingFiredResetAt = readStateSync()?.lastResetAt ?? null;
-    armsLog("fire:send-ok", withAttr("«продолжи» отправлен, флаг в pending до первого успешного ответа"));
+    armsLog("fire:send-ok", withAttr("«продолжи» отправлен и подтверждён в jsonl владельца, флаг в pending до первого успешного ответа"));
   } catch (err) {
     if (/stale/i.test(String((err as Error)?.message ?? err))) {
       // pi went stale mid-send. Spec 002 (D-204): bounded retry with
@@ -1505,7 +1754,14 @@ async function onAfterProviderResponse(
   if (providerName !== PROVIDER) return;
 
   // Keep currentCtx fresh so window_reset notifications find a live ctx.
-  currentCtx = ctx;
+  // Spec 007: do NOT re-point to a foreign session (subagent) -- its
+  // wormsoft responses (INCLUDING 429) must not steal the owner ctx; a
+  // repoint here made window_reset notifies and sends land in the foreign
+  // session (the 2026-09-28 incident). Same-key or no owner yet -> repoint.
+  const respKey = sessionKeyOf(ctx);
+  if (ownerKey === null || (respKey === ownerKey && !respKey.startsWith("ephemeral:"))) {
+    currentCtx = ctx;
+  }
 
   // Limit exhausted: remember when it happened (drives the pending
   // cont-after-reset retry pacing) and log a history row. A 429 does NOT
@@ -1563,10 +1819,26 @@ async function onAfterProviderResponse(
   // pending cont-after-reset arm. A one-shot arm is removed; a repeat>1 arm is
   // re-armed for the NEXT reset. Passing the current state.lastResetAt lets
   // the re-armed record wait for a reset that happens after confirmation.
+  //
+  // Spec 007 (D2): confirm ONLY for a real (token-bearing) response IN the
+  // owner conversation, after the send this arm waits for. A foreign
+  // subagent's flash responses and 0-token background calls (title
+  // generation, retry probes) must NOT confirm the arm -- in the 2026-09-28
+  // incident a 0/0-token glm-5.3-flash call in the foreign session consumed
+  // the arm while the owner chat had received nothing.
+  const respKey2 = sessionKeyOf(ctx);
+  const confirmEligible =
+    ownerKey !== null &&
+    respKey2 === ownerKey &&
+    !respKey2.startsWith("ephemeral:") &&
+    pendingFiredResetAt !== null &&
+    isTokenBearing(lastAssistantUsage(ctx));
   const armState = readStateSync();
-  const confirmed = await armsConfirmSuccess(Date.now(), {
-    lastResetAt: armState?.lastResetAt,
-  });
+  const confirmed = confirmEligible
+    ? await armsConfirmSuccess(Date.now(), {
+        lastResetAt: armState?.lastResetAt,
+      })
+    : false;
   if (confirmed) {
     // Spec 006 (D-604): fire:confirmed — release-точка аренды. Освобождаем
     // и сброс подтверждения, и сброс последней отправки (могут разойтись при
