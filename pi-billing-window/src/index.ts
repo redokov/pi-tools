@@ -1573,6 +1573,37 @@ function sessionBusOf(event: unknown, ctx: unknown): {
 }
 
 /**
+ * Spec 008 (T1): universal re-adoption of fresh pi/events references from
+ * the CURRENT context of a user command (/cont-after-reset). A command
+ * handler receives a fresh ExtensionCommandContext per invocation (the
+ * runner rebuilds it per call), so the ctx passed to the command is always
+ * bound to the live session -- unlike the module-level `piApi`, which was
+ * captured by main() / a session-start shift for a possibly replaced
+ * session. Adopting the refs here lets the fire path (`p = piApi`) deliver
+ * again after a session change WITHOUT a reload.
+ *
+ * Best-effort: today's real command ctx does not carry api/events fields,
+ * so in production this returns false and the bounded waiting path applies;
+ * the probe is kept so a future pi exposing the refs lights up automatically
+ * (same shapes as sessionBusOf). A no-op when the refs are already current
+ * (piApiEpoch === sessionEpoch) -- repeated /cont-after-reset calls in a
+ * healthy session must not spam replacement:adopted.
+ * Returns true when fresh refs were adopted.
+ */
+function adoptFreshRefs(ctx: unknown, source: string): boolean {
+  if (piApiEpoch === sessionEpoch) return false;
+  const fresh = sessionBusOf(null, ctx);
+  if (fresh === null) return false;
+  eventBus = fresh.bus;
+  piApi = fresh.api;
+  piApiEpoch = sessionEpoch;
+  staleAttempts = 0;
+  staleRetryNotBefore = 0;
+  armsLog("replacement:adopted", withAttr(source));
+  return true;
+}
+
+/**
  * pi.on("session_start"): capture ctx, initialize state if missing, run a
  * one-shot checkAndReset() if the saved state is already expired, and
  * start the periodic ticker. Idempotent across reloads thanks to the
@@ -1599,12 +1630,21 @@ async function onSessionStart(
   // already replaced, so the shutdown-guard protection is moot. Block ONLY
   // while the owner's captured ctx is alive; a dead ctx lets the shift
   // through so the delivery follows the user's actual conversation.
+  // Spec 008 (C2): probe «live» can ALSO be fictional when the captured
+  // refs belong to a REPLACED session (main() re-captured piApi for the new
+  // session, but ownerKey still points at the old conversation) -- the
+  // probe passes because the reference was re-captured for a session that is
+  // alive, just not the owner's. Require piApiEpoch === sessionEpoch: when
+  // the refs belong to another epoch, the shift must go through and
+  // ownerKey must move to the actual conversation (key/arms.json travel
+  // together); otherwise they diverge forever.
   const ownerBlocked =
     ownerKey !== null &&
     incomingKey !== ownerKey &&
     remapKey(reason) === "repoint" &&
     hasLiveOwnerInterest() &&
-    probePiAlive() === "live";
+    probePiAlive() === "live" &&
+    piApiEpoch === sessionEpoch;
   if (ownerBlocked) {
     armsLog(
       "session-start",
@@ -1624,6 +1664,12 @@ async function onSessionStart(
   // every send would fail with "extension ctx is stale". Try to re-capture
   // the fresh refs from the session_start event/context; if that fails, we
   // are on the bounded waiting path (replacement:waiting -> capitulation).
+  // Spec 008 (T1): session-start keeps its own inline re-capture because the
+  // session_start EVENT may also carry the refs (sessionBusOf checks both
+  // holders); the /cont-after-reset command path uses adoptFreshRefs(ctx)
+  // instead -- a command handler receives no event. The in-flight redraw
+  // below stays session-start specific (a delivery may already be in flight
+  // for the current reset).
   if (piApiEpoch !== sessionEpoch) {
     const fresh = sessionBusOf(event, ctx);
     if (fresh !== null) {
@@ -2257,6 +2303,16 @@ function registerContAfterReset(pi: ExtensionAPI): void {
         // владельца к активному conversation.
         ownerKey = key;
         armsSwitchKey(key);
+
+        // Spec 008 (T1): the command receives a FRESH ctx on every invocation
+        // -- this is the universal recovery after a session change without a
+        // reload. When the module-level piApi/eventBus still belong to a
+        // replaced session, adopt the fresh refs so the fire path (`p =
+        // piApi`) can deliver again; a no-op while the refs are current.
+        adoptFreshRefs(
+          ctx,
+          "/cont-after-reset переснял ссылки на pi/events из свежего ctx — отправка «продолжи» снова возможна",
+        );
 
         const arg = String(args ?? "").trim().toLowerCase();
         const wantOff =

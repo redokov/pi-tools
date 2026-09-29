@@ -421,6 +421,79 @@ async function testReplacementForcesReFireAfterAdopted(): Promise<void> {
   }
 }
 
+// --- 4. (spec 008, T1) /cont-after-reset перевзводит ссылки из свежего ctx ---
+
+/**
+ * Scenario 4 (spec 008, T1): the module-level piApi still belongs to a
+ * replaced session (piApiEpoch !== sessionEpoch), the owner conversation
+ * carries an armed flag, and the user runs /cont-after-reset. The command
+ * receives a FRESH ctx per invocation; the handler must adopt the fresh
+ * pi/events refs from it (armslog "replacement:adopted") so the fire path
+ * (`p = piApi`) can deliver again WITHOUT a reload.
+ */
+async function testContAfterResetAdoptsFreshRefs(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-repl-car-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(50);
+  try {
+    await seedFreshWindow();
+    const a = makeMockPi();
+    piBillingWindowFactory(a.pi as never);
+
+    const sessionFile = join(tmp, "sess-car.jsonl");
+    const ctxA = makeCtx(sessionFile);
+    await handlerOf(a.handlers, "session_start")({}, ctxA);
+    await commandOf(a.commands, "cont-after-reset")("", ctxA);
+    assert(armsIsArmed(), "car: флаг взведён до замены");
+    await backdateReset();
+
+    // Old session shuts down (epoch bumped, timers stopped); a new one
+    // starts WITHOUT the factory re-running. The module-level piApi still
+    // belongs to the replaced session (epoch mismatch).
+    await handlerOf(a.handlers, "session_shutdown")({}, ctxA);
+
+    // /cont-after-reset with a FRESH command ctx: the handler must adopt
+    // the fresh refs -- the universal recovery without a reload.
+    const fresh = makeMockPi();
+    const ctxB = makeCtx(sessionFile, {
+      api: fresh.pi,
+      events: (fresh.pi as { events: unknown }).events,
+    });
+    await commandOf(a.commands, "cont-after-reset")("", ctxB);
+    assert(armsIsArmed(), "car: флаг жив после переусыновления");
+
+    // The fire pipeline must now deliver via the adopted refs
+    // (sync resync -> watchdog -> grace -> send).
+    __syncWatchdogForTests();
+    await sleep(400);
+
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      log.includes("replacement:adopted"),
+      "car: armslog содержит replacement:adopted (T1)",
+    );
+    assert(
+      fresh.sends.length === 1 && fresh.sends[0]?.content === "продолжи",
+      "car: «продолжи» доставлен через переснятые ссылки (T1)",
+    );
+    assert(
+      a.sends.length === 0,
+      "car: старая (stale) api не используется (T1)",
+    );
+    assert(
+      !log.includes("send-error:stale"),
+      "car: на успешном пути нет send-error:stale (T1)",
+    );
+    await handlerOf(a.handlers, "session_shutdown")(
+      { reason: "replacement" },
+      ctxB,
+    );
+  } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 // --- runner ----------------------------------------------------------------------
 
 // Spec-002 test hook: reset the module-level stale-retry/dedup state between
@@ -452,6 +525,8 @@ async function main(): Promise<void> {
   await testReplacementWaitingWithoutFreshRefs();
   resetStaleStateForTests();
   await testReplacementForcesReFireAfterAdopted();
+  resetStaleStateForTests();
+  await testContAfterResetAdoptsFreshRefs();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

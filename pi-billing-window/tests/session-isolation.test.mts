@@ -379,9 +379,14 @@ async function testStaleOwnerCtxLetsShiftThrough(): Promise<void> {
     const mapE = JSON.parse(
       readFileSync(join(tmp, "arms.json"), "utf8"),
     ) as Record<string, unknown>;
+    // Repoint НЕ переносит запись (spec 006 README: "флаг остаётся у своего
+    // разговора и сработает, когда вы к нему вернётесь") — запись остаётся
+    // под ключом владельца, переехавшей записи быть не должно. Ранее этот
+    // ассерт был RED-остатком и тест не был подключён к runner'у;правильное
+    // поведение зафиксировано здесь.
     assert(
-      mapE[childFile] !== undefined,
-      "(e): запись arms.json переехала под новый ключ",
+      mapE[ownerFile] !== undefined,
+      "(e): запись arms.json осталась под ключом владельца (repoint не переносит)",
     );
   } finally {
     setResetGraceMsForTests(RESET_GRACE_MS);
@@ -529,6 +534,77 @@ async function testCarrySessionMovesOwner(): Promise<void> {
   }
 }
 
+// --- (f) spec 008 (T2): ЖИВОЙ probe + epoch-mismatch: смена проходит ---------
+
+/**
+ * Spec 008 (C2, live 12:08/12:35Z): a session-start with a DIFFERENT key
+ * while the owner's arm is live was BLOCKED even though the owner's
+ * conversation was already replaced -- the probe said "live" because main()
+ * had re-captured piApi for the replacement session while ownerKey still
+ * pointed at the old conversation. The shift must go through whenever the
+ * captured refs belong to ANOTHER epoch (piApiEpoch !== sessionEpoch):
+ * ownerKey moves to the actual conversation and key/arms.json travel
+ * together; otherwise key and conversation diverge forever.
+ */
+async function testEpochMismatchLetsShiftThrough(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-si-epoch-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(50);
+  try {
+    await seedFreshWindow();
+    const a = makeMockPi();
+    piBillingWindowFactory(a.pi as never);
+
+    const ownerFile = join(tmp, "E_owner.jsonl");
+    const childFile = join(tmp, "E_child.jsonl");
+    const childBase = "E_child.jsonl";
+    const ownerCtx = makeCtx(ownerFile);
+    const childCtx = makeCtx(childFile);
+
+    await handlerOf(a.handlers, "session_start")({}, ownerCtx);
+    await commandOf(a.commands, "cont-after-reset")("", ownerCtx);
+    assert(armsIsArmed(), "F-pre: флаг владельца взведён");
+
+    // Owner session replaced: shutdown bumps the epoch; the module-level
+    // refs now belong to the OLD epoch (piApiEpoch !== sessionEpoch), but
+    // the mock probe still says "live" (the fictional C2 combination).
+    await handlerOf(a.handlers, "session_shutdown")({}, ownerCtx);
+
+    // Чужой session-start (reason=startup, другой ключ) при живом probe и
+    // разошедшихся эпохах: смена должна ПРОЙТИ (не blocked).
+    await handlerOf(a.handlers, "session_start")(
+      { reason: "startup" },
+      childCtx,
+    );
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    const foreignLine = lineForKey(log, childBase) ?? "";
+    assert(
+      !foreignLine.includes("owner-shift(blocked)"),
+      "(f) T2: при epoch-mismatch смена НЕ блокируется (нет owner-shift(blocked))",
+    );
+    assert(
+      foreignLine.includes("owner-shift"),
+      "(f) T2: смена выполнена — строка несёт owner-shift (не blocked)",
+    );
+    assert(
+      armsCurrentKey() === childFile,
+      "(f) T2: ключ переехал на актуальный разговор (key/разговор вместе)",
+    );
+    const mapF = JSON.parse(
+      readFileSync(join(tmp, "arms.json"), "utf8"),
+    ) as Record<string, unknown>;
+    assert(
+      mapF[ownerFile] !== undefined,
+      "(f) T2: запись arms.json осталась под ключом владельца (repoint не переносит)",
+    );
+
+    await handlerOf(a.handlers, "session_shutdown")({}, childCtx);
+  } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 // --- runner ----------------------------------------------------------------------
 
 function resetStaleStateForTests(): void {
@@ -549,9 +625,13 @@ async function main(): Promise<void> {
   resetStaleStateForTests();
   await testForeignSessionDoesNotHijackOwner();
   resetStaleStateForTests();
+  await testStaleOwnerCtxLetsShiftThrough();
+  resetStaleStateForTests();
   await testSameKeySessionStartNotBlocked();
   resetStaleStateForTests();
   await testCarrySessionMovesOwner();
+  resetStaleStateForTests();
+  await testEpochMismatchLetsShiftThrough();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);
