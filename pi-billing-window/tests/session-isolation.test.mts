@@ -40,6 +40,7 @@ import piBillingWindowFactory, {
   __syncWatchdogForTests,
   __retryTickForTests,
   setVerifyDeliveredForTests,
+  setProbePiAliveForTests,
 } from "../src/index.ts";
 import {
   writeStateSync,
@@ -321,6 +322,70 @@ async function testForeignSessionDoesNotHijackOwner(): Promise<void> {
     await handlerOf(a.handlers, "session_shutdown")({}, ownerCtx);
   } finally {
     setResetGraceMsForTests(RESET_GRACE_MS);
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// --- (e) spec 007: МЁРТВЫЙ ctx владельца НЕ блокирует смену -------------------
+
+/**
+ * Spec 007 (live 07:38-09:38Z): reload-after-resume chains left the owner's
+ * captured ctx dead (probe "stale") and the blocked shift never happened --
+ * the fire could never send (send-error:stale loop). A dead owner ctx means
+ * the "live interest" is fictional, so the shift must go through: the
+ * delivery follows the user's actual conversation.
+ */
+async function testStaleOwnerCtxLetsShiftThrough(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-si-staleshift-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(50);
+  try {
+    await seedFreshWindow();
+    const a = makeMockPi();
+    piBillingWindowFactory(a.pi as never);
+
+    const ownerFile = join(tmp, "K_owner.jsonl");
+    const childFile = join(tmp, "K_child.jsonl");
+    const childBase = "K_child.jsonl";
+    const ownerCtx = makeCtx(ownerFile);
+    const childCtx = makeCtx(childFile);
+
+    await handlerOf(a.handlers, "session_start")({}, ownerCtx);
+    await commandOf(a.commands, "cont-after-reset")("", ownerCtx);
+    assert(armsIsArmed(), "E-pre: флаг владельца взведён");
+
+    // Мёртвый captured ctx владельца (probe "stale") — сессия заменена.
+    setProbePiAliveForTests("stale");
+
+    // Чужой session-start (reason=startup, другой ключ) при мёртвом ctx.
+    await handlerOf(a.handlers, "session_start")(
+      { reason: "startup" },
+      childCtx,
+    );
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    const foreignLine = lineForKey(log, childBase) ?? "";
+    assert(
+      !foreignLine.includes("owner-shift(blocked)"),
+      "(e): при мёртвом ctx владельца смена НЕ блокируется (нет owner-shift(blocked))",
+    );
+    assert(
+      foreignLine.includes("owner-shift"),
+      "(e): смена выполнена — строка несёт owner-shift (не blocked)",
+    );
+    assert(
+      armsCurrentKey() === childFile,
+      "(e): ключ переехал на новый session-file (доставка следует за разговором)",
+    );
+    const mapE = JSON.parse(
+      readFileSync(join(tmp, "arms.json"), "utf8"),
+    ) as Record<string, unknown>;
+    assert(
+      mapE[childFile] !== undefined,
+      "(e): запись arms.json переехала под новый ключ",
+    );
+  } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    setProbePiAliveForTests(null);
     rmSync(tmp, { recursive: true, force: true });
   }
 }

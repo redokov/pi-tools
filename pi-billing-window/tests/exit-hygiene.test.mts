@@ -73,6 +73,35 @@ function unitUnrefContract(): void {
   );
 }
 
+// --- 1b. spec 007: stale ctx в тике НЕ убивает процесс ------------------------
+
+/**
+ * Spec 007 (live /reload crash): after a session replacement the captured
+ * ctx goes stale -- reading ctx.ui throws via assertActive() and the
+ * uncaught exception KILLED pi. The status bar is cosmetic: the interval
+ * callback must skip the tick silently. If the callback threw, the test
+ * process would die with uncaughtException (a nonzero exit).
+ */
+async function testStaleCtxTickDoesNotKillProcess(): Promise<void> {
+  let staleHits = 0;
+  const staleCtx: any = {
+    mode: "tui",
+    get ui() {
+      staleHits++;
+      throw new Error(
+        "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().",
+      );
+    },
+  };
+  ui.startStatusUpdater(staleCtx, { intervalMs: 30 });
+  await new Promise((r) => setTimeout(r, 150)); // 3-5 ticks with a stale ctx
+  ui.stopStatusUpdater();
+  assert(
+    staleHits >= 2,
+    "unit: stale ctx доходит до applyStatus каждый тик (интервал жив)",
+  );
+}
+
 // --- 2. e2e: every suite exits with code 0 -------------------------------------
 
 const SUITES = [
@@ -149,6 +178,7 @@ async function main(): Promise<void> {
   );
 
   unitUnrefContract();
+  await testStaleCtxTickDoesNotKillProcess();
 
   for (const suite of SUITES) {
     const code = await runSuite(suite);

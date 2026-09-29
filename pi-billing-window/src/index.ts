@@ -198,6 +198,13 @@ let piApiEpoch = 0;
 let probeState: "live" | "stale" | "unknown" = "unknown";
 
 /**
+ * Spec 007 test hook: forces probePiAlive() to return this value regardless
+ * of the actual probe. null = use the real probe. Reset in
+ * __resetStaleStateForTests().
+ */
+let probeOverrideForTests: "live" | "stale" | null = null;
+
+/**
  * Spec 006 (D-603c / FR-102): the previous sync tick observed a dead
  * reference (probe "stale"). Read at the top of each syncWatchdog() to
  * detect the stale→live edge on the current tick. Never persisted.
@@ -221,6 +228,7 @@ let epochGuardWasFailing = false;
  * Never sends anything and never throws.
  */
 function probePiAlive(): "live" | "stale" {
+  if (probeOverrideForTests !== null) return probeOverrideForTests;
   if (piApi === null) return "stale";
   try {
     const p = piApi as unknown as { getSessionName?: () => unknown };
@@ -368,6 +376,10 @@ let verifyDeliveredOverride:
       text: string,
     ) => boolean)
   | null = null;
+export function setProbePiAliveForTests(s: "live" | "stale" | null): void {
+  probeOverrideForTests = s;
+}
+
 export function setVerifyDeliveredForTests(
   fn: ((
     ownerKey: string | null,
@@ -508,6 +520,7 @@ function isTokenBearing(u: {
  * scenarios in one process do not leak attempts into each other.
  */
 export function __resetStaleStateForTests(): void {
+  probeOverrideForTests = null;
   staleAttempts = 0;
   staleRetryNotBefore = 0;
   lastFiredResetAt = null;
@@ -1578,11 +1591,20 @@ async function onSessionStart(
   // таймеры/epoch владельца. Здесь НЕ делаем: currentCtx = ctx, НЕ
   // armsSwitchKey(incomingKey), НЕ переснятие piApi/eventBus, НЕ сброс
   // staleAttempts/таймеров по чужому поводу — доставка владельца нетронута.
+  // Spec 007 (live 07:38-09:38Z): reload-after-resume chains left the
+  // owner's captured ctx DEAD (probe "stale"), and the blocked shift then
+  // never happened -- every later session-start with a different key was
+  // blocked and the fire could never send (send-error:stale loop). A dead
+  // owner ctx means the "live interest" is fictional: the owner session is
+  // already replaced, so the shutdown-guard protection is moot. Block ONLY
+  // while the owner's captured ctx is alive; a dead ctx lets the shift
+  // through so the delivery follows the user's actual conversation.
   const ownerBlocked =
     ownerKey !== null &&
     incomingKey !== ownerKey &&
     remapKey(reason) === "repoint" &&
-    hasLiveOwnerInterest();
+    hasLiveOwnerInterest() &&
+    probePiAlive() === "live";
   if (ownerBlocked) {
     armsLog(
       "session-start",

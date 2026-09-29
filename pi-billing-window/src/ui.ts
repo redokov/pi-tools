@@ -133,7 +133,16 @@ export function startStatusUpdater(
 
   currentInterval = setInterval(() => {
     if (currentCtx && currentKey) {
-      applyStatus(currentCtx, currentKey);
+      try {
+        applyStatus(currentCtx, currentKey);
+      } catch (err) {
+        // Spec 007 (live /reload crash): the session was replaced
+        // (ctx.reload / restart) and the captured ctx went stale -- reading
+        // ctx.ui throws via assertActive() and the uncaught exception KILLED
+        // pi. The status bar is cosmetic: skip the tick silently. The
+        // extension reload re-creates the updater for the new session.
+        return;
+      }
     }
   }, intervalMs);
   currentInterval.unref();

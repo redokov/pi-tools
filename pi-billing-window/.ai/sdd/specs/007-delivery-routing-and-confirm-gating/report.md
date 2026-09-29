@@ -81,6 +81,25 @@ pid 3628 (17-27-11-381Z, first-fix code): attempt 6/6 -> `capitulation:after-6`
 persistent misroute ends in a VISIBLE disarm + notification instead of a
 silent loop.
 
+## Live observation, resets #447/#448 (07:38Z / 09:38Z) -- stale-shift defect
+
+c:\Tools (pid 34872): SECOND full live cycle confirmed -- fire:reset-ready
+(+0s) -> send -> `fire:send-reverify (rev 1)` caught the late append ->
+`fire:send-ok` -> `fire:confirmed` 07:38:49. The re-verify fix works
+consistently live.
+
+The 17-27-11-381Z window kept failing with send-error:stale: session-switch
+chains (/reload /new) carried the arm key to the newest file, but every
+later session-start with a different key was BLOCKED and per spec 006 the
+blocked path deliberately does not refresh the captured ctx -- the ctx
+stayed dead and the fire could never send. ROOT CAUSE: the "live interest"
+check ignored ctx staleness. Fix: the blocked shift now requires
+`probePiAlive() === "live"` -- a dead owner ctx lets the shift through so
+the delivery follows the user's actual conversation (new session-start
+hook path). New test (e) in session-isolation (stale owner ctx -> shift
+proceeds, no owner-shift(blocked), key+arms.json move) -- 26 passed there,
+full suite re-run green (exit 0 x14), redeployed identical to src.
+
 ## Live repro verdict (after user reloads the 2 sessions + /cont-after-reset)
 
 - Both sessions fire on the next reset (19:37:32Z) -> hypothesis about the
