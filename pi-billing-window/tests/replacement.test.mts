@@ -35,6 +35,7 @@ import piBillingWindowFactory, {
   __resetStaleStateForTests,
   setResetGraceMsForTests,
   setVerifyDeliveredForTests,
+  setSwitchWaitForTests,
 } from "../src/index.ts";
 import {
   mutateState,
@@ -46,6 +47,8 @@ import {
   resetPaths as armsResetPaths,
   isArmed as armsIsArmed,
   getArm as armsGetArm,
+  getKey as armsCurrentKey,
+  getArmForKey as armsGetArmForKey,
   RESET_GRACE_MS,
 } from "../src/arms.ts";
 import {
@@ -494,6 +497,149 @@ async function testContAfterResetAdoptsFreshRefs(): Promise<void> {
   }
 }
 
+// --- 5. (spec 009, T1) fork-цепочка: чужой session_start -> adopted + switch ---
+
+/**
+ * Scenario 5 (spec 009, T1): fork-цепочка. Чужой session_start (другой
+ * ключ, НЕСЁТ refs в ctx) попадает в ownerBlocked early-return путь:
+ *   (a) blocked-путь переснимает refs (armslog "replacement:adopted"),
+ *       ownerKey/currentKey НЕ меняются (флаг не крадётся), таймеры живы;
+ *   (b) fire доставляет «продолжи» через switchSession-путь (T2/F2) на
+ *       СВЕЖИЙ api владельца, флаг остаётся у владельца (pending).
+ */
+async function testOwnerBlockedAdoptsFreshRefsAndDeliversViaSwitch(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-repl-fork-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(50);
+  // switchSession обновляет lastSessionStartKey синхронно -- тест не ждёт
+  // bounded-ожидание (восстанавливается в finally).
+  setSwitchWaitForTests(0, 0);
+  try {
+    await seedFreshWindow();
+    resetStaleStateForTests();
+
+    // Owner runtime: factory ОБЁРТЫВАЕТ registerCommand, поэтому commandOf
+    // вернёт обёрнутый хендлер (сначала commandCtx = ctx, потом оригинал).
+    const a = makeMockPi();
+    piBillingWindowFactory(a.pi as never);
+
+    const ownerFile = join(tmp, "sess-owner.jsonl");
+    const childFile = join(tmp, "sess-fork.jsonl");
+
+    // Fresh command ctx, несущий switchSession (гипотетический payload
+    // командного ctx). Self-reference валиден (const до вызова).
+    const switchedRuntime: ReturnType<typeof makeMockPi>[] = [];
+    const ownerCtx = makeCtx(ownerFile, {
+      switchSession: async (path: string) => {
+        const a2 = makeMockPi(); // свежий api/runtime (фабрика перезапустилась)
+        piBillingWindowFactory(a2.pi as never); // module refs: piApi/piApiEpoch = fresh
+        switchedRuntime.push(a2); // тест наблюдает свежий экземпляр
+        assert(
+          path === ownerFile,
+          "fork: switchSession получил ключ владельца",
+        );
+        // session_start владельца на свежем runtime (полный старт, не blocked).
+        await handlerOf(a2.handlers, "session_start")({}, ownerCtx);
+        return { cancelled: false };
+      },
+    });
+
+    // owner session_start -> ownerKey = ownerFile, lastSessionStartKey = ownerFile.
+    await handlerOf(a.handlers, "session_start")({}, ownerCtx);
+    // /cont-after-reset -> флаг взведён; commandCtx = ownerCtx.
+    await commandOf(a.commands, "cont-after-reset")("", ownerCtx);
+    assert(armsIsArmed(), "fork: флаг взведён у владельца");
+
+    // Child mock БЕЗ factory -- fork несёт refs в ctx (гипотетический
+    // payload, который sessionBusOf зондирует: ключи api/events).
+    const b = makeMockPi();
+    const childCtx = makeCtx(childFile, {
+      api: b.pi,
+      events: (b.pi as { events: unknown }).events,
+    });
+
+    // Чужой session_start на ЖИВОМ runtime (хендлер runtime a): ownerBlocked
+    // (remapKey("startup")==="repoint", incoming!==ownerKey, probe "live",
+    // piApiEpoch===sessionEpoch) -> blocked-путь -> adopt свежих refs.
+    await handlerOf(a.handlers, "session_start")(
+      { reason: "startup" },
+      childCtx,
+    );
+
+    // --- asserts (a) ---
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      linesWith(log, "replacement:adopted").length > 0,
+      "fork: armslog содержит replacement:adopted (blocked-путь переснял ссылки)",
+    );
+    assert(
+      armsCurrentKey() === ownerFile,
+      "fork: currentKey не изменился (флаг не украден чужим стартом)",
+    );
+    assert(
+      armsGetArmForKey(ownerFile) !== null &&
+        armsGetArmForKey(childFile) === null,
+      "fork: запись arms.json под ключом владельца есть, под чужим ключом -- нет",
+    );
+    let timersAlive = true;
+    try {
+      __syncWatchdogForTests();
+      await __retryTickForTests();
+    } catch {
+      timersAlive = false;
+    }
+    assert(
+      timersAlive,
+      "fork: таймеры живы (sync/retry хуки не бросают)",
+    );
+
+    // Новый сброс -> fire: switch-needed -> trySwitchToOwner (switchSession
+    // mock) -> session_start владельца на свежем runtime -> доставка «продолжи»
+    // через СВЕЖИЙ api владельца (p = piApi = a2.pi).
+    await backdateReset();
+    __syncWatchdogForTests();
+    await sleep(300);
+
+    // --- asserts (b) ---
+    assert(
+      switchedRuntime.length === 1 &&
+        switchedRuntime[0]!.sends.some((s) => s.content === "продолжи"),
+      "fork: «продолжи» доставлен через СВЕЖИЙ api владельца (switchSession-путь)",
+    );
+    assert(
+      b.sends.length === 0,
+      "fork: child mock НЕ получил «продолжи» (без misroute)",
+    );
+    const log2 = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      linesWith(log2, "fire:switch-needed").length > 0,
+      "fork: armslog содержит fire:switch-needed",
+    );
+    assert(
+      linesWith(log2, "fire:send-ok").length > 0,
+      "fork: armslog содержит fire:send-ok",
+    );
+    assert(
+      !log2.includes("send-error:stale") &&
+        !log2.includes("fire:send-misroute"),
+      "fork: нет send-error:stale и fire:send-misroute",
+    );
+    assert(
+      armsIsArmed() || armsGetArmForKey(ownerFile) !== null,
+      "fork: флаг остаётся у владельца (после markFired -- pending)",
+    );
+
+    await handlerOf(a.handlers, "session_shutdown")(
+      { reason: "replacement" },
+      ownerCtx,
+    );
+  } finally {
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    setSwitchWaitForTests(150, 2);
+    cleanupPaths(tmp);
+  }
+}
+
 // --- runner ----------------------------------------------------------------------
 
 // Spec-002 test hook: reset the module-level stale-retry/dedup state between
@@ -527,6 +673,8 @@ async function main(): Promise<void> {
   await testReplacementForcesReFireAfterAdopted();
   resetStaleStateForTests();
   await testContAfterResetAdoptsFreshRefs();
+  resetStaleStateForTests();
+  await testOwnerBlockedAdoptsFreshRefsAndDeliversViaSwitch();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

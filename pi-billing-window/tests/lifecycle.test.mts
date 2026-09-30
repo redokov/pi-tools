@@ -36,6 +36,8 @@ import piBillingWindowFactory, {
   __syncWatchdogForTests,
   __retryTickForTests,
   setVerifyDeliveredForTests,
+  setSwitchWaitForTests,
+  __resetStaleStateForTests,
 } from "../src/index.ts";
 import {
   writeStateSync,
@@ -789,6 +791,125 @@ async function testRepeatRearmAcrossResets(): Promise<void> {
   }
 }
 
+/**
+ * Spec 009 (T3, F2/F3): полный цикл fire -> confirmed через switchSession-путь
+ * + pendingFiredResetAt (max 1 повторный send на reset).
+ *
+ * Владелец армится командой (командный ctx несёт switchSession), чужая
+ * (дочерняя) сессия стартует и блокируется (owner-ctx жив, repoint-причина),
+ * lastSessionStartKey = child-файл. После сброса окна refs указывают на
+ * другую сессию -> fire:switch-needed -> trySwitchToOwner(ownerKey) через
+ * командный ctx -> session_start владельца перезапускается синхронно
+ * (полный старт, не blocked) -> piApi живой той же эпохи -> «продолжи»
+ * уходит в разговор владельца (fire:send-ok), флаг в pending. Первый
+ * успешный wormsoft-ответ подтверждает флаг; повторный retryTick на ТОМ ЖЕ
+ * reset дубля не даёт (pendingFiredResetAt).
+ */
+async function testFullCycleViaSwitchPath(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-switch-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(50);
+  try {
+    setSwitchWaitForTests(0, 0);
+    __resetStaleStateForTests();
+    seedFreshWindow();
+    const a = makeMockPi();
+    piBillingWindowFactory(a.pi as never);
+
+    const ownerFile = join(tmp, "L_owner.jsonl");
+    const childFile = join(tmp, "L_child.jsonl");
+
+    // Owner ctx: свежий командный ctx несёт switchSession (spec 009 T2).
+    // switchSession маршрутизируется через командный ctx: поднимает
+    // session_start владельца СИНХРОННО ДО своего завершения (incoming ===
+    // ownerKey -> НЕ blocked, полный старт) и возвращает { cancelled: false }.
+    const baseOwner = makeCtx(ownerFile) as Record<string, unknown>;
+    const ownerCtx: Record<string, unknown> = {
+      ...baseOwner,
+      switchSession: async (path: string) => {
+        switchCalls.push(path);
+        await handlerOf(a.handlers, "session_start")({}, ownerCtx); // полный старт владельца
+        return { cancelled: false };
+      },
+    };
+    const switchCalls: string[] = [];
+
+    // Owner session_start: полный старт, ownerKey = ownerFile.
+    await handlerOf(a.handlers, "session_start")({}, ownerCtx);
+    // /cont-after-reset: обёртка фабрики захватывает командный ctx (несёт
+    // switchSession) на каждый вызов — он и используется switch-путём.
+    await commandOf(a.commands, "cont-after-reset")("", ownerCtx);
+    assert(armsIsArmed(), "switch-path: флаг взведён командой");
+
+    // Child (foreign) session_start: owner-ctx жив, repoint-причина ->
+    // ownerBlocked -> lastSessionStartKey = child-файл (ставится ДО гейта).
+    const childCtx = makeCtx(childFile);
+    await handlerOf(a.handlers, "session_start")({ reason: "startup" }, childCtx);
+
+    // Граница окна в прошлом: watchdog срабатывает, checkAndReset делает
+    // реальный reset, (сокращённый) grace планирует fire. Refs указывают на
+    // другую сессию (lastSessionStartKey = childFile != ownerKey) ->
+    // fire:switch-needed -> trySwitchToOwner(ownerFile) -> switchSession ->
+    // session_start re-run (lastSessionStartKey = ownerFile) -> piApi жив
+    // (piApiEpoch === sessionEpoch, shutdown'ов не было) -> send «продолжи»
+    // -> fire:send-ok, pendingFiredResetAt = lastResetAt.
+    await expireWindow();
+    await __syncWatchdogForTests();
+    await sleep(400); // watchdog fire + checkAndReset + grace + switch + send
+
+    assert(
+      a.sends.filter((s) => s.content === "продолжи").length === 1,
+      "switch-path: 'продолжи' отправлен ровно один раз через switchSession-путь",
+    );
+    assert(
+      switchCalls.length === 1 && switchCalls[0] === ownerFile,
+      "switch-path: switchSession вызван один раз с ключом владельца",
+    );
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      log.includes("fire:switch-needed"),
+      "switch-path: fire:switch-needed записан в armslog",
+    );
+    assert(
+      log.includes("fire:send-ok"),
+      "switch-path: fire:send-ok записан в armslog",
+    );
+    assert(
+      !log.includes("send-error:stale"),
+      "switch-path: send-error:stale ОТСУТСТВУЕТ (доставка без stale-ошибок)",
+    );
+
+    // Confirm: успешный wormsoft-ответ В разговоре владельца подтверждает
+    // pending-флаг (первый успех снимает/съедает его).
+    await handlerOf(a.handlers, "after_provider_response")(
+      { status: 200, headers: {} },
+      ownerCtx,
+    );
+    await sleep(200);
+    assert(
+      !armsIsArmed(),
+      "switch-path: первый успех подтвердил и снял pending-флаг",
+    );
+
+    // pendingFiredResetAt (max 1 повторный send на reset): retryTick на ТОМ
+    // ЖЕ reset (pendingFiredResetAt === st.lastResetAt) повторного send НЕ
+    // даёт — дубля нет.
+    await __retryTickForTests();
+    await sleep(300);
+    assert(
+      a.sends.filter((s) => s.content === "продолжи").length === 1,
+      "switch-path: дубля нет на том же reset (pendingFiredResetAt)",
+    );
+
+    // Stop the timers so the test process can exit.
+    await handlerOf(a.handlers, "session_shutdown")({}, ownerCtx);
+  } finally {
+    setSwitchWaitForTests(150, 2);
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    cleanupPaths(tmp);
+  }
+}
+
 // --- runner -------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -806,6 +927,7 @@ async function main(): Promise<void> {
   await testPendingRetryAndConfirm();
   await testContAfterResetArgParsing();
   await testRepeatRearmAcrossResets();
+  await testFullCycleViaSwitchPath();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

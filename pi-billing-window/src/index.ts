@@ -28,7 +28,11 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import {
   readStateSync,
   mutateState,
@@ -354,6 +358,45 @@ let lastFiredResetAt: number | null = null;
 let pendingFiredResetAt: number | null = null;
 
 /**
+ * Spec 009 (T1): ключ сессии, для которой стартовал ТЕКУЩИЙ runtime.
+ * Ставится В НАЧАЛЕ onSessionStart (ДО ownerBlocked-гейта) на КАЖДЫЙ
+ * session_start, включая blocked/чужие, поэтому fire-путь (T2/F2) отличает
+ * «refs указывают на другую сессию» от «старт ещё не был» и маршрутизирует
+ * доставку в разговор владельца через switchSession.
+ */
+let lastSessionStartKey: string | null = null;
+
+/**
+ * Spec 009 (T2): state.lastResetAt, для которого switch-путь уже
+ * пробовался (max 1 попытка на reset). Неудачная попытка fall-through к
+ * обычной отправке (существующая обработка stale); повтор на ТОМ ЖЕ reset
+ * switch не перезапускает.
+ */
+let switchRoutedForReset: number | null = null;
+
+/**
+ * Spec 009 (T2): свежий командный ctx (несёт switchSession, жив, пока его
+ * сессия активна). Захватывается обёрткой pi.registerCommand в фабрике на
+ * КАЖДЫЙ вызов команды — командный хендлер получает свежий
+ * ExtensionCommandContext на каждый вызов, в отличие от module-level piApi,
+ * захваченного для возможно заменённой сессии.
+ */
+let commandCtx: ExtensionCommandContext | null = null;
+
+/**
+ * Spec 009 (T2, test hook): bounded-ожидание lastSessionStartKey ===
+ * ownerKey после успешного switch. В проде switchSession завершает
+ * session_start синхронно, так что ожидание — belt-and-suspenders
+ * (пара round'ов); тесты сводят его к 0.
+ */
+let switchWaitMs = 150;
+let switchWaitRounds = 2;
+export function setSwitchWaitForTests(ms: number, rounds: number): void {
+  switchWaitMs = ms;
+  switchWaitRounds = rounds;
+}
+
+/**
  * Spec 007 (D1): bounded misroute attempts. A send that resolved but never
  * appeared in the owner session jsonl is re-driven by the existing retry
  * loop; after MISROUTE_MAX_ATTEMPTS the mechanism capitulates (disarm +
@@ -525,6 +568,12 @@ export function __resetStaleStateForTests(): void {
   staleRetryNotBefore = 0;
   lastFiredResetAt = null;
   pendingFiredResetAt = null;
+  // Spec 009 (T1/T2): session-tracking module state resets with the rest,
+  // so scenarios in one process do not leak the switch route or the last
+  // session-start key into each other.
+  lastSessionStartKey = null;
+  switchRoutedForReset = null;
+  commandCtx = null;
   probeWasStale = false;
   epochGuardWasFailing = false;
   ownerKey = null;
@@ -1203,6 +1252,32 @@ async function noteStaleFailure(
  * After a successful send the flag switches to "pending" (markFired); the
  * first successful provider response confirms it (confirmSuccess).
  */
+/**
+ * Spec 009 (T2): переключить АКТИВНУЮ сессию окна на разговор владельца
+ * ТОЛЬКО через командный ctx-механизм. Командный ctx (захвачен обёрткой
+ * pi.registerCommand) несёт switchSession, который маршрутизируется через
+ * AgentSessionRuntime.switchSession и поднимает session_start владельца
+ * СИНХРОННО ДО своего завершения (полный старт — incoming === ownerKey
+ * никогда не blocked). Возвращает true, когда switch прошёл
+ * (res?.cancelled === false); иначе false БЕЗ ожидания — вызывающий
+ * fall-through к обычной отправке (существующая обработка stale).
+ * НЕ трогает ownerKey/currentKey (инвариант spec 006).
+ */
+async function trySwitchToOwner(ownerKey: string): Promise<boolean> {
+  const ctx = commandCtx as unknown as {
+    switchSession?: (
+      sessionPath: string,
+    ) => Promise<{ cancelled: boolean }>;
+  } | null;
+  if (ctx === null || typeof ctx.switchSession !== "function") return false;
+  try {
+    const res = await ctx.switchSession(ownerKey);
+    return res?.cancelled === false;
+  } catch {
+    return false;
+  }
+}
+
 async function fireContinue(): Promise<void> {
   // Spec 006 (D-601): свежий статус на момент попытки, перед epoch-guard.
   probePiAlive();
@@ -1233,6 +1308,46 @@ async function fireContinue(): Promise<void> {
       ),
     );
     return;
+  }
+
+  // Spec 009 (T2, F2): маршрутизация доставки в РАЗГОВОР владельца.
+  // lastSessionStartKey — ключ, для которого стартовал текущий runtime;
+  // когда он ≠ владельцу, refs (piApi) принадлежат другой сессии, и обычная
+  // отправка уйдёт в чужой разговор (или упадёт stale). Переключаем активную
+  // сессию на владельца через командный ctx (switchSession) — он поднимает
+  // session_start владельца синхронно (полный старт, не blocked: incoming
+  // === ownerKey), после чего piApi перечитывается свежим. Max 1 попытка
+  // switch на reset (switchRoutedForReset); неудачная попытка fall-through
+  // к обычной отправке (существующая обработка stale/misroute).
+  const curReset = readStateSync()?.lastResetAt ?? 0;
+  if (
+    ownerKey !== null &&
+    lastSessionStartKey !== null &&
+    lastSessionStartKey !== ownerKey &&
+    switchRoutedForReset !== curReset
+  ) {
+    armsLog(
+      "fire:switch-needed",
+      withAttr(
+        `refs указывают на другую сессию (${sessionKeyBase(lastSessionStartKey)} != владельца ${sessionKeyBase(ownerKey)}) — переключаю активную сессию на владельца через switchSession`,
+      ),
+    );
+    const switched = await trySwitchToOwner(ownerKey);
+    switchRoutedForReset = curReset;
+    if (switched) {
+      // switchSession завершается ПОСЛЕ session_start-хендлеров владельца,
+      // так что lastSessionStartKey уже равен ownerKey — ожидание
+      // belt-and-suspenders (bounded: пара round'ов, settable для тестов).
+      for (
+        let round = 0;
+        round < switchWaitRounds && lastSessionStartKey !== ownerKey;
+        round++
+      ) {
+        await new Promise((r) => setTimeout(r, switchWaitMs));
+      }
+    }
+    // Fall-through: const p = piApi ниже перечитывает (возможно свежие)
+    // refs; при неудачном switch существующая обработка stale действует.
   }
 
   const p = piApi;
@@ -1614,6 +1729,11 @@ async function onSessionStart(
   ctx: ExtensionContext,
 ): Promise<void> {
   const incomingKey = sessionKeyOf(ctx);
+  // Spec 009 (T1): ключ сессии, для которой стартовал ТЕКУЩИЙ runtime —
+  // на КАЖДЫЙ session_start, включая blocked/чужие, строго ДО
+  // ownerBlocked-гейта (иначе fire-путь не отличит «refs на другую
+  // сессию» от «старта не было» и не сработает switch-маршрутизация).
+  lastSessionStartKey = incomingKey;
   const reason = String((event as { reason?: string } | null)?.reason ?? "");
   // Spec 006 (D-608): foreign session-start (repoint + другой session-file
   // key) при живом интересе ВЛАДЕЛЬЦА. КРИТИЧНО строго до `currentCtx = ctx`:
@@ -1652,6 +1772,37 @@ async function onSessionStart(
         `reason=${reason} key=${sessionKeyBase(incomingKey)} armed=${armsIsArmed()} owner-shift(blocked): ${sessionKeyBase(ownerKey as string)}->${sessionKeyBase(incomingKey)}`,
       ),
     );
+    // Spec 009 (T1, F1): гейт блокирует только owner-SHIFT, НЕ
+    // самопрочинку refs. 1) Adopt свежих ссылок из event/ctx, когда они
+    // есть (belt-and-suspenders: сегодняшний event-handler ctx не несёт
+    // api/events — в проде это no-op; будущий pi с refs зажжётся
+    // автоматически). 2) Сброс staleAttempts/staleRetryNotBefore — после
+    // fork/replace-цепочки чистый лист. Лог replacement:adopted ТОЛЬКО
+    // когда refs реально изменились (избегать спама на каждый fork).
+    // 3) ensureTickerStarted + ensureSyncPoller (C2: ранний return раньше
+    // пропускал запуск таймеров/поллера). Инвариант spec 006: ownerKey и
+    // currentCtx НЕ меняются — флаг не крадётся; доставка следует за
+    // владельцем через T2/F2 switch.
+    const blockedFresh = sessionBusOf(event, ctx);
+    if (blockedFresh !== null) {
+      const refsChanged =
+        piApi !== blockedFresh.api || eventBus !== blockedFresh.bus;
+      eventBus = blockedFresh.bus;
+      piApi = blockedFresh.api;
+      piApiEpoch = sessionEpoch;
+      staleAttempts = 0;
+      staleRetryNotBefore = 0;
+      if (refsChanged) {
+        armsLog(
+          "replacement:adopted",
+          withAttr(
+            "session_start (blocked) переснял ссылки на pi/events — отправка «продолжи» снова возможна",
+          ),
+        );
+      }
+    }
+    ensureTickerStarted();
+    ensureSyncPoller();
     return;
   }
 
@@ -2414,6 +2565,24 @@ export default function (pi: ExtensionAPI): void {
   // Keep a live ExtensionAPI reference for pi.sendUserMessage (cont-after-reset).
   piApi = pi;
   piApiEpoch = sessionEpoch;
+
+  // Spec 009 (T2): обернуть pi.registerCommand так, чтобы хендлер КАЖДОЙ
+  // команды сначала захватывал свежий командный ctx (он несёт switchSession
+  // и пересоздаётся на каждый вызов), потом вызывал оригинал. Обёртка
+  // устанавливается ДО registerBillingStatus и остальных register*, поэтому
+  // покрыты все команды.
+  const origRegisterCommand = pi.registerCommand.bind(pi);
+  pi.registerCommand = ((
+    name: string,
+    options: Parameters<typeof origRegisterCommand>[1],
+  ) => {
+    const origHandler = options.handler;
+    options.handler = async (args, ctx) => {
+      commandCtx = ctx;
+      return origHandler(args, ctx);
+    };
+    return origRegisterCommand(name, options);
+  }) as typeof pi.registerCommand;
 
   pi.on("session_start", onSessionStart);
   pi.on("model_select", onModelSelect);

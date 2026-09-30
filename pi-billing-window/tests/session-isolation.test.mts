@@ -30,7 +30,13 @@
  * setArmsLogPath.
  */
 
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  appendFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -41,6 +47,7 @@ import piBillingWindowFactory, {
   __retryTickForTests,
   setVerifyDeliveredForTests,
   setProbePiAliveForTests,
+  setSwitchWaitForTests,
 } from "../src/index.ts";
 import {
   writeStateSync,
@@ -605,6 +612,169 @@ async function testEpochMismatchLetsShiftThrough(): Promise<void> {
   }
 }
 
+// --- spec 009 (T2): refs mis-target + живой owner: switch на владельца --------
+
+/**
+ * Spec 009 (T2, F2): a foreign (blocked) session_start moves
+ * lastSessionStartKey to the child's key while ownerKey stays with the
+ * owner. On the next fire the refs point at ANOTHER conversation -- the
+ * module must call switchSession with the OWNER's key (not misroute), the
+ * owner's session_start re-runs fully (not blocked), and the delivery
+ * lands in the OWNER's jsonl.
+ *
+ * Техника: faithful mock pi (sendUserMessage пишет РЕАЛЬНУЮ запись
+ * пользователя в jsonl владельца) + ownerCtx со switchSession, чей вызов
+ * перезапускает session_start владельца (incoming === ownerKey → НЕ blocked).
+ */
+function makeFaithfulMockPi(ownerFile: string): {
+  pi: unknown;
+  handlers: Map<string, SessionHandler[]>;
+  commands: Map<string, CommandHandler>;
+  sends: Array<{ content: unknown; opts: unknown }>;
+} {
+  const handlers = new Map<string, SessionHandler[]>();
+  const commands = new Map<string, CommandHandler>();
+  const sends: Array<{ content: unknown; opts: unknown }> = [];
+  const busSubs = new Map<string, Array<(d: unknown) => void>>();
+
+  const pi = {
+    events: {
+      emit: (_ch: string, _data: unknown) => {},
+      on: (ch: string, h: (d: unknown) => void) => {
+        const arr = busSubs.get(ch) ?? [];
+        arr.push(h);
+        busSubs.set(ch, arr);
+        return () => {
+          const i = arr.indexOf(h);
+          if (i >= 0) arr.splice(i, 1);
+        };
+      },
+    },
+    on: (ev: string, h: SessionHandler) => {
+      const arr = handlers.get(ev) ?? [];
+      arr.push(h);
+      handlers.set(ev, arr);
+    },
+    registerCommand: (name: string, spec: { handler: CommandHandler }) => {
+      commands.set(name, spec.handler);
+    },
+    sendUserMessage: async (content: unknown, opts?: unknown) => {
+      sends.push({ content, opts });
+      const entry = {
+        type: "message",
+        timestamp: new Date().toISOString(),
+        message: {
+          role: "user",
+          content: [{ type: "text", text: String(content) }],
+        },
+      };
+      appendFileSync(ownerFile, JSON.stringify(entry) + "\n", "utf8");
+      return undefined;
+    },
+  };
+  return { pi, handlers, commands, sends };
+}
+
+async function testSwitchToOwnerDeliversToOwnerConversation(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-si-switch-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(50);
+  // РЕАЛЬНАЯ верификация доставки (main() ставит override always-true;
+  // этот тест восстанавливает реальную, как delivery-gating тесты).
+  setVerifyDeliveredForTests(null);
+  setSwitchWaitForTests(0, 0);
+  resetStaleStateForTests();
+  try {
+    await seedFreshWindow();
+    const a = makeFaithfulMockPi(join(tmp, "S_owner.jsonl"));
+    piBillingWindowFactory(a.pi as never);
+
+    const ownerFile = join(tmp, "S_owner.jsonl");
+    const childFile = join(tmp, "S_child.jsonl");
+
+    // ownerCtx: свежий командный ctx несёт switchSession; вызов
+    // switchSession(ownerKey) перезапускает session_start владельца
+    // (incoming === ownerKey → НЕ blocked) и возвращает { cancelled: false }.
+    const switchCalls: string[] = [];
+    const ownerCtx = {
+      ...(makeCtx(ownerFile) as Record<string, unknown>),
+      switchSession: async (path: string) => {
+        switchCalls.push(path);
+        await handlerOf(a.handlers, "session_start")({}, ownerCtx);
+        return { cancelled: false };
+      },
+    };
+
+    await handlerOf(a.handlers, "session_start")({}, ownerCtx);
+    assert(
+      armsCurrentKey() === ownerFile,
+      "T2-pre: ключ владельца установлен (session_start владельца)",
+    );
+    await commandOf(a.commands, "cont-after-reset")("", ownerCtx);
+    assert(armsIsArmed(), "T2-pre: флаг владельца взведён");
+
+    // Чужой session_start (reason=startup, другой ключ) BLOCKED:
+    // lastSessionStartKey уходит на чужой ключ, ownerKey не меняется.
+    await handlerOf(a.handlers, "session_start")(
+      { reason: "startup" },
+      makeCtx(childFile),
+    );
+    assert(
+      armsCurrentKey() === ownerFile,
+      "T2: после blocked чужого session_start ключ остался у владельца",
+    );
+
+    // Новый сброс окна: fire видит refs mis-target
+    // (lastSessionStartKey=childFile != владельца) → switch-needed →
+    // trySwitchToOwner(ownerFile) → switchSession → session_start re-run →
+    // lastSessionStartKey = ownerFile → wait сразу → sendUserMessage("продолжи")
+    // → faithful mock пишет запись в jsonl владельца → verifyDelivered →
+    // fire:send-ok.
+    await backdateReset();
+    await __syncWatchdogForTests();
+    await sleep(300);
+
+    assert(
+      switchCalls.length === 1 && switchCalls[0] === ownerFile,
+      "T2: switchSession вызван ровно один раз с КЛЮЧОМ владельца (без ложного misroute)",
+    );
+    assert(
+      a.sends.some((s) => s.content === "продолжи"),
+      "T2: доставка «продолжи» ушла в разговор владельца (send на mock-pi владельца)",
+    );
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      log.includes("fire:switch-needed"),
+      "T2: лог содержит fire:switch-needed",
+    );
+    assert(log.includes("fire:send-ok"), "T2: лог содержит fire:send-ok");
+    assert(
+      !log.includes("fire:send-misroute"),
+      "T2: лог НЕ содержит fire:send-misroute",
+    );
+    assert(
+      !log.includes("send-error:stale"),
+      "T2: лог НЕ содержит send-error:stale",
+    );
+    const ownerJsonl = readFileSync(ownerFile, "utf8");
+    assert(
+      ownerJsonl.includes("продолжи"),
+      "T2: jsonl владельца содержит РЕАЛЬНУЮ запись «продолжи» ( faithful mock пишет на диск )",
+    );
+    const mapT2 = JSON.parse(
+      readFileSync(join(tmp, "arms.json"), "utf8"),
+    ) as Record<string, unknown>;
+    assert(
+      mapT2[ownerFile] !== undefined,
+      "T2: запись arms.json под ключом владельца есть",
+    );
+  } finally {
+    setVerifyDeliveredForTests(() => true);
+    setSwitchWaitForTests(150, 2);
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 // --- runner ----------------------------------------------------------------------
 
 function resetStaleStateForTests(): void {
@@ -632,6 +802,8 @@ async function main(): Promise<void> {
   await testCarrySessionMovesOwner();
   resetStaleStateForTests();
   await testEpochMismatchLetsShiftThrough();
+  resetStaleStateForTests();
+  await testSwitchToOwnerDeliversToOwnerConversation();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);
