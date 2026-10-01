@@ -90,7 +90,18 @@ export async function checkAndReset(
     return didReset;
   } catch (err) {
     // Never let a ticker failure kill the host process.
-    console.warn("pi-billing-window: checkAndReset failed:", err);
+    // ELOCKED (state-lock contention with another window/process holding
+    // it longer than the retry budget) is NOT fatal: the other holder did
+    // the check, and the next tick retries. Do not spam the agent window
+    // with a console.warn for it -- log quietly and move on.
+    const msg = String((err as Error)?.message ?? err).slice(0, 160);
+    if ((err as { code?: string })?.code === "ELOCKED") {
+      console.warn(
+        "pi-billing-window: checkAndReset отложен (state-lock занят другим окном, повтор на следующем тике)",
+      );
+      return false;
+    }
+    console.warn("pi-billing-window: checkAndReset failed:", msg);
     return false;
   }
 }

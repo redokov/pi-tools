@@ -70,10 +70,18 @@ export async function withLock<T>(
 ): Promise<T> {
   const dir = path.dirname(lockFile);
   fs.mkdirSync(dir, { recursive: true });
-  if (!fs.existsSync(lockFile)) {
-    fs.writeFileSync(lockFile, "{}", "utf8");
-  }
-  await lockfile.lock(lockFile, { retries: 8 });
+  // NOTE: do NOT pre-create a marker FILE at lockFile -- proper-lockfile
+  // creates the lock DIRECTORY at that path, and an existing FILE makes
+  // mkdir fail with EEXIST, which proper-lockfile reads as "lock held" ->
+  // ELOCKED even when nobody actually holds the lock (the incident of
+  // 2026-10-01: checkAndReset failed ELOCKED while the marker file sat
+  // untouched since 2026-08-27).
+  // proper-lockfile retries: 8 was too few under contention (two windows
+  // firing at the same window boundary) -- the lock was held longer than
+  // the retry budget, so the lock call threw instead of waiting.
+  await lockfile.lock(lockFile, {
+    retries: { retries: 20, factor: 1, minTimeout: 100, maxTimeout: 200 },
+  });
   try {
     return await fn();
   } finally {
