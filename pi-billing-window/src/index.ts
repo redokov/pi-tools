@@ -1258,23 +1258,35 @@ async function noteStaleFailure(
  * pi.registerCommand) несёт switchSession, который маршрутизируется через
  * AgentSessionRuntime.switchSession и поднимает session_start владельца
  * СИНХРОННО ДО своего завершения (полный старт — incoming === ownerKey
- * никогда не blocked). Возвращает true, когда switch прошёл
- * (res?.cancelled === false); иначе false БЕЗ ожидания — вызывающий
- * fall-through к обычной отправке (существующая обработка stale).
- * НЕ трогает ownerKey/currentKey (инвариант spec 006).
+ * никогда не blocked). НЕ трогает ownerKey/currentKey (инвариант spec 006).
+ * Follow-up (live 19:42Z): commandCtx может быть МЁРТВ после длинной
+ * fork-цепочки (захвачен при /cont-after-reset до цепочки) — switchSession
+ * бросает stale; причина отказа возвращается вызывающему для лога
+ * fire:switch-failed (диагностика) и для решения о повторной попытке.
  */
-async function trySwitchToOwner(ownerKey: string): Promise<boolean> {
+async function trySwitchToOwner(
+  key: string,
+): Promise<{ ok: boolean; reason: string }> {
   const ctx = commandCtx as unknown as {
     switchSession?: (
       sessionPath: string,
     ) => Promise<{ cancelled: boolean }>;
   } | null;
-  if (ctx === null || typeof ctx.switchSession !== "function") return false;
+  if (ctx === null || typeof ctx.switchSession !== "function") {
+    return {
+      ok: false,
+      reason: "commandCtx недоступен/не несёт switchSession",
+    };
+  }
   try {
-    const res = await ctx.switchSession(ownerKey);
-    return res?.cancelled === false;
-  } catch {
-    return false;
+    const res = await ctx.switchSession(key);
+    if (res?.cancelled === false) return { ok: true, reason: "switched" };
+    return { ok: false, reason: `cancelled=${String(res?.cancelled)}` };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `switchSession бросил: ${String((err as Error)?.message ?? err).slice(0, 120)}`,
+    };
   }
 }
 
@@ -1332,9 +1344,15 @@ async function fireContinue(): Promise<void> {
         `refs указывают на другую сессию (${sessionKeyBase(lastSessionStartKey)} != владельца ${sessionKeyBase(ownerKey)}) — переключаю активную сессию на владельца через switchSession`,
       ),
     );
-    const switched = await trySwitchToOwner(ownerKey);
-    switchRoutedForReset = curReset;
-    if (switched) {
+    const switchRes = await trySwitchToOwner(ownerKey);
+    // Follow-up (live 19:42Z): маркер ставится ТОЛЬКО при УСПЕШНОМ switch —
+    // неудачная попытка (commandCtx мёртв после fork-цепочки, throw/cancel)
+    // НЕ блокирует повторные попытки switch на retry-попытках того же
+    // сброса; частоту ограничивает существующий stale-пейcинг
+    // (staleRetryNotBefore: 5/10/20/40/60 мин). Неудачный switch НЕ
+    // переключает активную сессию — повтор безопасен.
+    if (switchRes.ok) {
+      switchRoutedForReset = curReset;
       // switchSession завершается ПОСЛЕ session_start-хендлеров владельца,
       // так что lastSessionStartKey уже равен ownerKey — ожидание
       // belt-and-suspenders (bounded: пара round'ов, settable для тестов).
@@ -1345,6 +1363,13 @@ async function fireContinue(): Promise<void> {
       ) {
         await new Promise((r) => setTimeout(r, switchWaitMs));
       }
+    } else {
+      armsLog(
+        "fire:switch-failed",
+        withAttr(
+          `switchSession не прошёл (${switchRes.reason}) — fall-through к обычной отправке, повтор switch на следующей попытке`,
+        ),
+      );
     }
     // Fall-through: const p = piApi ниже перечитывает (возможно свежие)
     // refs; при неудачном switch существующая обработка stale действует.
