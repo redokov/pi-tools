@@ -44,6 +44,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import lockfile from "proper-lockfile";
+import { armsLog } from "./armslog.js";
 
 export type Arm = {
   armedAt: number;
@@ -262,7 +263,16 @@ export async function arm(
   repeat?: number,
 ): Promise<Arm | null> {
   const key = currentKey;
-  if (!key) return null;
+  if (!key) {
+    // Diagnostic (2026-10-01 incident): "не удалось взвести флаг" with no
+    // visible cause -- log WHY the arm returned null so the holder/window
+    // can be identified from the armslog.
+    armsLog(
+      "arm:null-key",
+      `диагностика: /cont-after-reset не взведён, currentKey пуст в этом процессе pid=${process.pid} (session_start не переполнил ключ — blocked-старт после reload?)`,
+    );
+    return null;
+  }
   await withArmsLock(() => {
     const map = readArmsSync();
     pruneExpired(map, now);

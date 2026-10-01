@@ -79,9 +79,26 @@ export async function withLock<T>(
   // proper-lockfile retries: 8 was too few under contention (two windows
   // firing at the same window boundary) -- the lock was held longer than
   // the retry budget, so the lock call threw instead of waiting.
-  await lockfile.lock(lockFile, {
-    retries: { retries: 20, factor: 1, minTimeout: 100, maxTimeout: 200 },
-  });
+  try {
+    await lockfile.lock(lockFile, {
+      retries: { retries: 20, factor: 1, minTimeout: 100, maxTimeout: 200 },
+    });
+  } catch (err) {
+    if ((err as { code?: string })?.code === "ELOCKED") {
+      // Diagnostic (2026-10-01): the lock was held longer than the retry
+      // budget -- log WHO failed to take it (pid + path) into the armslog
+      // so the actual holder can be identified.
+      import("./armslog.js")
+        .then(({ armsLog }) =>
+          armsLog(
+            "state-lock:ELOCKED",
+            `диагностика: retries исчерпаны, лок занят другим окном/процессом pid=${process.pid} file=${lockFile}`,
+          ),
+        )
+        .catch(() => {});
+    }
+    throw err;
+  }
   try {
     return await fn();
   } finally {
