@@ -68,6 +68,8 @@ import {
   getArm as armsGetArm,
   getArmForKey as armsGetArmForKey,
   getKey as armsGetKey,
+  extendArmTtl as armsExtendArmTtl,
+  ARMS_TTL_MS,
   remapKey,
   RESET_GRACE_MS,
   RETRY_AFTER_FIRE_MS,
@@ -375,6 +377,20 @@ let lastSessionStartKey: string | null = null;
 let switchRoutedForReset: number | null = null;
 
 /**
+ * Spec 010 (T1, F1b): state.lastResetAt сброса, TTL для которого уже
+ * продлевался sync-poller'ом (один раз на сброс) — флаг не сгорает по TTL
+ * во время ночных неудачных цепочек.
+ */
+let lastTtlExtendedReset = 0;
+
+/**
+ * Spec 010 (T3, F4): notify «commandCtx мёртв — вызови команду» отправлен
+ * ОДИН раз на цепочку (сбрасывается при успешной доставке и в
+ * __resetStaleStateForTests) — не спамить на каждую попытку.
+ */
+let switchFailedNotified = false;
+
+/**
  * Spec 009 (T2): свежий командный ctx (несёт switchSession, жив, пока его
  * сессия активна). Захватывается обёрткой pi.registerCommand в фабрике на
  * КАЖДЫЙ вызов команды — командный хендлер получает свежий
@@ -574,11 +590,28 @@ export function __resetStaleStateForTests(): void {
   lastSessionStartKey = null;
   switchRoutedForReset = null;
   commandCtx = null;
+  // Spec 010 (T1/T3): TTL-маркер сброса и notify-флаг цепочки — тоже в
+  // изоляцию (сценарии одного процесса не должны наследовать друг друга).
+  lastTtlExtendedReset = 0;
+  switchFailedNotified = false;
   probeWasStale = false;
   epochGuardWasFailing = false;
   ownerKey = null;
   // Spec 007 (D1): the misroute streak resets with the stale state.
   misrouteAttempts = 0;
+  // Diagnostic follow-up (spec 010 T5): scenario 4 leaves currentCtx (isIdle
+  // mock) and lastArmSeenKey behind; the fork scenario's fire was silently
+  // blocked by the stale currentCtx surviving the reset. Full isolation:
+  // these module vars reset with the rest so scenarios in one process do
+  // not leak into each other.
+  currentCtx = null;
+  lastArmSeenKey = null;
+  // Diagnostic follow-up (spec 010 T5): car's fireContinue hung inside
+  // await armsMarkFired() (withArmsLock racing the spec-010 TTL extension),
+  // leaving watchdogEvalInFlight=true -- every later runGuarded call in the
+  // fork scenario was silently skipped. Reset the in-flight guard with the
+  // rest so scenarios in one process do not inherit a hung delivery.
+  watchdogEvalInFlight = false;
   // Spec 006 (D-604): маркеры firelease в тестах — изолированный каталог в
   // системном tmp (пересоздаётся на каждый сброс), чтобы планирования fire из
   // разных сценариев не пересекались и не писали в ~/.pi/agent/...-fires.
@@ -955,6 +988,22 @@ function syncWatchdog(): void {
   const arm = armsGetArm();
   const st = readStateSync();
 
+  // Spec 010 (T1, F1b): TTL продлевается ПРИ КАЖДОМ сбросе окна (один раз
+  // на сброс — lastTtlExtendedReset): флаг, переживающий неудачную цепочку
+  // доставки, не сгорает по TTL до восстановления доставки (miRead-кейс:
+  // confirm 17:39 → TTL до 01:39 → истёк во время цепочки). sync-poller
+  // жив и после fork-цепочек (module timer), поэтому продление не требует
+  // живого окна. Никогда не укорачивает (extendArmTtl).
+  if (
+    st !== null &&
+    st.lastResetAt > 0 &&
+    lastTtlExtendedReset !== st.lastResetAt &&
+    arm !== null
+  ) {
+    lastTtlExtendedReset = st.lastResetAt;
+    void armsExtendArmTtl(armsGetKey(), ARMS_TTL_MS);
+  }
+
   // Spec 006 (D-603c / FR-102): форс-перерис доставки на ПЕРВОМ же sync-тике,
   // где доставка оживает — probe перешёл stale→live ИЛИ впервые после
   // stale-цепочки (staleAttempts > 0) успешен epoch-guard (piApiEpoch ===
@@ -1238,8 +1287,50 @@ async function noteStaleFailure(
   );
   ensureRetryInterval();
   if (staleAttempts >= STALE_MAX_ATTEMPTS) {
-    await capitulate();
+    // Spec 010 (T1, F1a): капитуляция в repeat-режиме (repeat > 1) НЕ
+    // снимает флаг — пауза до следующего сброса окна (флаг остаётся armed,
+    // retry-интервал жив с пейcингом до границы, sync-poller жив): ночной
+    // сценарий требует, чтобы флаг пережил ночь; при следующем сбросе —
+    // новая цепочка (staleAttempts обнуляется), и если commandCtx ожил
+    // (пользователь вызвал команду) — delivery проходит. Одноразовый флаг
+    // (repeat=1) капитулирует как раньше (вечный ретрай не нужен).
+    const armRec = armsGetArm();
+    if (armRec !== null && (armRec.repeat ?? 1) > 1) {
+      await pauseChainUntilNextReset();
+    } else {
+      await capitulate();
+    }
   }
+}
+
+/**
+ * Spec 010 (T1, F1a): пауза неудачной цепочки доставки в repeat-режиме —
+ * флаг остаётся armed (НЕ disarm), notify уходит пользователю, retry-пейcинг
+ * ставится на момент следующего сброса (computeFireAt), staleAttempts
+ * обнуляется (новая цепочка при следующем сбросе — чистый backoff).
+ * Вечный ретрай останавливается (попытки не повторяются 6 раз подряд), но
+ * флаг переживает ночь.
+ */
+async function pauseChainUntilNextReset(): Promise<void> {
+  const key = armsGetKey();
+  const nextFire = computeFireAt(readStateSync() as State);
+  staleAttempts = 0;
+  staleRetryNotBefore = Number.isFinite(nextFire) ? nextFire : Date.now() + STALE_BACKOFF_CAP_MS;
+  // Spec 010 (T3): notify-флаг цепочки сбрасывается — новая цепочка даст
+  // новый notify, если commandCtx опять мёртв.
+  switchFailedNotified = false;
+  armsLog(
+    `capitulation:paused-until-reset`,
+    withAttr(`«продолжи» не доставлен после ${STALE_MAX_ATTEMPTS} попыток, ключ ${key?.split(/[\\/]/).pop() ?? "?"} — флага НЕ снят (repeat-режим), цепочка паузится до следующего сброса`),
+  );
+  void sendNotify({
+    type: "billing:cont-after-reset-capitulation",
+    provider: PROVIDER,
+    title: "cont-after-reset: пауза до сброса",
+    body: `«продолжи» не удалось доставить (${STALE_MAX_ATTEMPTS} попыток). Флаг остаётся взведённым (repeat-режим) и переживёт ночь; доставка восстановится, когда commandCtx оживёт (вызов любой команды в окне). Подробности: ~/.pi/agent/pi-billing-window-arms.log`,
+    timestamp: Date.now(),
+  });
+  syncWatchdog();
 }
 
 /**
@@ -1370,6 +1461,51 @@ async function fireContinue(): Promise<void> {
           `switchSession не прошёл (${switchRes.reason}) — fall-through к обычной отправке, повтор switch на следующей попытке`,
         ),
       );
+      const staleCommandCtx = /stale/i.test(switchRes.reason);
+      // Spec 010 (T3, F4): notify при ПЕРВОМ switch-failed из-за мёртвого
+      // commandCtx на цепочку (switchFailedNotified) — не спамить на каждую
+      // попытку; уходит через notifier, виден утром/в истории.
+      if (staleCommandCtx && !switchFailedNotified) {
+        switchFailedNotified = true;
+        void sendNotify({
+          type: "billing:cont-after-reset-capitulation",
+          provider: PROVIDER,
+          title: "cont-after-reset: commandCtx мёртв",
+          body: `switchSession не прошёл после fork-цепочки. Вызови любую команду в окне (например /billing-status), чтобы switch-путь ожил. Подробности: ~/.pi/agent/pi-billing-window-arms.log`,
+          timestamp: Date.now(),
+        });
+      }
+      // Spec 010 (T2, F2): программный вызов команды при ЖИВОМ piApi —
+      // pi исполняет extension-команду ВМЕСТО отправки (no turn, no user
+      // entry) через текущий runtime → обёртка pi.registerCommand захватит
+      // commandCtx = fresh ctx → switch-путь восстановится на следующей
+      // попытке. Гейт: только при stale commandCtx И probePiAlive() ===
+      // "live" И piApiEpoch === sessionEpoch (мёртвый piApi → throws stale
+      // — без вызова). При мёртвом piApi — ничего.
+      const piRef = piApi;
+      if (
+        staleCommandCtx &&
+        probePiAlive() === "live" &&
+        piApiEpoch === sessionEpoch &&
+        piRef !== null
+      ) {
+        try {
+          await piRef.sendUserMessage("/billing-status", {
+            expandPromptTemplates: true,
+          });
+          armsLog(
+            "switch-revive:cmd",
+            withAttr(
+              "команда исполнена программно — commandCtx обновится на свежий ctx, switch-путь восстановится на следующей попытке",
+            ),
+          );
+        } catch (err) {
+          armsLog(
+            "switch-revive:failed",
+            withAttr(String((err as Error)?.message ?? err).slice(0, 120)),
+          );
+        }
+      }
     }
     // Fall-through: const p = piApi ниже перечитывает (возможно свежие)
     // refs; при неудачном switch существующая обработка stale действует.
@@ -1477,6 +1613,9 @@ async function fireContinue(): Promise<void> {
     // Spec 007 (D1): a delivered send starts the misroute streak from
     // scratch (no false capitulation from a stale foreign session).
     misrouteAttempts = 0;
+    // Spec 010 (T3): успешная доставка сбрасывает notify-флаг цепочки —
+    // следующая fork-цепочка с мёртвым commandCtx даст новый notify.
+    switchFailedNotified = false;
     // Spec 005: record the reset this send was made for so the pending
     // branch of retryTick re-sends only on a NEW reset, not on a 5-min
     // timeout (FR1).

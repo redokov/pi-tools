@@ -775,6 +775,279 @@ async function testSwitchToOwnerDeliversToOwnerConversation(): Promise<void> {
   }
 }
 
+// --- spec 010 (T2/F2): switch-revive через программный вызов команды ---------
+
+/**
+ * Spec 010 (T2/F2): commandCtx мёртв после fork-цепочки (switchSession
+ * бросает stale) + ЖИВЫЙ piApi → fire:switch-failed → ПАДДБЕК-ВОССТАНОВЛЕНИЕ:
+ * программный вызов /billing-status (команда исполнена ВМЕСТО отправки, no
+ * turn) через текущий runtime → обёртка pi.registerCommand захватит
+ * commandCtx = fresh ctx → лог switch-revive:cmd → следующая попытка:
+ * switch-путь ВОССТАНАВЛИВАЕТСЯ (switchSession с ключом владельца) →
+ * доставка в jsonl владельца. При мёртвом piApi (probe stale) — программный
+ * вызов НЕ выполняется (гейт не прошёл).
+ *
+ * Техника: faithful mock pi (sendUserMessage исполняет "/..."-команды при
+ * expandPromptTemplates и пишет РЕАЛЬНУЮ запись пользователя в jsonl
+ * владельца для обычного content) + ownerCtx со switchSession, мутируемым
+ * в бросающий ПОСЛЕ взвода флага (commandCtx = ownerCtx — ссылка общая).
+ */
+function makeReviveMockPi(ownerFile: string): {
+  pi: unknown;
+  handlers: Map<string, SessionHandler[]>;
+  commands: Map<string, CommandHandler>;
+  sends: Array<{ content: unknown; opts: unknown }>;
+  switchCalls: string[];
+} {
+  const handlers = new Map<string, SessionHandler[]>();
+  const commands = new Map<string, CommandHandler>();
+  const sends: Array<{ content: unknown; opts: unknown }> = [];
+  const busSubs = new Map<string, Array<(d: unknown) => void>>();
+  const switchCalls: string[] = [];
+
+  // Свежий командный ctx с РАБОЧИМ switchSession (как ownerCtx в
+  // testSwitchToOwnerDeliversToOwnerConversation): вызов switchSession(key)
+  // перезапускает session_start (incoming === ownerKey → НЕ blocked) и
+  // возвращает { cancelled: false }.
+  const freshCtx: Record<string, unknown> = {
+    ...(makeCtx(ownerFile) as Record<string, unknown>),
+    switchSession: async (path: string) => {
+      switchCalls.push(path);
+      await handlerOf(handlers, "session_start")({}, freshCtx);
+      return { cancelled: false };
+    },
+  };
+
+  const pi = {
+    events: {
+      emit: (_ch: string, _data: unknown) => {},
+      on: (ch: string, h: (d: unknown) => void) => {
+        const arr = busSubs.get(ch) ?? [];
+        arr.push(h);
+        busSubs.set(ch, arr);
+        return () => {
+          const i = arr.indexOf(h);
+          if (i >= 0) arr.splice(i, 1);
+        };
+      },
+    },
+    on: (ev: string, h: SessionHandler) => {
+      const arr = handlers.get(ev) ?? [];
+      arr.push(h);
+      handlers.set(ev, arr);
+    },
+    registerCommand: (name: string, spec: { handler: CommandHandler }) => {
+      commands.set(name, spec.handler);
+    },
+    sendUserMessage: async (content: unknown, opts?: unknown) => {
+      sends.push({ content, opts });
+      const c = typeof content === "string" ? content : String(content);
+      // Командный вызов: "/..." при expandPromptTemplates === true — pi
+      // ИСПОЛНЯЕТ команду как в проде (no turn, no user entry); обёртка
+      // pi.registerCommand фабрики захватит commandCtx = freshCtx.
+      const expand =
+        (opts as { expandPromptTemplates?: boolean } | undefined)
+          ?.expandPromptTemplates === true;
+      if (c.startsWith("/") && expand) {
+        await commandOf(commands, c.slice(1))(c, freshCtx);
+        return undefined;
+      }
+      // Обычный content — реальная запись пользователя в jsonl владельца.
+      const entry = {
+        type: "message",
+        timestamp: new Date().toISOString(),
+        message: {
+          role: "user",
+          content: [{ type: "text", text: c }],
+        },
+      };
+      appendFileSync(ownerFile, JSON.stringify(entry) + "\n", "utf8");
+      return undefined;
+    },
+  };
+  return { pi, handlers, commands, sends, switchCalls };
+}
+
+async function testSwitchReviveViaProgrammaticCommand(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-si-revive-"));
+  const armslogFile = join(tmp, "armslog.log");
+  applyPaths(tmp);
+  setResetGraceMsForTests(50);
+  // РЕАЛЬНАЯ верификация доставки (main() ставит override always-true).
+  setVerifyDeliveredForTests(null);
+  setSwitchWaitForTests(0, 0);
+  resetStaleStateForTests();
+  try {
+    // ===== Сценарий A: commandCtx мёртв + piApi жив → revive =====
+    await seedFreshWindow();
+    const a = makeReviveMockPi(join(tmp, "R_owner.jsonl"));
+    piBillingWindowFactory(a.pi as never);
+
+    const ownerFile = join(tmp, "R_owner.jsonl");
+    const childFile = join(tmp, "R_child.jsonl");
+    const STALE_MSG =
+      "This extension ctx is stale after session replacement or reload.";
+
+    // ownerCtx: командный ctx с РАБОЧИМ switchSession (замыкание на себя).
+    const ownerCtx: Record<string, unknown> = {
+      ...(makeCtx(ownerFile) as Record<string, unknown>),
+      switchSession: async (path: string) => {
+        await handlerOf(a.handlers, "session_start")({}, ownerCtx);
+        return { cancelled: false };
+      },
+    };
+
+    await handlerOf(a.handlers, "session_start")({}, ownerCtx);
+    assert(
+      armsCurrentKey() === ownerFile,
+      "Rv-pre: ключ владельца установлен (session_start владельца)",
+    );
+    await commandOf(a.commands, "cont-after-reset")("", ownerCtx);
+    assert(armsIsArmed(), "Rv-pre: флаг владельца взведён");
+
+    // МУТАЦИЯ: commandCtx (= ownerCtx, тот же объект — ссылка общая) теперь
+    // мёртв: switchSession бросает stale (имитация fork-цепочки).
+    ownerCtx.switchSession = async () => {
+      throw new Error(STALE_MSG);
+    };
+
+    // Чужой session_start (reason=startup, другой ключ) BLOCKED:
+    // lastSessionStartKey уходит на чужой ключ, ownerKey не меняется.
+    await handlerOf(a.handlers, "session_start")(
+      { reason: "startup" },
+      makeCtx(childFile),
+    );
+    assert(
+      armsCurrentKey() === ownerFile,
+      "Rv-A: после blocked чужого session_start ключ остался у владельца",
+    );
+
+    // Новый сброс окна: fire → switch-needed → trySwitchToOwner →
+    // commandCtx мёртв, switchSession БРОСАЕТ stale → fire:switch-failed →
+    // notify (1-й на цепочку) → FALLBACK: piApi жив → программный вызов
+    // /billing-status (команда исполнена, commandCtx = freshCtx с РАБОЧИМ
+    // switchSession) → лог switch-revive:cmd → fall-through → send
+    // «продолжи» → jsonl владельца → verifyDelivered (реальная) →
+    // fire:send-ok.
+    await backdateReset();
+    await __syncWatchdogForTests();
+    await sleep(300);
+
+    const logA = readFileSync(armslogFile, "utf8");
+    assert(
+      logA.includes("fire:switch-failed"),
+      "Rv-A: лог содержит fire:switch-failed (switchSession бросил stale)",
+    );
+    assert(
+      logA.includes("switch-revive:cmd"),
+      "Rv-A: лог содержит switch-revive:cmd (команда исполнена программно)",
+    );
+    assert(
+      a.sends.some((s) => s.content === "/billing-status"),
+      "Rv-A: fallback вызвал программный /billing-status (piApi жив)",
+    );
+    assert(
+      a.sends.some((s) => s.content === "продолжи"),
+      "Rv-A: доставка «продолжи» ушла (fall-through send)",
+    );
+    assert(
+      logA.includes("fire:send-ok"),
+      "Rv-A: лог содержит fire:send-ok",
+    );
+    const ownerJsonlA = readFileSync(ownerFile, "utf8");
+    assert(
+      ownerJsonlA.includes("продолжи"),
+      "Rv-A: jsonl владельца содержит РЕАЛЬНУЮ запись «продолжи» (доставка в разговор владельца)",
+    );
+    assert(
+      !ownerJsonlA.includes("billing-status"),
+      "Rv-A: командный вызов НЕ писал в jsonl владельца (no turn)",
+    );
+
+    // НОВЫЙ сброс: commandCtx = freshCtx (с РАБОЧИМ switchSession) —
+    // switch-путь ВОССТАНАВЛИВАЕТСЯ: switchSession с КЛЮЧОМ владельца →
+    // session_start re-run → доставка → fire:send-ok.
+    await sleep(60); // ownerQuiet: пропустить окно grace после доставки A
+    await backdateReset();
+    await __syncWatchdogForTests();
+    await __retryTickForTests();
+    await sleep(300);
+
+    assert(
+      a.switchCalls.length === 1 && a.switchCalls[0] === ownerFile,
+      "Rv-A2: switchSession (freshCtx) вызван с КЛЮЧОМ владельца — switch-путь восстановился",
+    );
+    const logA2 = readFileSync(armslogFile, "utf8");
+    assert(
+      (logA2.match(/fire:send-ok/g) ?? []).length === 2,
+      "Rv-A2: второй fire:send-ok (повторная цепочка доставила)",
+    );
+    assert(
+      armsCurrentKey() === ownerFile,
+      "Rv-A2: arms-ключ у владельца после успешного switch",
+    );
+    assert(
+      a.sends.filter((s) => s.content === "продолжи").length === 2,
+      "Rv-A2: вторая доставка «продолжи» ушла в владельца",
+    );
+
+    // ===== Сценарий B: commandCtx мёртв + piApi мёртв (probe stale) =====
+    resetStaleStateForTests();
+    await seedFreshWindow();
+    const b = makeReviveMockPi(ownerFile);
+    piBillingWindowFactory(b.pi as never);
+    const logLenBeforeB = readFileSync(armslogFile, "utf8").length;
+
+    const bOwnerCtx: Record<string, unknown> = {
+      ...(makeCtx(ownerFile) as Record<string, unknown>),
+      switchSession: async (path: string) => {
+        await handlerOf(b.handlers, "session_start")({}, bOwnerCtx);
+        return { cancelled: false };
+      },
+    };
+    await handlerOf(b.handlers, "session_start")({}, bOwnerCtx);
+    await commandOf(b.commands, "cont-after-reset")("", bOwnerCtx);
+    assert(armsIsArmed(), "Rv-B-pre: флаг взведён");
+
+    // commandCtx (= bOwnerCtx) мёртв + probe stale (piApi мёртв).
+    bOwnerCtx.switchSession = async () => {
+      throw new Error(STALE_MSG);
+    };
+    await handlerOf(b.handlers, "session_start")(
+      { reason: "startup" },
+      makeCtx(childFile),
+    );
+    setProbePiAliveForTests("stale");
+
+    await sleep(60);
+    await backdateReset();
+    await __syncWatchdogForTests();
+    await __retryTickForTests();
+    await sleep(300);
+
+    // Ассерты B — по ХВОСТУ лога (armslog append-only, A оставил свои
+    // switch-revive:cmd/fire:* строки).
+    const logB = readFileSync(armslogFile, "utf8").slice(logLenBeforeB);
+    assert(
+      !b.sends.some((s) => s.content === "/billing-status"),
+      "Rv-B: программный вызов /billing-status НЕ выполнен (гейт fallback не прошёл при probe stale)",
+    );
+    assert(
+      logB.includes("fire:switch-failed"),
+      "Rv-B: лог содержит fire:switch-failed (stale commandCtx)",
+    );
+    assert(
+      !logB.includes("switch-revive:cmd"),
+      "Rv-B: лог НЕ содержит switch-revive:cmd (piApi мёртв — без вызова)",
+    );
+  } finally {
+    setVerifyDeliveredForTests(() => true);
+    setSwitchWaitForTests(150, 2);
+    setProbePiAliveForTests(null);
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 // --- runner ----------------------------------------------------------------------
 
 function resetStaleStateForTests(): void {
@@ -804,6 +1077,8 @@ async function main(): Promise<void> {
   await testEpochMismatchLetsShiftThrough();
   resetStaleStateForTests();
   await testSwitchToOwnerDeliversToOwnerConversation();
+  resetStaleStateForTests();
+  await testSwitchReviveViaProgrammaticCommand();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

@@ -299,6 +299,35 @@ export async function disarm(now: number = Date.now()): Promise<boolean> {
 }
 
 /**
+ * Spec 010 (T1, F1b): extend the TTL of the conversation's arm WITHOUT
+ * touching repeat/phase/lastFireAt. Used on every window reset (sync-poller
+ * notices state.lastResetAt): an arm that survives a failed delivery chain
+ * must not burn out by TTL before the delivery recovers. Never shortens an
+ * existing longer TTL. No-op when there is no (unexpired) arm for the key.
+ */
+export async function extendArmTtl(
+  key: string | null,
+  ms: number,
+  now: number = Date.now(),
+): Promise<boolean> {
+  if (!key) return false;
+  let extended = false;
+  await withArmsLock(() => {
+    const map = readArmsSync();
+    pruneExpired(map, now);
+    const cur = map[key];
+    if (!cur) return;
+    const nextExpiresAt = Math.max(cur.expiresAt, now + ms);
+    if (nextExpiresAt > cur.expiresAt) {
+      map[key] = { ...cur, expiresAt: nextExpiresAt };
+      writeArmsSync(map);
+      extended = true;
+    }
+  });
+  return extended;
+}
+
+/**
  * Transition the current conversation's arm to "pending": "продолжи" has
  * just been sent. Records lastFireAt, extends expiresAt to cover the
  * confirmation wait (never shrinks an existing longer TTL) and writes the

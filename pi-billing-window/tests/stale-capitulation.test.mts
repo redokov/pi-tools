@@ -482,6 +482,286 @@ async function testSuccessResetsCounter(): Promise<void> {
   }
 }
 
+// --- 4. spec 010 (T1/F1a): капитуляция-пауза в repeat-режиме ------------------
+
+async function testRepeatPauseUntilNextReset(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-reppause-"));
+  applyPaths(tmp);
+  __resetStaleStateForTests();
+  setStaleRetryMsForTests(0);
+  const originalFetch = globalThis.fetch;
+  const fetched: Array<{ url: string; body: unknown; headers: unknown }> = [];
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    fetched.push({
+      url: String(url),
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+      headers: init?.headers,
+    });
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { pi, handlers, commands, sends } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-1.jsonl"));
+    await seedArmedWithPastReset(commands, handlers, ctx);
+
+    // Re-arm with repeat=2: "/cont-after-reset 2" -> args="2". The explicit
+    // numeric argument disarms and re-arms with repeat=2.
+    await commandOf(commands, "cont-after-reset")("2", ctx);
+    assert(
+      armsGetArm()?.repeat === 2,
+      "reppause: флаг перевзведён с repeat=2 (arms.json)",
+    );
+
+    // Make the reset NEWER than lastResetAtAtArm (which the re-arm stamped)
+    // and exactly 60s in the past so the grace delay at fire is ~0
+    // (deterministic; same shape as the existing test 1 seeding).
+    await advanceResetAt(60_000);
+
+    // Attempt 1 (watchdog fire): stale, counter=1.
+    await __fireWatchdogForTests();
+    await sleep(150);
+    assert(sends.length === 1, "reppause: первая попытка отправки была");
+
+    // Attempts 2..6: the flag stays ARMED (all sends fail stale -- no
+    // confirmation, no pending phase), so the armed retry branch needs no
+    // pending gate (same mechanics as the existing test 1).
+    for (let n = 2; n <= 6; n++) {
+      setStaleRetryMsForTests(0); // force pacing open (deterministic)
+      await __retryTickForTests();
+      await sleep(100);
+      assert(
+        sends.length === n,
+        `reppause: попытка ${n} после retry-tick (sends=${sends.length})`,
+      );
+    }
+
+    // Attempt 6 hit STALE_MAX_ATTEMPTS with repeat=2: PAUSE, not capitulate.
+    const pacing = __staleRetryNotBeforeForTests();
+    assert(
+      armsIsArmed(),
+      "reppause: флаг ОСТАЛСЯ armed после 6 попыток (не disarm в repeat-режиме)",
+    );
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      log.includes("capitulation:paused-until-reset"),
+      "reppause: armslog содержит capitulation:paused-until-reset",
+    );
+    assert(
+      !log.includes("capitulation:after-6"),
+      "reppause: armslog НЕ содержит capitulation:after-6 (repeat-режим)",
+    );
+    assert(
+      sends.length === 6,
+      `reppause: ровно 6 попыток — вечный ретрай остановлен (sends=${sends.length})`,
+    );
+    assert(
+      pacing - Date.now() >= 30 * 60_000,
+      `reppause: пейcинг ДАЛЬНИЙ — момент следующего сброса (через ${Math.round((pacing - Date.now()) / 60000)} мин)`,
+    );
+
+    // sendNotify is fire-and-forget: give the fetch a moment to land.
+    await sleep(400);
+    const pauseNotifyCount = fetched.filter(
+      (f) =>
+        f.body !== null &&
+        (f.body as { type?: string }).type ===
+          "billing:cont-after-reset-capitulation" &&
+        (f.body as { title?: string }).title ===
+          "cont-after-reset: пауза до сброса",
+    ).length;
+    assert(
+      pauseNotifyCount === 1,
+      "reppause: notify «пауза до сброса» РОВНО 1",
+    );
+
+    // Attempt AFTER the pause: force pacing open (determinism). The flag
+    // survived the pause (still armed), the chain resumed: the counter is
+    // back at 1/6 (staleAttempts was zeroed by the pause).
+    setStaleRetryMsForTests(0);
+    await __retryTickForTests();
+    await sleep(100);
+    assert(
+      sends.length === 7,
+      `reppause: попытка после паузы состоялась (sends=${sends.length})`,
+    );
+    assert(
+      armsIsArmed(),
+      "reppause: флаг пережил паузу (всё ещё armed)",
+    );
+    const logAfter = readFileSync(join(tmp, "armslog.log"), "utf8");
+    const count16 = logAfter.split("попытка 1/6").length - 1;
+    assert(
+      count16 >= 2,
+      `reppause: счётчик «попытка 1/6» заново после паузы (${count16} раз)`,
+    );
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    globalThis.fetch = originalFetch;
+    __resetStaleStateForTests();
+    cleanupPaths(tmp);
+  }
+}
+
+/** Contrast: repeat=1 (classic one-shot) still capitulates after 6 attempts. */
+async function testRepeatOneShotStillCapitulates(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-repcap-"));
+  applyPaths(tmp);
+  __resetStaleStateForTests();
+  setStaleRetryMsForTests(0);
+  try {
+    const { pi, handlers, commands, sends } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-1.jsonl"));
+    await seedArmedWithPastReset(commands, handlers, ctx);
+    assert(
+      (armsGetArm()?.repeat ?? 1) === 1,
+      "repcap: одноразовый флаг (repeat=1)",
+    );
+
+    await __fireWatchdogForTests(); // attempt 1
+    await sleep(150);
+    for (let n = 2; n <= 6; n++) {
+      setStaleRetryMsForTests(0);
+      await __retryTickForTests();
+      await sleep(80);
+    }
+    assert(
+      sends.length === 6,
+      `repcap: 6 попыток (sends=${sends.length})`,
+    );
+    assert(
+      !armsIsArmed(),
+      "repcap: repeat=1 капитулирует как раньше (disarm)",
+    );
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      log.includes("capitulation:after-6"),
+      "repcap: armslog содержит capitulation:after-6",
+    );
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    __resetStaleStateForTests();
+    cleanupPaths(tmp);
+  }
+}
+
+// --- 5. spec 010 (T3/F4): notify при ПЕРВОМ switch-failed (мёртвый ctx) -------
+
+async function testSwitchFailedDeadCtxNotify(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-swdead-"));
+  applyPaths(tmp);
+  __resetStaleStateForTests();
+  setStaleRetryMsForTests(0);
+  const originalFetch = globalThis.fetch;
+  const fetched: Array<{ url: string; body: unknown; headers: unknown }> = [];
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    fetched.push({
+      url: String(url),
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+      headers: init?.headers,
+    });
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { pi, handlers, commands, sends } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    // commandCtx is captured by the pi.registerCommand wrapper at command
+    // INVOCATION, so the seed's /cont-after-reset call binds it to ctxOwner.
+    const ctxOwner = makeCtx(join(tmp, "sess-owner.jsonl"));
+    await seedArmedWithPastReset(commands, handlers, ctxOwner);
+
+    // Mutate the captured ctx AFTER the command: commandCtx === ctxOwner
+    // (same object) -> switchSession now throws pi's exact stale error.
+    (ctxOwner as { switchSession?: unknown }).switchSession = async () => {
+      throw new Error(
+        "This extension ctx is stale after session replacement or reload.",
+      );
+    };
+
+    // Override the mock's sendUserMessage: the revive fallback (programmatic
+    // /billing-status) must SUCCEED (log switch-revive:cmd) while the
+    // ordinary "продолжи" send keeps failing stale (bounded attempts).
+    (pi as { sendUserMessage: (c: unknown, o?: unknown) => Promise<void> })
+      .sendUserMessage = async (content: unknown, opts?: unknown) => {
+      sends.push({ content, opts });
+      if (content !== "/billing-status") {
+        throw new Error(
+          "This extension ctx is stale after session replacement or reload.",
+        );
+      }
+      return undefined;
+    };
+
+    // Foreign session-start (different file, reason "startup" -> repoint):
+    // lastSessionStartKey is stamped BEFORE the ownerBlocked gate, the gate
+    // blocks the owner shift (arm + live owner interest), so the fire path
+    // sees refs on a foreign session -> switch routing engages.
+    await handlerOf(handlers, "session_start")(
+      { reason: "startup" },
+      makeCtx(join(tmp, "sess-child.jsonl")),
+    );
+
+    // Attempt 1 (watchdog fire): switch-needed -> switchSession throws
+    // stale -> fire:switch-failed -> FIRST notify on the chain + revive.
+    await advanceResetAt(60_000); // unique reset (pending/plan gates)
+    await __fireWatchdogForTests();
+    await sleep(300);
+
+    // Repeat attempts: fire:switch-failed again, but notify NOT repeated.
+    for (let n = 1; n <= 2; n++) {
+      await advanceResetAt(90_000 + n * 1_000); // unique reset per attempt
+      setStaleRetryMsForTests(0);
+      await __retryTickForTests();
+      await sleep(100);
+    }
+
+    // sendNotify is fire-and-forget: give the fetch a moment to land.
+    await sleep(400);
+
+    const deadNotifies = fetched.filter(
+      (f) =>
+        f.body !== null &&
+        (f.body as { type?: string }).type ===
+          "billing:cont-after-reset-capitulation" &&
+        (f.body as { title?: string }).title ===
+          "cont-after-reset: commandCtx мёртв",
+    );
+    assert(
+      deadNotifies.length === 1,
+      `swdead: notify «commandCtx мёртв» РОВНО 1 (получено ${deadNotifies.length})`,
+    );
+    assert(
+      sends.some((s) => s.content === "/billing-status"),
+      "swdead: sends содержит программный вызов /billing-status (fallback)",
+    );
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      log.includes("fire:switch-failed"),
+      "swdead: armslog содержит fire:switch-failed",
+    );
+    assert(
+      log.includes("switch-revive:cmd"),
+      "swdead: armslog содержит switch-revive:cmd (живой piApi)",
+    );
+    assert(
+      armsIsArmed(),
+      "swdead: только 3 stale-попытки — флаг ещё взведён (не капитуляция)",
+    );
+
+    await handlerOf(handlers, "session_shutdown")({}, ctxOwner);
+  } finally {
+    globalThis.fetch = originalFetch;
+    __resetStaleStateForTests();
+    cleanupPaths(tmp);
+  }
+}
+
 // --- runner ----------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -495,6 +775,11 @@ async function main(): Promise<void> {
   await testBoundedRetryAndDisarm();
   await testCapitulationNotify();
   await testSuccessResetsCounter();
+  // Spec 010 (T1/F1a + T3/F4): capitulation pause in repeat mode and the
+  // first switch-failed notify on a dead commandCtx.
+  await testRepeatPauseUntilNextReset();
+  await testRepeatOneShotStillCapitulates();
+  await testSwitchFailedDeadCtxNotify();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

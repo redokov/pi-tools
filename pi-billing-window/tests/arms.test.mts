@@ -20,12 +20,25 @@ import {
   confirmSuccess,
   isArmed,
   getArm,
+  getArmForKey,
+  extendArmTtl,
   resetReadyToFire,
   remapKey,
   ARMS_TTL_MS,
   RESET_GRACE_MS,
   type Arm,
 } from "../src/arms.ts";
+import {
+  setArmsLogPath,
+  __syncWatchdogForTests,
+  __resetStaleStateForTests,
+} from "../src/index.ts";
+import {
+  writeStateSync,
+  setPaths as stateSetPaths,
+  resetPaths as stateResetPaths,
+  type State,
+} from "../src/state.ts";
 
 let tmp: string;
 let pass = 0;
@@ -346,8 +359,246 @@ async function main(): Promise<void> {
     rmSync(tmp, { recursive: true, force: true });
   } catch {}
 
+  // --- spec 010 (T1/F1b): extendArmTtl + sync-poller TTL-продление ----------
+  await testExtendArmTtlUnit();
+  await testSyncPollerTtlExtension();
+
   console.log(`\n==== ${pass} passed, ${fail} failed ====`);
   if (fail > 0) process.exit(1);
+}
+
+// --- spec 010 (T1/F1b): new async test functions -----------------------------
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((r) => setTimeout(r, ms));
+
+/** Read the arm record under `key` straight from the arms.json file. */
+function rawArmAt(file: string, key: string): Arm | null {
+  const map = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, Arm>;
+  return map[key] ?? null;
+}
+
+/** Poll until the record's expiresAt reaches `min`, or the deadline hits. */
+async function waitExpiresAt(
+  file: string,
+  key: string,
+  min: number,
+): Promise<Arm | null> {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const rec = rawArmAt(file, key);
+    if (rec !== null && rec.expiresAt >= min) return rec;
+    if (Date.now() > deadline) return rec;
+    await sleep(25);
+  }
+}
+
+/**
+ * Spec 010 (T1, F1b): extendArmTtl unit -- продлевает expiresAt записи arm,
+ * НИКОГДА не укорачивает, no-op (false) без незаэкспайренной записи под
+ * ключом; repeat/phase/lastFireAt не трогаются.
+ */
+async function testExtendArmTtlUnit(): Promise<void> {
+  console.log("\n--- spec 010 T1/F1b: extendArmTtl (unit) ---");
+  const tmpTtl = mkdtempSync(join(tmpdir(), "billing-ttl-"));
+  const af = join(tmpTtl, "arms.json");
+  setPaths(af, join(tmpTtl, "arms.lock"));
+
+  // Arming epoch slightly in the FUTURE: arms.ts prunes against real
+  // Date.now(), past synthetic times would be pruned as already-expired.
+  const T0 = Date.now() + 60_000;
+
+  // setup: seed arm with repeat=2
+  switchKey("convTtl");
+  const a = await arm(2, T0, 2);
+  assert(a !== null, "extendTtl: arm exists (repeat=2)");
+  const rec0 = rawArmAt(af, "convTtl");
+  assert(
+    rec0 !== null && rec0.expiresAt === T0 + ARMS_TTL_MS,
+    "extendTtl: fresh arm TTL = armedAt + 8h",
+  );
+
+  // fresh arm: extending by the full TTL is a no-op (expiresAt0 is already
+  // max(expiresAt0, now + 8h) -- 60 s ahead of the real clock; never shortens)
+  const r1 = await extendArmTtl("convTtl", ARMS_TTL_MS);
+  assert(r1 === false, "extendTtl: fresh arm -> no-op (false)");
+  const rec1 = rawArmAt(af, "convTtl");
+  assert(
+    rec1 !== null && rec0 !== null && Math.abs(rec1.expiresAt - rec0.expiresAt) < 2000,
+    "extendTtl: fresh arm expiresAt not changed (не укорачивает; < 2 с)",
+  );
+
+  // repeated extend: still false / not changed
+  const r2 = await extendArmTtl("convTtl", ARMS_TTL_MS);
+  assert(r2 === false, "extendTtl: repeated extend on fresh arm -> false");
+  const rec2 = rawArmAt(af, "convTtl");
+  assert(
+    rec2 !== null && rec1 !== null && rec2.expiresAt === rec1.expiresAt,
+    "extendTtl: repeated extend does not change expiresAt",
+  );
+
+  // backdate expiresAt to now + 1h (write arms.json directly), then extend:
+  // expiresAt must become now + 8h; repeat/phase/lastFireAt untouched.
+  const beforeExtend = rawArmAt(af, "convTtl");
+  const rawMap: Record<string, Arm> = JSON.parse(fs.readFileSync(af, "utf8"));
+  rawMap["convTtl"] = {
+    armedAt: beforeExtend?.armedAt ?? 0,
+    lastResetAtAtArm: 2,
+    expiresAt: Date.now() + 60 * 60 * 1000, // only 1h left
+    repeat: 2,
+  };
+  fs.writeFileSync(af, JSON.stringify(rawMap, null, 2), "utf8");
+  const r3 = await extendArmTtl("convTtl", ARMS_TTL_MS);
+  assert(r3 === true, "extendTtl: backdated arm -> true (продлён)");
+  const rec3 = rawArmAt(af, "convTtl");
+  const realNow = Date.now();
+  assert(
+    rec3 !== null &&
+      rec3.expiresAt >= realNow + ARMS_TTL_MS - 2000 &&
+      rec3.expiresAt <= realNow + ARMS_TTL_MS + 2000,
+    "extendTtl: expiresAt = now + 8h after backdated extend",
+  );
+  assert(rec3 !== null && rec3.repeat === 2, "extendTtl: repeat unchanged (2)");
+  assert(
+    rec3 !== null && rec3.phase === undefined,
+    "extendTtl: phase unchanged (armed, без phase-поля)",
+  );
+  assert(
+    rec3 !== null && rec3.lastFireAt === undefined,
+    "extendTtl: lastFireAt unchanged (undefined)",
+  );
+
+  // null key -> false
+  assert(
+    (await extendArmTtl(null, ARMS_TTL_MS)) === false,
+    "extendTtl: null key -> false",
+  );
+  // unknown key -> false
+  assert(
+    (await extendArmTtl("нет-такой-ключ", ARMS_TTL_MS)) === false,
+    "extendTtl: unknown key -> false",
+  );
+
+  // expired record (expiresAt in the past) -> false (no-op, prune)
+  rawMap["convExpired"] = {
+    armedAt: T0,
+    lastResetAtAtArm: 1,
+    expiresAt: Date.now() - 1000, // already expired
+  };
+  fs.writeFileSync(af, JSON.stringify(rawMap, null, 2), "utf8");
+  assert(
+    (await extendArmTtl("convExpired", ARMS_TTL_MS)) === false,
+    "extendTtl: expired record -> false (no-op, prune)",
+  );
+  assert(
+    getArmForKey("convExpired", Date.now()) === null,
+    "extendTtl: expired record pruned after extend call",
+  );
+
+  resetPaths();
+  try {
+    rmSync(tmpTtl, { recursive: true, force: true });
+  } catch {}
+}
+
+/**
+ * Spec 010 (T2): sync-poller TTL-продление при сбросе окна (miRead-кейс):
+ * флаг переживает ночные неудачные цепочки -- TTL продлевается ОДИН раз на
+ * сброс (lastTtlExtendedReset), новый сброс даёт новое продление, без arm --
+ * тихий no-op.
+ */
+async function testSyncPollerTtlExtension(): Promise<void> {
+  console.log("\n--- spec 010 T2: sync-poller TTL-продление при сбросе ---");
+  const tmpSync = mkdtempSync(join(tmpdir(), "billing-ttl-sync-"));
+  const af = join(tmpSync, "arms.json");
+  const sf = join(tmpSync, "state.json");
+  setPaths(af, join(tmpSync, "arms.lock"));
+  stateSetPaths(sf, join(tmpSync, "state.lock"));
+  setArmsLogPath(join(tmpSync, "armslog.log"));
+  // изоляция module state (lastTtlExtendedReset и др.) + каталог маркеров
+  // firelease в пер-процессный tmp -- планирования fire не пишут в ~/.pi.
+  __resetStaleStateForTests();
+
+  const armNow = Date.now() - 30_000; // backdated arming
+  const expiresAt0 = armNow + ARMS_TTL_MS;
+  const reset1 = Date.now() - 60_000; // свежий сброс
+  switchKey("convSync");
+  // lastResetAtAtArm = reset1: fire-planning branch (st.lastResetAt >
+  // lastResetAtAtArm) не срабатывает -- TTL-продление идёт чисто по
+  // st.lastResetAt > 0.
+  const a = await arm(reset1, armNow, 4);
+  assert(a !== null, "syncTtl: arm exists (repeat=4)");
+  assert(
+    a !== null && a.expiresAt === expiresAt0,
+    "syncTtl: fresh TTL = armedAt + 8h",
+  );
+
+  const st1: State = {
+    provider: "mock",
+    windowStartedAt: Date.now(),
+    windowMs: 2 * 60 * 60 * 1000,
+    lastResetAt: reset1,
+    resetCount: 1,
+    callsInWindow: 0,
+  };
+  writeStateSync(st1);
+
+  // первый sync-тик -> TTL-продление (void'ed async внутри хука -- ждём)
+  __syncWatchdogForTests();
+  const rec1 = await waitExpiresAt(af, "convSync", Date.now() + ARMS_TTL_MS - 2000);
+  assert(
+    rec1 !== null && rec1.expiresAt > expiresAt0,
+    "syncTtl: первый сброс продлевает TTL (продлён, miRead-кейс)",
+  );
+  assert(
+    rec1 !== null && rec1.expiresAt >= Date.now() + ARMS_TTL_MS - 2000,
+    "syncTtl: expiresAt ≈ now + 8ч после продления",
+  );
+  const e1 = rec1?.expiresAt ?? 0;
+
+  // повторный sync-тик: продление ОДИН раз на сброс (expiresAt не меняется)
+  __syncWatchdogForTests();
+  const rec2 = rawArmAt(af, "convSync");
+  assert(
+    rec2 !== null && rec2.expiresAt === e1,
+    "syncTtl: повторный sync -- продление один раз на сброс (expiresAt неизменен)",
+  );
+
+  // новый сброс (уникальное значение lastResetAt) -> продление снова
+  const reset2 = Date.now() - 30_000;
+  writeStateSync({ ...st1, lastResetAt: reset2 });
+  __syncWatchdogForTests();
+  const rec3 = await waitExpiresAt(af, "convSync", e1 + 1);
+  assert(
+    rec3 !== null && rec3.expiresAt > e1,
+    "syncTtl: новый сброс продлевает TTL снова (от нового now)",
+  );
+
+  // БЕЗ arm (arms.json пуст) -> __syncWatchdogForTests() не бросает
+  assert((await disarm()) === true, "syncTtl: disarm removes the arm");
+  const emptyMap = JSON.parse(fs.readFileSync(af, "utf8")) as Record<string, Arm>;
+  assert(
+    Object.keys(emptyMap).length === 0,
+    "syncTtl: arms.json пуст после disarm",
+  );
+  __syncWatchdogForTests();
+  const emptyMap2 = JSON.parse(fs.readFileSync(af, "utf8")) as Record<string, Arm>;
+  assert(
+    Object.keys(emptyMap2).length === 0,
+    "syncTtl: sync без arm -- записей нет (тихий no-op)",
+  );
+
+  // cleanup: state file must be gone so the sync clears the armed watchdog
+  // timer (otherwise the process would hang until the 2h boundary).
+  try {
+    rmSync(sf, { force: true });
+  } catch {}
+  __syncWatchdogForTests();
+  stateResetPaths();
+  resetPaths();
+  try {
+    rmSync(tmpSync, { recursive: true, force: true });
+  } catch {}
 }
 
 void main();
