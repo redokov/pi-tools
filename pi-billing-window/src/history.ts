@@ -155,7 +155,12 @@ function buildRow(row: HistoryRow, now: number): string {
 async function withHistoryLock<T>(fn: () => T): Promise<T> {
   fs.mkdirSync(path.dirname(historyLock), { recursive: true });
   if (!fs.existsSync(historyLock)) fs.writeFileSync(historyLock, "{}", "utf8");
-  await lockfile.lock(historyLock, { retries: 8 });
+  // Retry budget: see arms.ts / state.ts -- tight factor-1 budget so a
+  // same-process contention (appendHistory vs trim from one tick) resolves
+  // within one ~100 ms step instead of a ~1s+ default backoff.
+  await lockfile.lock(historyLock, {
+    retries: { retries: 20, factor: 1, minTimeout: 100, maxTimeout: 200 },
+  });
   try {
     return fn();
   } finally {

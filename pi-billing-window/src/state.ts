@@ -70,15 +70,15 @@ export async function withLock<T>(
 ): Promise<T> {
   const dir = path.dirname(lockFile);
   fs.mkdirSync(dir, { recursive: true });
-  // NOTE: do NOT pre-create a marker FILE at lockFile -- proper-lockfile
-  // creates the lock DIRECTORY at that path, and an existing FILE makes
-  // mkdir fail with EEXIST, which proper-lockfile reads as "lock held" ->
-  // ELOCKED even when nobody actually holds the lock (the incident of
-  // 2026-10-01: checkAndReset failed ELOCKED while the marker file sat
-  // untouched since 2026-08-27).
-  // proper-lockfile retries: 8 was too few under contention (two windows
-  // firing at the same window boundary) -- the lock was held longer than
-  // the retry budget, so the lock call threw instead of waiting.
+  // proper-lockfile canonicalizes the given path with fs.realpath() BEFORE
+  // creating the lock DIRECTORY at `<lockFile>.lock`; a path that does not
+  // exist yet fails realpath with ENOENT (the dev-suite regression after
+  // the ELOCKED fix removed the pre-creation). Pre-create a marker FILE at
+  // lockFile itself -- exactly the proven arms.ts/history.ts pattern. The
+  // marker never collides with the lock dir (`<lockFile>.lock`), so the
+  // 2026-10-01 ELOCKED incident was NOT caused by this marker; its real fix
+  // is the retry budget below.
+  if (!fs.existsSync(lockFile)) fs.writeFileSync(lockFile, "{}", "utf8");
   try {
     await lockfile.lock(lockFile, {
       retries: { retries: 20, factor: 1, minTimeout: 100, maxTimeout: 200 },

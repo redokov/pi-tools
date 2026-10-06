@@ -144,7 +144,16 @@ function writeArmsSync(map: ArmMap): void {
 async function withArmsLock<T>(fn: () => Promise<T> | T): Promise<T> {
   fs.mkdirSync(path.dirname(armsLock), { recursive: true });
   if (!fs.existsSync(armsLock)) fs.writeFileSync(armsLock, "{}", "utf8");
-  await lockfile.lock(armsLock, { retries: 8 });
+  // Retry budget: same as state.ts (the 2026-10-01 ELOCKED fix) -- the
+  // proper-lockfile default backoff (retries: 8, ~1s+ first step) makes a
+  // benign same-process contention (markFired vs extendArmTtl from one
+  // sync tick) wait a full retry step; the fire:send-ok log line then lands
+  // AFTER the delivery round effectively completed, and e2e asserts reading
+  // the log within ~250 ms miss it (watchdog.e2e "probe→live" RED). Tight
+  // factor-1 budget resolves contention within one ~100 ms step.
+  await lockfile.lock(armsLock, {
+    retries: { retries: 20, factor: 1, minTimeout: 100, maxTimeout: 200 },
+  });
   try {
     return await fn();
   } finally {

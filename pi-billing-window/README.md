@@ -279,15 +279,23 @@ New-Item -ItemType SymbolicLink `
   blocked-пути session_start всё равно перезапускает ticker/sync-poller
   (лог `replacement:adopted` при реальной смене ссылок из event/ctx) и
   сбрасывает stale-счётчики — чистый лист после fork-цепочки;
-- **switch-маршрутизация доставки к владельцу** (spec 009): fire-путь
+- **switch-маршрутизация доставки к владельцу** (spec 009, 011): fire-путь
   сравнивает ключ сессии, для которой стартовал текущий runtime
   (`lastSessionStartKey`), с ключом владельца; при расхождении — лог
   `fire:switch-needed` и переключение активной сессии на владельца через
-  командный ctx (`switchSession`, max 1 попытка на сброс —
+  командный ctx (`switchSession`, max 1 УСПЕШНЫЙ switch на сброс —
   `switchRoutedForReset`): switchSession поднимает полный `session_start`
   владельца синхронно, после чего `piApi` перечитывается свежим и доставка
   «продолжи» идёт в разговор владельца; верификация по ключу владельца
   (spec 007) остаётся гейтом — `fire:send-ok`/`fire:confirmed`;
+  **switch-gating** (spec 011 D2): при НЕПРОШЕДШЕМ switch раунд
+  блокируется — «продолжи» не отправляется ВООБЩЕ (лог
+  `fire:switch-blocked`, без fall-through — misroute-отправка в чужую
+  сессию невозможна; инцидент 19:17 2026-10-05 закрыт), доставка ждёт
+  следующего retry-тика; после успешного программного revive
+  (`switch-revive:cmd`, spec 010) — один мгновенный повтор switch в том же
+  раунде (`fire:switch-retry-ok`/`fire:switch-retry-failed`), доставка
+  не ждёт 5-минутного retry-тика;
 - **один fire на один сброс окна** (spec 002): тики sync-poller'а (60 с)
   не перепланируют уже спланированный fire — нет цикла
   «fire:reset-ready» каждые 60 с; новый сброс снова разрешает fire
@@ -301,6 +309,18 @@ New-Item -ItemType SymbolicLink `
   (5 мин → 60 мин); после 6 неудач флаг снимается, в armslog пишется
   `capitulation:after-6`, а через `notifier.ts` уходит уведомление
   (`billing:cont-after-reset-capitulation`);
+- **arm-gone не молчит** (spec 011 D1): флаг, сгоревший БЕЗ нашего
+  участия — repeat исчерпан (в т.ч. другим процессом, reason
+  `repeat-exhausted`), TTL истёк (`ttl-expired`) или запись удалена из
+  arms.json внешне — сопровождается уведомлением
+  `billing:cont-after-reset-arm-gone` с подсказкой взвести снова; ручное
+  снятие (`/cont-after-reset off`), капитуляция и исчерпание подтверждением
+  уведомлениями не дублируются (маркер само-снятия);
+- **бюджет автопродолжений виден** (spec 011 D3): при каждом
+  `fire:confirmed` уходит уведомление
+  `billing:cont-after-reset-confirmed` — «осталось автопродолжений: N»,
+  а при N=0 — «исчерпаны, взведите снова: /cont-after-reset N»: пользователь
+  видит бюджет до того, как флаг сгорит (инцидент 23:35 2026-10-05 закрыт);
 - внешний poller 10 с удалён; его роль подхватил медленный sync-poller
   (60 с), который лишь замечает внешние записи в arms.json (ночной
   helper-скрипт) и пересинхронизирует watchdog — сам он ничего не шлёт;

@@ -31,6 +31,21 @@ export type NotifyPayload = {
   title: string;
   body: string;
   timestamp: number;
+} | {
+  /** Spec 011 (D1): cont-after-reset arm vanished/expired without our own
+   *  action (repeat-exhausted cross-process, TTL expiry, external edit). */
+  type: "billing:cont-after-reset-arm-gone";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
+} | {
+  /** Spec 011 (D3): delivery confirmed, budget of remaining auto-continuations. */
+  type: "billing:cont-after-reset-confirmed";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
 };
 
 export type NotifyOptions = {

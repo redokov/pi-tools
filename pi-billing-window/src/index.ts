@@ -606,6 +606,10 @@ export function __resetStaleStateForTests(): void {
   // not leak into each other.
   currentCtx = null;
   lastArmSeenKey = null;
+  // Spec 011 (D1): снимок последней живой записи и маркер само-снятия —
+  // в общую изоляцию сценариев (кейсы одного процесса не наследуют их).
+  lastArmSeen = null;
+  selfArmGoneKind = null;
   // Diagnostic follow-up (spec 010 T5): car's fireContinue hung inside
   // await armsMarkFired() (withArmsLock racing the spec-010 TTL extension),
   // leaving watchdogEvalInFlight=true -- every later runGuarded call in the
@@ -683,6 +687,18 @@ export function __retryTickForTests(): Promise<void> {
  * "arm-gone" only on the transition, not on every sync tick.
  */
 let lastArmSeenKey: string | null = null;
+
+// Spec 011 (D1): снимок последней живой записи флага (обновляется на каждом
+// sync-тике при живом arm) — по нему arm-gone-переход определяет причину
+// сгорания (ttl-expired / repeat-exhausted) для уведомления пользователю.
+let lastArmSeen: { phase: string; repeat: number; expiresAt: number } | null =
+  null;
+
+// Spec 011 (D1, FR-011-4): маркер «флаг сняли мы сами» — уведомление уже
+// есть (capitulation / confirmed-exhausted) или не нужно (off); гасит
+// arm-gone-notify, чтобы пользователь не получал дубликат.
+let selfArmGoneKind: "off" | "capitulation" | "confirmed-exhausted" | null =
+  null;
 
 // --- firelease helpers (spec 006, D-604) --------------------------------------
 
@@ -1043,7 +1059,63 @@ function syncWatchdog(): void {
     stopGraceTimer();
     if (lastArmSeenKey !== null) {
       lastArmSeenKey = null;
-      armsLog("arm-gone", withAttr("флаг исчез/истёк (sync-poller продолжает жить)"));
+      if (selfArmGoneKind !== null) {
+        // Spec 011 (D1, FR-011-4): флаг сняли мы сами (off / capitulation /
+        // confirmed-exhausted) — уведомление уже есть или не нужно: только
+        // лог с атрибутом kind, без notify.
+        armsLog(
+          "arm-gone",
+          withAttr(
+            `флаг исчез/истёк (sync-poller продолжает жить), kind=${selfArmGoneKind}`,
+          ),
+        );
+        selfArmGoneKind = null;
+      } else {
+        // Spec 011 (D1, FR-011-1): флаг сгорел без нашего участия —
+        // определить причину по снимку последней живой записи и уведомить
+        // пользователя (fire-and-forget, как capitulation-notify).
+        const seen = lastArmSeen;
+        let reason: "ttl-expired" | "repeat-exhausted" = "ttl-expired";
+        let bodyText: string;
+        if (seen !== null && Date.now() > seen.expiresAt) {
+          reason = "ttl-expired";
+          bodyText =
+            "срок годности флага (8 ч) истёк — запись удалена из arms.json. Для продолжения взведите снова: /cont-after-reset N";
+        } else if (
+          seen !== null &&
+          seen.phase === "pending" &&
+          seen.repeat <= 1
+        ) {
+          reason = "repeat-exhausted";
+          bodyText =
+            "автопродолжения исчерпаны (последний «продолжи» подтвердился и снял флаг). Для продолжения взведите снова: /cont-after-reset N";
+        } else {
+          // Внешнее удаление записи из arms.json (не нами): канонических
+          // значений reason два — оставляем ttl-expired, текст поясняет
+          // суть (см. D-011-1).
+          reason = "ttl-expired";
+          bodyText =
+            "запись исчезла из arms.json (внешнее изменение). Для продолжения взведите снова: /cont-after-reset N";
+        }
+        armsLog(
+          "arm-gone",
+          withAttr(
+            `флаг исчез/истёк (sync-poller продолжает жить), reason=${reason}`,
+          ),
+        );
+        // Spec 011 (D1): уведомление об исчезновении/истечении флага —
+        // новый type в union NotifyPayload (notifier.ts).
+        void sendNotify({
+          type: "billing:cont-after-reset-arm-gone",
+          provider: PROVIDER,
+          title: "cont-after-reset: флаг сгорел",
+          body: bodyText,
+          timestamp: Date.now(),
+        });
+      }
+      // Spec 011 (D1): снимок сбрасывается вместе с ключом перехода —
+      // повторные тики без флага не считаются новым переходом (no dup).
+      lastArmSeen = null;
     }
     // Spec 006 (D-604): флаг снят (arm-gone) — освобождаем аренду сброса.
     releaseFireForReset(st?.lastResetAt ?? 0);
@@ -1058,6 +1130,14 @@ function syncWatchdog(): void {
       withAttr(`repeat=${arm.repeat ?? 1} phase=${arm.phase ?? "armed"} key=${key?.split(/[\\/]/).pop() ?? "?"}`),
     );
   }
+  // Spec 011 (D1): свежий снимок живой записи на каждом тике — к моменту
+  // перехода arm-gone он отражает последнее известное состояние флага
+  // (phase/repeat/TTL), по нему определяется причина сгорания.
+  lastArmSeen = {
+    phase: arm.phase ?? "armed",
+    repeat: arm.repeat ?? 1,
+    expiresAt: arm.expiresAt,
+  };
 
   if (arm.phase === "pending") {
     clearWatchdog();
@@ -1234,6 +1314,10 @@ type CapitulationCause = "stale" | "misroute";
 
 async function capitulate(cause: CapitulationCause = "stale"): Promise<void> {
   const key = armsGetKey();
+  // Spec 011 (D1, FR-011-4): капитуляция снимает флаг сама — пометить
+  // само-снятие ДО armsDisarm(), чтобы arm-gone-переход не отправил
+  // дублирующее уведомление (capitulation-notify уже уходит ниже).
+  selfArmGoneKind = "capitulation";
   await armsDisarm();
   // Spec 006 (D-604): капитуляция — release-точка аренды сброса.
   releaseFireForReset(readStateSync()?.lastResetAt ?? 0);
@@ -1419,9 +1503,10 @@ async function fireContinue(): Promise<void> {
   // отправка уйдёт в чужой разговор (или упадёт stale). Переключаем активную
   // сессию на владельца через командный ctx (switchSession) — он поднимает
   // session_start владельца синхронно (полный старт, не blocked: incoming
-  // === ownerKey), после чего piApi перечитывается свежим. Max 1 попытка
-  // switch на reset (switchRoutedForReset); неудачная попытка fall-through
-  // к обычной отправке (существующая обработка stale/misroute).
+  // === ownerKey), после чего piApi перечитывается свежим. Max 1 УСПЕШНЫЙ switch на reset
+  // (switchRoutedForReset); неудачная попытка НЕ отправляет ничего
+  // (Spec 011 D2: misroute исключён, повтор на retry-тике), после успешного
+  // revive — один мгновенный повтор switch (Spec 011 TD-011-3).
   const curReset = readStateSync()?.lastResetAt ?? 0;
   if (
     ownerKey !== null &&
@@ -1442,6 +1527,7 @@ async function fireContinue(): Promise<void> {
     // сброса; частоту ограничивает существующий stale-пейcинг
     // (staleRetryNotBefore: 5/10/20/40/60 мин). Неудачный switch НЕ
     // переключает активную сессию — повтор безопасен.
+    let switched = false;
     if (switchRes.ok) {
       switchRoutedForReset = curReset;
       // switchSession завершается ПОСЛЕ session_start-хендлеров владельца,
@@ -1454,11 +1540,12 @@ async function fireContinue(): Promise<void> {
       ) {
         await new Promise((r) => setTimeout(r, switchWaitMs));
       }
+      switched = true;
     } else {
       armsLog(
         "fire:switch-failed",
         withAttr(
-          `switchSession не прошёл (${switchRes.reason}) — fall-through к обычной отправке, повтор switch на следующей попытке`,
+          `switchSession не прошёл (${switchRes.reason}) — повтор switch после revive`,
         ),
       );
       const staleCommandCtx = /stale/i.test(switchRes.reason);
@@ -1478,11 +1565,12 @@ async function fireContinue(): Promise<void> {
       // Spec 010 (T2, F2): программный вызов команды при ЖИВОМ piApi —
       // pi исполняет extension-команду ВМЕСТО отправки (no turn, no user
       // entry) через текущий runtime → обёртка pi.registerCommand захватит
-      // commandCtx = fresh ctx → switch-путь восстановится на следующей
-      // попытке. Гейт: только при stale commandCtx И probePiAlive() ===
-      // "live" И piApiEpoch === sessionEpoch (мёртвый piApi → throws stale
-      // — без вызова). При мёртвом piApi — ничего.
+      // commandCtx = fresh ctx → switch-путь восстановится. Гейт: только
+      // при stale commandCtx И probePiAlive() === "live" И piApiEpoch ===
+      // sessionEpoch (мёртвый piApi → throws stale — без вызова). При
+      // мёртвом piApi — ничего.
       const piRef = piApi;
+      let revived = false;
       if (
         staleCommandCtx &&
         probePiAlive() === "live" &&
@@ -1496,9 +1584,10 @@ async function fireContinue(): Promise<void> {
           armsLog(
             "switch-revive:cmd",
             withAttr(
-              "команда исполнена программно — commandCtx обновится на свежий ctx, switch-путь восстановится на следующей попытке",
+              "команда исполнена программно — commandCtx обновится на свежий ctx, switch-путь восстановится",
             ),
           );
+          revived = true;
         } catch (err) {
           armsLog(
             "switch-revive:failed",
@@ -1506,9 +1595,53 @@ async function fireContinue(): Promise<void> {
           );
         }
       }
+      if (revived) {
+        // Spec 011 (TD-011-3): мгновенный ЕДИНСТВЕННЫЙ повтор switch в том
+        // же раунде — revive синхронно перезахватил commandCtx, повторный
+        // switchSession почти всегда проходит; провал → switch-blocked
+        // (return) — снова через retry-тик.
+        const retryRes = await trySwitchToOwner(ownerKey);
+        if (retryRes.ok) {
+          switchRoutedForReset = curReset;
+          armsLog(
+            "fire:switch-retry-ok",
+            withAttr(
+              "повтор switchSession после revive прошёл — доставка в разговор владельца в этом же раунде",
+            ),
+          );
+          // Тот же wait-loop, что и при первом прохождении switch.
+          for (
+            let round = 0;
+            round < switchWaitRounds && lastSessionStartKey !== ownerKey;
+            round++
+          ) {
+            await new Promise((r) => setTimeout(r, switchWaitMs));
+          }
+          switched = true;
+        } else {
+          armsLog(
+            "fire:switch-retry-failed",
+            withAttr(
+              `switchSession после revive не прошёл (${retryRes.reason}) — «продолжи» не отправляю`,
+            ),
+          );
+        }
+      }
+      if (!switched) {
+        // Spec 011 (D2, FR-011-2): ГЛАВНОЕ — отправка «продолжи» в чужую
+        // сессию невозможна: без прошедшего switch доставка блокируется,
+        // повтор на retry-тике (ensureRetryInterval). switch-blocked НЕ
+        // инкрементирует staleAttempts (ложная капитуляция запрещена).
+        armsLog(
+          "fire:switch-blocked",
+          withAttr(
+            "switch на владельца не прошёл — «продолжи» НЕ отправляю (misroute исключён), повтор на retry-тике",
+          ),
+        );
+        ensureRetryInterval();
+        return;
+      }
     }
-    // Fall-through: const p = piApi ниже перечитывает (возможно свежие)
-    // refs; при неудачном switch существующая обработка stale действует.
   }
 
   const p = piApi;
@@ -2235,6 +2368,26 @@ async function onAfterProviderResponse(
     // freshly re-armed repeat flag starts from a clean slate.
     pendingFiredResetAt = null;
     armsLog("fire:confirmed", withAttr("успешный ответ после «продолжи» — флаг снят/перевзведён"));
+    // Spec 011 (D3, FR-011-3): бюджет автопродолжений — сообщить пользователю
+    // до того, как флаг сгорит. armsGetArm() после confirmSuccess: перевзведённая
+    // запись (repeat-1) либо null (одноразовый флаг снят).
+    const remaining = armsGetArm()?.repeat ?? 0;
+    if (remaining === 0) {
+      // FR-011-4: исчерпание подтверждением — arm-gone-notify (D1) подавляем,
+      // это уведомление уже сообщает пользователю об исчерпании.
+      selfArmGoneKind = "confirmed-exhausted";
+    }
+    void sendNotify({
+      type: "billing:cont-after-reset-confirmed",
+      provider: PROVIDER,
+      title: remaining > 0
+        ? `cont-after-reset: продолжи доставлен (осталось ${remaining})`
+        : "cont-after-reset: продолжи доставлен (автопродолжения исчерпаны)",
+      body: remaining > 0
+        ? `«продолжи» доставлен и подтверждён. Осталось автопродолжений: ${remaining}.`
+        : `«продолжи» доставлен и подтверждён. Автопродолжения исчерпаны — флаг снят. Для продолжения взведите снова: /cont-after-reset N.`,
+      timestamp: Date.now(),
+    });
     // Re-arm the watchdog for the next boundary (repeat>1) or drop it
     // (the one-shot arm was removed by confirmSuccess).
     syncWatchdog();
@@ -2647,6 +2800,10 @@ function registerContAfterReset(pi: ExtensionAPI): void {
         }
 
         if (wantOff) {
+          // Spec 011 (D1, FR-011-4): снятие флага по команде пользователя —
+          // само-снятие: arm-gone-notify не нужен (действие инициировал сам
+          // пользователь, ответ уже есть в ctx.ui.notify).
+          selfArmGoneKind = "off";
           const removed = await armsDisarm();
           // Spec 005: снятие флага снимает и маркер последней отправки.
           pendingFiredResetAt = null;

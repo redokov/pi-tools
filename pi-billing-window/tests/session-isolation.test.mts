@@ -244,7 +244,18 @@ async function testForeignSessionDoesNotHijackOwner(): Promise<void> {
     const childFile = join(tmp, "K_child.jsonl");
     const ownerBase = "K_owner.jsonl";
     const childBase = "K_child.jsonl";
-    const ownerCtx = makeCtx(ownerFile);
+    // Spec 011 (D2): командный ctx несёт РАБОЧИЙ switchSession — после
+    // blocked чужого session_start (lastSessionStartKey уходит на чужой
+    // ключ, ownerKey остаётся у владельца) fire-путь ДОЛЖЕН
+    // маршрутизировать доставку обратно в разговор владельца через
+    // switch (как T2-сценарий), а не fall-through.
+    const ownerCtx = {
+      ...(makeCtx(ownerFile) as Record<string, unknown>),
+      switchSession: async () => {
+        await handlerOf(a.handlers, "session_start")({}, ownerCtx as never);
+        return { cancelled: false };
+      },
+    };
     const childCtx = makeCtx(childFile);
 
     await handlerOf(a.handlers, "session_start")({}, ownerCtx);
@@ -284,7 +295,10 @@ async function testForeignSessionDoesNotHijackOwner(): Promise<void> {
       "(b): запись НЕ появилась под чужим ключом (arm не переехал)",
     );
 
-    // (b) владельческая доставка продолжает работать после чужого session-start.
+    // (b) владельческая доставка продолжает работать после чужого
+    // session-start: switch-needed → switchSession (ownerCtx) →
+    // session_start re-run владельца → send «продолжи» (Spec 011 D2:
+    // доставка ТОЛЬКО в разговор владельца).
     await backdateReset();
     await __syncWatchdogForTests();
     await sleep(200);
@@ -924,11 +938,12 @@ async function testSwitchReviveViaProgrammaticCommand(): Promise<void> {
 
     // Новый сброс окна: fire → switch-needed → trySwitchToOwner →
     // commandCtx мёртв, switchSession БРОСАЕТ stale → fire:switch-failed →
-    // notify (1-й на цепочку) → FALLBACK: piApi жив → программный вызов
+    // notify (1-й на цепочку) → revive: piApi жив → программный вызов
     // /billing-status (команда исполнена, commandCtx = freshCtx с РАБОЧИМ
-    // switchSession) → лог switch-revive:cmd → fall-through → send
-    // «продолжи» → jsonl владельца → verifyDelivered (реальная) →
-    // fire:send-ok.
+    // switchSession) → лог switch-revive:cmd → Spec 011 (TD-011-3):
+    // мгновенный retry switchSession(freshCtx) → session_start владельца
+    // → лог fire:switch-retry-ok → send «продолжи» В ТОМ ЖЕ РАУНДЕ →
+    // jsonl владельца → verifyDelivered (реальная) → fire:send-ok.
     await backdateReset();
     await __syncWatchdogForTests();
     await sleep(300);
@@ -947,8 +962,12 @@ async function testSwitchReviveViaProgrammaticCommand(): Promise<void> {
       "Rv-A: fallback вызвал программный /billing-status (piApi жив)",
     );
     assert(
+      logA.includes("fire:switch-retry-ok"),
+      "Rv-A: лог содержит fire:switch-retry-ok (мгновенный повтор switch после revive прошёл)",
+    );
+    assert(
       a.sends.some((s) => s.content === "продолжи"),
-      "Rv-A: доставка «продолжи» ушла (fall-through send)",
+      "Rv-A: доставка «продолжи» ушла в том же раунде после switch-retry",
     );
     assert(
       logA.includes("fire:send-ok"),
@@ -964,9 +983,9 @@ async function testSwitchReviveViaProgrammaticCommand(): Promise<void> {
       "Rv-A: командный вызов НЕ писал в jsonl владельца (no turn)",
     );
 
-    // НОВЫЙ сброс: commandCtx = freshCtx (с РАБОЧИМ switchSession) —
-    // switch-путь ВОССТАНАВЛИВАЕТСЯ: switchSession с КЛЮЧОМ владельца →
-    // session_start re-run → доставка → fire:send-ok.
+    // НОВЫЙ сброс: после retry-switch раунда A lastSessionStartKey уже
+    // === ownerKey → switch-needed НЕ возникает → прямая доставка без
+    // switchSession (единственный вызов switchCalls был в retry раунда A).
     await sleep(60); // ownerQuiet: пропустить окно grace после доставки A
     await backdateReset();
     await __syncWatchdogForTests();
@@ -975,7 +994,7 @@ async function testSwitchReviveViaProgrammaticCommand(): Promise<void> {
 
     assert(
       a.switchCalls.length === 1 && a.switchCalls[0] === ownerFile,
-      "Rv-A2: switchSession (freshCtx) вызван с КЛЮЧОМ владельца — switch-путь восстановился",
+      "Rv-A2: switchSession вызван ровно один раз — в retry раунда A (во втором сбросе switch не нужен, прямая доставка)",
     );
     const logA2 = readFileSync(armslogFile, "utf8");
     assert(
@@ -1039,6 +1058,16 @@ async function testSwitchReviveViaProgrammaticCommand(): Promise<void> {
     assert(
       !logB.includes("switch-revive:cmd"),
       "Rv-B: лог НЕ содержит switch-revive:cmd (piApi мёртв — без вызова)",
+    );
+    // Spec 011 (D2, FR-011-2): revive не выполнен → switched=false →
+    // fire:switch-blocked + return — «продолжи» НЕ отправлена.
+    assert(
+      logB.includes("fire:switch-blocked"),
+      "Rv-B: лог содержит fire:switch-blocked (switch-gating, D2)",
+    );
+    assert(
+      !b.sends.some((s) => s.content === "продолжи"),
+      "Rv-B: «продолжи» НЕ отправлена (switch-gating, D2)",
     );
   } finally {
     setVerifyDeliveredForTests(() => true);
