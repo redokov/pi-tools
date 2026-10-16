@@ -910,6 +910,214 @@ async function testFullCycleViaSwitchPath(): Promise<void> {
   }
 }
 
+/**
+ * Spec 012 (T1): pi инвалидирует командный ctx САМ ФАКТОМ успешного
+ * switchSession ("Do not use a captured pi or command ctx after
+ * ctx.switchSession()"). Наш switch-путь обязан захватывать свежий ctx из
+ * withSession-callback — иначе СЛЕДУЮЩИЙ fire-раунд с тем же мёртвым ctx
+ * упрётся в stale даже при живом runtime (инцидент pi-remote 2026-10-15).
+ *
+ * Модель: первый switch проходит через исходный ownerCtx и «умерщвляет»
+ * его (мок, как делает pi); withSession присылает свежий ctx. Второй
+ * цикл (repeat-режим) снова попадает в switch-путь — switch #2 обязан пройти
+ * через withSession-captured ctx, а не через мёртвый ownerCtx.
+ */
+async function testSwitchWithSessionCapture(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-wsession-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(50);
+  try {
+    setSwitchWaitForTests(0, 0);
+    __resetStaleStateForTests();
+    seedFreshWindow();
+    const a = makeMockPi();
+    piBillingWindowFactory(a.pi as never);
+
+    const ownerFile = join(tmp, "W_owner.jsonl");
+    const childFile = join(tmp, "W_child.jsonl");
+
+    const ownerStarts = join(tmp, "owner-starts.txt");
+    const freshSwitchCalls: string[] = [];
+
+    // Свежий ctx, который pi присылает в withSession после замены.
+    const freshCtx: Record<string, unknown> = {
+      ...(makeCtx(ownerFile) as Record<string, unknown>),
+      switchSession: async (path: string) => {
+        freshSwitchCalls.push(path);
+        await handlerOf(a.handlers, "session_start")({}, freshCtx);
+        return { cancelled: false };
+      },
+    };
+
+    // ownerCtx умирает после первого успешного switch (как делает pi).
+    let ownerCtxDead = false;
+    const ownerCtx: Record<string, unknown> = {
+      ...(makeCtx(ownerFile) as Record<string, unknown>),
+      switchSession: async (
+        _path: string,
+        options?: { withSession?: (ctx: unknown) => Promise<void> },
+      ) => {
+        if (ownerCtxDead) {
+          throw new Error(
+            "This extension ctx is stale after session replacement or reload.",
+          );
+        }
+        ownerCtxDead = true;
+        await options?.withSession?.(freshCtx);
+        await handlerOf(a.handlers, "session_start")({}, freshCtx);
+        return { cancelled: false };
+      },
+    };
+
+    await handlerOf(a.handlers, "session_start")({}, ownerCtx);
+    await commandOf(a.commands, "cont-after-reset")("2", ownerCtx);
+    assert(
+      armsIsArmed() && (armsGetArm()?.repeat ?? 0) === 2,
+      "wsession: флаг взведён с repeat=2",
+    );
+
+    // Цикл 1: child-сессия → switch #1 через ownerCtx → «продолжи» #1.
+    await handlerOf(a.handlers, "session_start")(
+      { reason: "startup" },
+      makeCtx(childFile),
+    );
+    await expireWindow();
+    await __syncWatchdogForTests();
+    await sleep(400);
+    assert(
+      a.sends.filter((s) => s.content === "продолжи").length === 1,
+      "wsession: «продолжи» #1 доставлен после switch #1",
+    );
+
+    // Confirm #1: repeat-режим перевзводит (2 → 1).
+    await handlerOf(a.handlers, "after_provider_response")(
+      { status: 200, headers: {} },
+      ownerCtx,
+    );
+    await sleep(200);
+    assert(
+      armsIsArmed() && (armsGetArm()?.repeat ?? 0) === 1,
+      "wsession: после confirm #1 флаг перевзведён (repeat 2→1)",
+    );
+
+    // Цикл 2: снова refs на child → нужен switch #2. ownerCtx мёртв,
+    // сработать должен withSession-captured ctx. Новый сброс через
+    // advanceResetAt (expireWindow упрётся в 10-мин дедуп checkAndReset).
+    await handlerOf(a.handlers, "session_start")(
+      { reason: "startup" },
+      makeCtx(childFile),
+    );
+    await advanceResetAt(0);
+    await __syncWatchdogForTests();
+    await sleep(400);
+    assert(
+      a.sends.filter((s) => s.content === "продолжи").length === 2,
+      "wsession: «продолжи» #2 доставлен через withSession-captured ctx (не через мёртвый ownerCtx)",
+    );
+    assert(
+      freshSwitchCalls.length === 1 && freshSwitchCalls[0] === ownerFile,
+      "wsession: switch #2 прошёл через свежий ctx из withSession",
+    );
+    const wlog = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      !wlog.includes("fire:switch-blocked"),
+      "wsession: switch-путь не блокировался",
+    );
+
+    void ownerStarts;
+    await handlerOf(a.handlers, "session_shutdown")({}, ownerCtx);
+  } finally {
+    setSwitchWaitForTests(150, 2);
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    cleanupPaths(tmp);
+  }
+}
+
+/**
+ * Spec 012 (T2): неудачный switch-раунд пейсингуется — следующий sync-тик
+ * (грейс с delay=0) НЕ гоняет switch-попытки каждую минуту (инцидент
+ * pi-remote: ~50 тройных кругов fire:switch-* за ночь).
+ */
+async function testSwitchBlockedPacing(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-lc-switchpaced-"));
+  applyPaths(tmp);
+  setResetGraceMsForTests(50);
+  try {
+    setSwitchWaitForTests(0, 0);
+    __resetStaleStateForTests();
+    seedFreshWindow();
+    const a = makeMockPi();
+    piBillingWindowFactory(a.pi as never);
+
+    const ownerFile = join(tmp, "P_owner.jsonl");
+    const childFile = join(tmp, "P_child.jsonl");
+    let switchCalls = 0;
+
+    // commandCtx умирает сразу — как после длинной fork-цепочки.
+    const ownerCtx: Record<string, unknown> = {
+      ...(makeCtx(ownerFile) as Record<string, unknown>),
+      switchSession: async () => {
+        switchCalls++;
+        throw new Error(
+          "This extension ctx is stale after session replacement or reload.",
+        );
+      },
+    };
+
+    await handlerOf(a.handlers, "session_start")({}, ownerCtx);
+    await commandOf(a.commands, "cont-after-reset")("5", ownerCtx);
+    assert(armsIsArmed(), "switch-paced: флаг взведён");
+    await handlerOf(a.handlers, "session_start")(
+      { reason: "startup" },
+      makeCtx(childFile),
+    );
+
+    // Первый fire: switch-failed → revive («/billing-status») → retry
+    // switch тоже fail → switch-blocked (попытки 1 и 2).
+    await expireWindow();
+    await __syncWatchdogForTests();
+    await sleep(400);
+    assert(
+      switchCalls === 2,
+      `switch-paced: switch-попыток ровно 2 (первая + retry после revive), получено ${switchCalls}`,
+    );
+
+    // Повторные гонки (sync-тик + grace с delay=0): пейсинг обязан
+    // пресечь повтор до истечения backoff (5 мин).
+    await __syncWatchdogForTests();
+    await __retryTickForTests();
+    await sleep(200);
+    assert(
+      switchCalls === 2,
+      "switch-paced: switch НЕ ретраится до истечения backoff",
+    );
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(
+      log.includes("fire:switch-blocked"),
+      "switch-paced: fire:switch-blocked записан",
+    );
+    const blockedCount = log.split("fire:switch-blocked").length - 1;
+    assert(
+      blockedCount === 1,
+      `switch-paced: ровно один fire:switch-blocked (получено ${blockedCount})`,
+    );
+    assert(
+      log.includes("повтор через"),
+      "switch-paced: лог сообщает интервал повтора",
+    );
+    assert(
+      armsIsArmed(),
+      "switch-paced: флаг жив после неудачной switch-цепочки (не капитуляция)",
+    );
+
+    await handlerOf(a.handlers, "session_shutdown")({}, ownerCtx);
+  } finally {
+    setSwitchWaitForTests(150, 2);
+    setResetGraceMsForTests(RESET_GRACE_MS);
+    cleanupPaths(tmp);
+  }
+}
+
 // --- runner -------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -928,6 +1136,8 @@ async function main(): Promise<void> {
   await testContAfterResetArgParsing();
   await testRepeatRearmAcrossResets();
   await testFullCycleViaSwitchPath();
+  await testSwitchWithSessionCapture();
+  await testSwitchBlockedPacing();
 
   console.log("\n========================================");
   for (const r of results) console.log(r);

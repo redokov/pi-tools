@@ -384,6 +384,19 @@ let switchRoutedForReset: number | null = null;
 let lastTtlExtendedReset = 0;
 
 /**
+ * Spec 012 (инцидент pi-remote 2026-10-15, ночная цепочка 02:04→02:57Z):
+ * pacing неудачных switch-попыток. Неудачный switchSession НЕ пейсинговался
+ * вообще — каждый 60-с sync-тик через ensureGraceTimer (delay=0) заново
+ * гонял fire:switch-needed → fire:switch-failed → fire:switch-blocked
+ * (~50 тройных кругов за ночь). Теперь неудачная попытка ставит
+ * switchRetryNotBefore = now + staleBackoffMs(switchAttempts) (5→60 мин,
+ * тот же график, что у stale-доставки), успех switch и переход
+ * stale→live сбрасывают счётчик.
+ */
+let switchAttempts = 0;
+let switchRetryNotBefore = 0;
+
+/**
  * Spec 010 (T3, F4): notify «commandCtx мёртв — вызови команду» отправлен
  * ОДИН раз на цепочку (сбрасывается при успешной доставке и в
  * __resetStaleStateForTests) — не спамить на каждую попытку.
@@ -590,6 +603,9 @@ export function __resetStaleStateForTests(): void {
   lastSessionStartKey = null;
   switchRoutedForReset = null;
   commandCtx = null;
+  // Spec 012 (T2): pacing неудачных switch-попыток — тоже в изоляцию
+  // сценариев.
+  resetSwitchPacing();
   // Spec 010 (T1/T3): TTL-маркер сброса и notify-флаг цепочки — тоже в
   // изоляцию (сценарии одного процесса не должны наследовать друг друга).
   lastTtlExtendedReset = 0;
@@ -1043,6 +1059,9 @@ function syncWatchdog(): void {
   ) {
     staleAttempts = 0;
     staleRetryNotBefore = 0;
+    // Spec 012 (T2): оживание ссылок — чистый лист и для switch-pacing:
+    // доставка не ждёт остатка backoff-а.
+    resetSwitchPacing();
     ensureRetryInterval();
     void runGuarded(fireContinue);
   }
@@ -1428,6 +1447,16 @@ async function pauseChainUntilNextReset(): Promise<void> {
  * first successful provider response confirms it (confirmSuccess).
  */
 /**
+ * Spec 012: сброс pacing-состояния switch-пути (успешный switch, переход
+ * stale→live, session_start владельца). Доставка начинается с чистого
+ * листа, как D-204 делает для stale-доставки.
+ */
+function resetSwitchPacing(): void {
+  switchAttempts = 0;
+  switchRetryNotBefore = 0;
+}
+
+/**
  * Spec 009 (T2): переключить АКТИВНУЮ сессию окна на разговор владельца
  * ТОЛЬКО через командный ctx-механизм. Командный ctx (захвачен обёрткой
  * pi.registerCommand) несёт switchSession, который маршрутизируется через
@@ -1438,6 +1467,13 @@ async function pauseChainUntilNextReset(): Promise<void> {
  * fork-цепочки (захвачен при /cont-after-reset до цепочки) — switchSession
  * бросает stale; причина отказа возвращается вызывающему для лога
  * fire:switch-failed (диагностика) и для решения о повторной попытке.
+ * Spec 012 (T1): с успешной заменой pi инвалидирует и САМ вызывающий командный
+ * ctx ("Do not use a captured pi or command ctx after ctx.switchSession()") —
+ * пост-replacement работу pi предписывает вести в withSession-callback,
+ * который получает свежий command-capable ctx. Захватываем его в commandCtx,
+ * чтобы СЛЕДУЮЩИЙ fire-раунд не упирался в мёртвый switch-путь после нашего
+ * же успешного switch (инцидент pi-remote: успешный switch в 09:00Z оставлял
+ * мёртвый commandCtx до следующей ручной команды в окне).
  */
 async function trySwitchToOwner(
   key: string,
@@ -1445,6 +1481,9 @@ async function trySwitchToOwner(
   const ctx = commandCtx as unknown as {
     switchSession?: (
       sessionPath: string,
+      options?: {
+        withSession?: (replacedCtx: ExtensionCommandContext) => Promise<void>;
+      },
     ) => Promise<{ cancelled: boolean }>;
   } | null;
   if (ctx === null || typeof ctx.switchSession !== "function") {
@@ -1454,7 +1493,15 @@ async function trySwitchToOwner(
     };
   }
   try {
-    const res = await ctx.switchSession(key);
+    const res = await ctx.switchSession(key, {
+      withSession: async (replacedCtx) => {
+        // Свежий ReplacedSessionContext — command-capable и жив: pi
+        // валидирует его методы ровно как у обычного командного ctx.
+        commandCtx = replacedCtx;
+        switchFailedNotified = false;
+        resetSwitchPacing();
+      },
+    });
     if (res?.cancelled === false) return { ok: true, reason: "switched" };
     return { ok: false, reason: `cancelled=${String(res?.cancelled)}` };
   } catch (err) {
@@ -1514,6 +1561,17 @@ async function fireContinue(): Promise<void> {
     lastSessionStartKey !== ownerKey &&
     switchRoutedForReset !== curReset
   ) {
+    // Spec 012 (T2): paced retry после неудачного switch-пути — как
+    // D-204 делает для stale-доставки. Неудачный switch НЕ пейсинговался
+    // вообще: каждый 60-с sync-тик через ensureGraceTimer (delay=0)
+    // заново гонял switch-раунд (инцидент pi-remote: ~50 тройных кругов
+    // fire:switch-* за ночь). Молча ждём — нарушать silence ради спама
+    // нечего, доставка возобновится сама по backoff-у или при
+    // stale→live переходе в syncWatchdog.
+    if (Date.now() < switchRetryNotBefore) {
+      ensureRetryInterval();
+      return;
+    }
     armsLog(
       "fire:switch-needed",
       withAttr(
@@ -1530,6 +1588,9 @@ async function fireContinue(): Promise<void> {
     let switched = false;
     if (switchRes.ok) {
       switchRoutedForReset = curReset;
+      // Spec 012 (T2): успешный switch — чистый лист pacing-а (withSession-
+      // callback тоже это делает, но он опционален со стороны pi).
+      resetSwitchPacing();
       // switchSession завершается ПОСЛЕ session_start-хендлеров владельца,
       // так что lastSessionStartKey уже равен ownerKey — ожидание
       // belt-and-suspenders (bounded: пара round'ов, settable для тестов).
@@ -1609,6 +1670,7 @@ async function fireContinue(): Promise<void> {
               "повтор switchSession после revive прошёл — доставка в разговор владельца в этом же раунде",
             ),
           );
+          resetSwitchPacing();
           // Тот же wait-loop, что и при первом прохождении switch.
           for (
             let round = 0;
@@ -1632,10 +1694,14 @@ async function fireContinue(): Promise<void> {
         // сессию невозможна: без прошедшего switch доставка блокируется,
         // повтор на retry-тике (ensureRetryInterval). switch-blocked НЕ
         // инкрементирует staleAttempts (ложная капитуляция запрещена).
+        // Spec 012 (T2): неудачная цепочка switch-путь пейсингует — следующий
+        // раунд не раньше staleBackoffMs(switchAttempts).
+        switchAttempts++;
+        switchRetryNotBefore = Date.now() + staleBackoffMs(switchAttempts);
         armsLog(
           "fire:switch-blocked",
           withAttr(
-            "switch на владельца не прошёл — «продолжи» НЕ отправляю (misroute исключён), повтор на retry-тике",
+            `switch на владельца не прошёл — «продолжи» НЕ отправляю (misroute исключён), повтор через ${Math.round(staleBackoffMs(switchAttempts) / 60_000)} мин (попытка ${switchAttempts})`,
           ),
         );
         ensureRetryInterval();

@@ -296,6 +296,23 @@ New-Item -ItemType SymbolicLink `
   (`switch-revive:cmd`, spec 010) — один мгновенный повтор switch в том же
   раунде (`fire:switch-retry-ok`/`fire:switch-retry-failed`), доставка
   не ждёт 5-минутного retry-тика;
+  **withSession-захват свежего командного ctx** (spec 012 T1): pi
+  инвалидирует командный ctx САМ ФАКТОМ успешного `switchSession`
+  («Do not use a captured pi or command ctx after ctx.switchSession()»),
+  поэтому `trySwitchToOwner` передаёт `withSession`-callback и
+  перезахватывает в `commandCtx` свежий command-capable `ReplacedSessionContext`.
+  Без этого СЛЕДУЮЩИЙ fire-раунд упирался в мёртвый switch-путь даже при
+  живом runtime (инцидент pi-remote 2026-10-15 09:00Z: успешный switch
+  оставлял мёртвый commandCtx до следующей ручной команды в окне);
+  **pacing неудачных switch-попыток** (spec 012 T2): неудачный
+  switch-раунд пейсингуется экспоненциальным backoff (`staleBackoffMs`:
+  5→60 мин) — `switchRetryNotBefore`/`switchAttempts`; успех switch,
+  переход stale→live в sync-poller'е и session_start сбрасывают
+  счётчик. До спека неудачный switch ретраился КАЖДЫЙ 60-с sync-тик через
+  ensureGraceTimer (delay=0) — ночная цепочка pi-remote 02:04→02:57Z дала
+  ~50 тройных кругов `fire:switch-*`; доставка при мёртвом commandCtx
+  остаётся честной (не capitulation), notify «вызови команду в окне» —
+  один на цепочку (spec 010 T3);
 - **один fire на один сброс окна** (spec 002): тики sync-poller'а (60 с)
   не перепланируют уже спланированный fire — нет цикла
   «fire:reset-ready» каждые 60 с; новый сброс снова разрешает fire
