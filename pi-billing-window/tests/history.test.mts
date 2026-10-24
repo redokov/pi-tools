@@ -42,6 +42,20 @@ function rows(): string[] {
   return read().split("\n").filter((l) => l.trim() !== "");
 }
 
+// console.warn interception: count warnings emitted during a test case
+// (used by the spec-013 silent-repair / warn-once cases).
+const origWarn = console.warn;
+let warnCount = 0;
+function captureWarn(): void {
+  warnCount = 0;
+  console.warn = () => {
+    warnCount++;
+  };
+}
+function restoreWarn(): void {
+  console.warn = origWarn;
+}
+
 const base: HistoryRow = {
   kind: "call",
   project: "c:/Tools",
@@ -362,6 +376,142 @@ async function main(): Promise<void> {
     assert(
       foreignLines[0] === "foo,bar" && foreignLines.length === 3,
       "foreign header: header untouched, row appended",
+    );
+
+    // --- NUL repair: leading NUL block + surviving LF data rows (spec 013) ---
+    // Simulates the NTFS crashed-write corruption: a run of NUL bytes wipes
+    // the original header, valid data rows survive after the block.
+    const nulRows = [
+      "2026-10-14T10:00:00+03:00,1760427600000,call,c:/p,s.jsonl,3,1,10,20,30,0,note-a,model-a",
+      "2026-10-15T10:00:00+03:00,1760514000000,call,c:/p,s.jsonl,4,1,11,21,31,0,note-b,model-b",
+    ];
+    const HEADER13 =
+      "ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count," +
+      "input,output,cache_read,cache_write,note,model";
+    const nulFile = join(tmp, "nul.csv");
+    const nulLock = join(tmp, "nul.lock");
+    fs.writeFileSync(
+      nulFile,
+      "\x00".repeat(100_000) + nulRows.join("\n") + "\n",
+      "utf8",
+    );
+    setPaths(nulFile, nulLock);
+    captureWarn();
+    const okNul = await appendHistory(base, 1_000_008_000_000);
+    restoreWarn();
+    assert(okNul === true, "nul-repair: append to NUL-corrupted file returns true");
+    assert(warnCount === 0, "nul-repair: repair is silent (0 console.warn calls)");
+    const nulRaw = fs.readFileSync(nulFile, "utf8");
+    assert(
+      nulRaw.charCodeAt(0) === 0xfeff && nulRaw.slice(1).startsWith(HEADER13),
+      "nul-repair: file starts with BOM + current 13-column header",
+    );
+    assert(!nulRaw.includes("\x00"), "nul-repair: no NUL bytes left in the file");
+    const nulLines = nulRaw.split("\n").filter((l) => l.trim() !== "");
+    assert(
+      nulLines[1] === nulRows[0] && nulLines[2] === nulRows[1],
+      "nul-repair: surviving data rows preserved byte-for-byte",
+    );
+    assert(
+      nulLines.length === 4 && nulLines[3]!.includes(",call,"),
+      "nul-repair: appended row lands after the repaired rows",
+    );
+    // Idempotency: a second append must not touch the (already repaired) head.
+    await appendHistory(base, 1_000_008_000_001);
+    const nulRaw2 = fs.readFileSync(nulFile, "utf8");
+    assert(
+      nulRaw2.startsWith("\uFEFF" + HEADER13 + "\n") &&
+        !nulRaw2.includes("\x00") &&
+        nulRaw2.split("\n").filter((l) => l.trim() !== "").length === 5,
+      "nul-repair: second append is a no-op for the head (idempotent)",
+    );
+
+    // --- NUL repair: CRLF file stays uniformly CRLF --------------------------
+    const nulCrlfFile = join(tmp, "nul-crlf.csv");
+    const nulCrlfLock = join(tmp, "nul-crlf.lock");
+    fs.writeFileSync(
+      nulCrlfFile,
+      "\x00".repeat(50_000) + nulRows.join("\r\n") + "\r\n",
+      "utf8",
+    );
+    setPaths(nulCrlfFile, nulCrlfLock);
+    const okNulCrlf = await appendHistory(base, 1_000_008_100_000);
+    assert(okNulCrlf === true, "nul-repair-crlf: append returns true");
+    const nulCrlfRaw = fs.readFileSync(nulCrlfFile, "utf8");
+    const nulCrlfParts = nulCrlfRaw.split("\r\n");
+    assert(
+      !nulCrlfParts.some((p) => p.includes("\n")),
+      "nul-repair-crlf: no bare-LF separators left (file uniformly CRLF)",
+    );
+    assert(
+      nulCrlfParts[0] === "\uFEFF" + HEADER13 &&
+        nulCrlfParts[1] === nulRows[0] &&
+        nulCrlfParts[2] === nulRows[1],
+      "nul-repair-crlf: BOM+header restored, rows preserved (sans EOL)",
+    );
+
+    // --- NUL repair: file consisting entirely of NUL bytes -------------------
+    const nulOnlyFile = join(tmp, "nul-only.csv");
+    const nulOnlyLock = join(tmp, "nul-only.lock");
+    fs.writeFileSync(nulOnlyFile, "\x00".repeat(10_000), "utf8");
+    setPaths(nulOnlyFile, nulOnlyLock);
+    captureWarn();
+    const okNulOnly = await appendHistory(base, 1_000_008_200_000);
+    restoreWarn();
+    assert(okNulOnly === true, "nul-only: append to all-NUL file returns true");
+    assert(warnCount === 0, "nul-only: repair is silent");
+    const nulOnlyRaw = fs.readFileSync(nulOnlyFile, "utf8");
+    const nulOnlyLines = nulOnlyRaw.split("\n").filter((l) => l.trim() !== "");
+    assert(
+      nulOnlyRaw.startsWith("\uFEFF" + HEADER13 + "\n") &&
+        !nulOnlyRaw.includes("\x00") &&
+        nulOnlyLines.length === 2,
+      "nul-only: file rebuilt as BOM+HEADER+EOL plus the appended row",
+    );
+
+    // --- foreign header warn-once: exactly 1 warning across 3 appends --------
+    const foreignOnceFile = join(tmp, "foreign-once.csv");
+    const foreignOnceLock = join(tmp, "foreign-once.lock");
+    fs.writeFileSync(foreignOnceFile, "foo,bar\nsome,data\n", "utf8");
+    setPaths(foreignOnceFile, foreignOnceLock); // setPaths resets the warn flag
+    captureWarn();
+    const okF1 = await appendHistory(base, 1_000_009_000_000);
+    await appendHistory(base, 1_000_009_000_001);
+    await appendHistory(base, 1_000_009_000_002);
+    restoreWarn();
+    assert(okF1 === true, "warn-once: first append to foreign file returns true");
+    assert(
+      warnCount === 1,
+      `warn-once: exactly 1 warning across 3 appends (got ${warnCount})`,
+    );
+    const foreignOnceLines = fs
+      .readFileSync(foreignOnceFile, "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "");
+    assert(
+      foreignOnceLines[0] === "foo,bar" && foreignOnceLines.length === 5,
+      "warn-once: foreign file untouched except appended rows",
+    );
+
+    // --- NUL repair: failed rename (read-only destination) -------------------
+    const nulRoFile = join(tmp, "nul-ro.csv");
+    const nulRoLock = join(tmp, "nul-ro.lock");
+    fs.writeFileSync(nulRoFile, "\x00".repeat(1_000) + nulRows.join("\n") + "\n", "utf8");
+    fs.chmodSync(nulRoFile, 0o444); // read-only -> renameSync fails with EPERM
+    setPaths(nulRoFile, nulRoLock);
+    captureWarn();
+    const okNulRo = await appendHistory(base, 1_000_009_100_000);
+    restoreWarn();
+    fs.chmodSync(nulRoFile, 0o666); // restore for asserts/cleanup
+    assert(okNulRo === false, "nul-repair-fail: append returns false when rename fails");
+    const nulRoLeftovers = fs.readdirSync(tmp).filter((f) => f.includes(".tmp."));
+    assert(
+      nulRoLeftovers.length === 0,
+      `nul-repair-fail: no orphan .tmp files (got: ${nulRoLeftovers})`,
+    );
+    assert(
+      fs.readFileSync(nulRoFile, "utf8").startsWith("\x00"),
+      "nul-repair-fail: original corrupted file untouched after failed rename",
     );
 
     // --- failure tolerance ---------------------------------------------------

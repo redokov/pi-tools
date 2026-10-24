@@ -31,7 +31,9 @@ index.ts ──── оркестратор: хуки (session_start, model_sel
   ├── state.ts  ──── JSON-файл + proper-lockfile для межпроцессной
   │                  синхронизации state. mutateState() / readStateSync()
   │
-  ├── ticker.ts ──── setInterval(TICK_MS=5min) → checkAndReset(emit).
+  ├── wakeups.ts ──── абсолютная таблица wake-точек (spec 012): якорь от
+  │                    первого расхода кредитов + 2ч + маржа 2 мин, глубина 12
+  ├── reset.ts ───── checkAndReset(emit, meta?, note) под lock (spec 012 T3).
   │                  Дедуп через lastResetAt (<10 мин → повторно не шлём).
   │
   ├── arms.ts   ──── per-разговор флаги /cont-after-reset (отдельный
@@ -56,8 +58,8 @@ index.ts ──── оркестратор: хуки (session_start, model_sel
 | Канал | Источник | Payload |
 |---|---|---|
 | `llm:first_call` | `index.ts::onAfterProviderResponse` | `{ provider, timestamp, windowStartedAt }` |
-| `billing:window_reset` | `ticker.ts::checkAndReset` или `/billing-reset` / `/settimer 0` | полный `State` |
-| `billing:window_about_to_reset` | `ticker.ts::checkAndReset` | `{ provider, msRemaining }` |
+| `billing:window_reset` | `reset.ts::checkAndReset` (wake-точка / `/billing-reset` / `/settimer 0`) | полный `State` |
+| `billing:window_about_to_reset` | `reset.ts::checkAndReset` (за 5 мин до wake-точки) | `{ provider, msRemaining }` |
 
 > **Важно:** для cross-extension рассылки используется `pi.events` (нетипизированная шина), а не `pi.on(...)` — последний принимает только фиксированный набор `ExtensionEvent`-имён и не пропустит произвольные каналы.
 
@@ -105,7 +107,7 @@ C:\Tools\pi-billing-window\
 ├── src/                   # исходники расширения
 │   ├── index.ts           # оркестратор, регистрация хуков и команд
 │   ├── state.ts           # file-backed JSON state + lock
-│   ├── ticker.ts          # 5-минутный цикл проверки окна
+│   ├── wakeups.ts          # абсолютные wake-точки (spec 012)
 │   ├── ui.ts              # setStatus-виджет в TUI footer
 │   ├── parser.ts          # parseDuration / formatDuration
 │   ├── history.ts         # append-only CSV-история вызовов/сбросов
@@ -113,7 +115,7 @@ C:\Tools\pi-billing-window\
 ├── scripts/
 │   └── billing_report.py  # MD-отчёт из history.csv (по моделям/проектам/суммарно)
 ├── tests/
-│   ├── test.mts                # unit-тесты (state, ticker, ui, parser, notifier)
+│   ├── test.mts                # unit-тесты (state, reset, wakeups, ui, parser, notifier)
 │   ├── arms.test.mts           # unit-тесты флагов /cont-after-reset
 │   ├── history.test.mts        # unit-тесты CSV-истории
 │   ├── lifecycle.test.mts      # регресс-тесты замены сессии (stale ctx, cont-after-reset)

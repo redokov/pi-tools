@@ -31,6 +31,11 @@ export function armWatchdog(fireAt: number, cb: () => void): void {
     scheduledFireAt = null;
     cb();
   }, delay);
+  // Unref parity (spec 003, spec 012 T7): the watchdog is armed ~2h ahead
+  // at the window boundary; a ref'd handle kept every embedded/test process
+  // (tsx suites, repro harnesses) alive until the boundary. The pi host
+  // process holds its own loop, so unref changes nothing in production.
+  handle.unref();
   scheduledFireAt = fireAt;
 }
 

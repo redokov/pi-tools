@@ -5,7 +5,8 @@
  * Architecture
  * ------------
  * - state.ts: file-backed JSON state with proper-lockfile serialization
- * - ticker.ts: 5-minute timer that calls checkAndReset() under a lock
+ * - wakeups.ts: absolute wake-point table + wake timer (spec 012)
+ * - reset.ts: checkAndReset() under a lock (window boundary detection)
  * - ui.ts: status bar widget that renders a live countdown via ctx.ui.setStatus
  * - index.ts (this file): orchestration -- hooks + commands wiring
  *
@@ -15,7 +16,7 @@
  *   "billing:window_about_to_reset"-> payload: { provider, msRemaining }
  *   "llm:first_call"               -> payload: { provider, timestamp, windowStartedAt }
  *
- * The first two are produced by ticker.ts (via the emitFn we pass to it).
+The first two are produced by reset.ts via the wake scheduler (spec 012).
  * The last one is produced by this extension on the first LLM call in a
  * freshly started window.
  *
@@ -39,11 +40,23 @@ import {
   type State,
 } from "./state.js";
 import {
-  startTicker,
-  stopTicker,
+  ABOUT_TO_RESET_MS,
+  // Spec 012 (TD-002/TD-008): checkAndReset живёт в reset.ts (дословный
+  // перенос из бывшего ticker.ts) + параметр note для history-строк.
   checkAndReset,
   type EmitFn,
-} from "./ticker.js";
+} from "./reset.js";
+import {
+  armWakeTimer,
+  clearWakeTimer,
+  readWakeTable,
+  mutateWakeTable,
+  nextDuePoint,
+  dropBurnedPoints,
+  appendAnchorPoint,
+  WAKE_BURNED_TTL_MS,
+  setWakePaths,
+} from "./wakeups.js";
 import {
   renderStatusBar,
   startStatusUpdater,
@@ -108,12 +121,6 @@ function makeInitialState(): State {
 }
 
 // --- Module-level orchestration state ----------------------------------------
-
-/**
- * Whether startTicker() has already been called. Guards against double-start
- * when /reload fires multiple session_start events back-to-back.
- */
-let tickerStarted = false;
 
 /**
  * The most recent ctx handed to session_start. Used by the window_reset
@@ -490,6 +497,13 @@ function staleBackoffMs(attempt: number): number {
 let testFiresDir: string | null = null;
 
 /**
+ * Spec 012 (T4): per-test temp dir for the wake table. __resetStaleStateForTests
+ * redirects the wakeups file/lock here so no suite ever touches the user's
+ * real ~/.pi/agent/pi-billing-window-wakeups.json (same policy as testFiresDir).
+ */
+let testWakeDir: string | null = null;
+
+/**
  * Spec 007 (D1): did the sent text actually reach the OWNER conversation?
  * Reads the owner session jsonl and looks for a user entry whose text
  * contains the sent text and whose timestamp is >= sendTimeMs - tolerance.
@@ -642,6 +656,20 @@ export function __resetStaleStateForTests(): void {
   }
   fs.mkdirSync(testFiresDir, { recursive: true });
   setFiresDirPath(testFiresDir);
+  // Spec 012 (T4): wake-таблица/таймер — изоляция сценариев: снятый таймер +
+  // свежий tmp-каталог, чтобы сьюты не трогали реальный wakeups.json и не
+  // стреляли чужие точки (фабрика теперь пишет якоря на каждый firstCall).
+  stopWakeTimer();
+  if (testWakeDir === null) {
+    testWakeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pibw-wake-"));
+  } else {
+    fs.rmSync(testWakeDir, { recursive: true, force: true });
+  }
+  fs.mkdirSync(testWakeDir, { recursive: true });
+  setWakePaths(
+    path.join(testWakeDir, "wakeups.json"),
+    path.join(testWakeDir, "wakeups.lock"),
+  );
 }
 
 /** Test hook: read the current stale-retry pacing moment. */
@@ -696,6 +724,26 @@ export function __fireWatchdogForTests(): Promise<void> {
 /** Test hook: run one pending-retry tick manually (interval is 5 min). */
 export function __retryTickForTests(): Promise<void> {
   return retryTick();
+}
+
+/** Spec 012 (T4): test hook -- re-arm the wake scheduler from the table right now. */
+export function __ensureWakeTimerForTests(): void {
+  ensureWakeTimer();
+}
+
+/** Spec 012 (T4/T5): test hook -- force one wake fire (consume + reset check). */
+export function __fireWakeForTests(): Promise<void> {
+  return onWakeFire();
+}
+
+/** Spec 012 (T5): test hook -- run one sync-poller wake safety tick. */
+export function __wakeSyncTickForTests(): Promise<void> {
+  return wakeSyncTick();
+}
+
+/** Spec 012 (T4): test hook -- stop both wake timers (scenario teardown). */
+export function __stopWakeTimerForTests(): void {
+  stopWakeTimer();
 }
 
 /**
@@ -944,6 +992,9 @@ function stopWatchdogTimers(): void {
   stopRetryInterval();
   stopGraceTimer();
   clearWatchdog();
+  // Spec 012 (T4): wake/about timers close over the same session refs --
+  // stop them with the rest (session_start re-arms from the wake table).
+  stopWakeTimer();
 }
 
 /**
@@ -969,10 +1020,12 @@ function ensureSyncPoller(): void {
   if (syncTimer === null) {
     syncTimer = setInterval(() => {
       syncWatchdog();
+      void wakeSyncTick();
     }, SYNC_POLL_MS);
     syncTimer.unref();
   }
   syncWatchdog();
+  void wakeSyncTick();
 }
 
 /**
@@ -1267,8 +1320,8 @@ async function retryTick(): Promise<void> {
  * The watchdog fired (window boundary or reset+grace): do a precise
  * checkAndReset() and, when the conversation is armed, schedule the
  * "продолжи" send after the grace period. The grace delay is measured from
- * state.lastResetAt, so a reset that happened before the fire (lazy ticker,
- * another process) does not wait the grace twice.
+ * state.lastResetAt, so a reset that happened before the fire (lazy wake
+ * point, another process) does not wait the grace twice.
  */
 async function onWatchdogFire(): Promise<void> {
   return runGuarded(async () => {
@@ -1844,13 +1897,13 @@ async function fireContinue(): Promise<void> {
 
 /**
  * Build an EmitFn that forwards into pi.events (the EventBus shared across
- * extensions). We capture the bus reference once at session_start; subsequent
- * ticker ticks call this closure, so the bus reference is stable for the
- * lifetime of the running session.
+ * extensions). We capture the bus reference once at session_start; the wake
+ * scheduler and commands call this closure, so the bus reference is stable
+ * for the lifetime of the running session.
  *
  * `null` is treated as "no bus yet" (e.g. very early startup before
  * session_start has fired) -- in that case emit becomes a no-op so the
- * ticker doesn't crash.
+ * scheduler doesn't crash.
  */
 function buildEmitFn(): EmitFn {
   return (event: string, payload: unknown) => {
@@ -1859,33 +1912,133 @@ function buildEmitFn(): EmitFn {
     try {
       bus.emit(event, payload);
     } catch {
-      // Never let a listener failure kill the ticker. The bus already wraps
+      // Never let a listener failure kill the scheduler. The bus already wraps
       // individual handlers, but our own .emit must not throw either.
     }
   };
 }
 
-// --- Ticker lifecycle ---------------------------------------------------------
+// --- Wake scheduler lifecycle (spec 012, TD-005) -------------------------------
 
 /**
- * Idempotent ticker starter. Safe to call multiple times: only the first
- * call wires up the interval. Used in session_start where a reload may
- * fire repeatedly without the previous shutdown having torn the ticker down.
+ * Secondary one-shot timer for billing:window_about_to_reset (Should, D-012):
+ * fires ABOUT_TO_RESET_MS before the armed wake point. Kept as a separate
+ * module handle -- wakeups.ts owns the wake timer handle itself.
  */
-function ensureTickerStarted(): void {
-  if (tickerStarted) return;
-  startTicker(buildEmitFn());
-  tickerStarted = true;
+let wakeAboutHandle: ReturnType<typeof setTimeout> | null = null;
+
+/** Stop both wake timers (idempotent; shutdown + cancel-before-arm). */
+function stopWakeTimer(): void {
+  clearWakeTimer();
+  if (wakeAboutHandle !== null) {
+    clearTimeout(wakeAboutHandle);
+    wakeAboutHandle = null;
+  }
+}
+
+/** History note for a wake-sourced reset: "wake HH:MM" (local time of the
+ * fired point, TD-008). */
+function wakeNoteOf(p: number): string {
+  const d = new Date(p);
+  return `wake ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 /**
- * Stop the ticker AND reset the started flag so a future session_start can
- * start it again. Matches the contract required by tests: stopTicker() is
- * safe to call when no interval is running (it's a no-op in that case).
+ * Idempotent wake scheduler (ensureGraceTimer pattern, TD-005): cancel both
+ * old timers, tolerantly read the table, arm the one-shot unref wake timer
+ * at the next due point; the about_to_reset secondary timer is armed only
+ * when its moment is in the future. Re-armed on every source event
+ * (llm:first_call anchor, billing:window_reset, /settimer, /billing-reset,
+ * session_start, every fire, every sync tick) -- the wall-clock recompute on
+ * each re-arm neutralizes setTimeout drift.
  */
-function shutdownTicker(): void {
-  stopTicker();
-  tickerStarted = false;
+function ensureWakeTimer(): void {
+  stopWakeTimer();
+  const now = Date.now();
+  const p = nextDuePoint(readWakeTable(), now);
+  if (p === null) return;
+  armWakeTimer(p, () => {
+    void onWakeFire();
+  });
+  const aboutAt = p - ABOUT_TO_RESET_MS;
+  if (aboutAt > now) {
+    wakeAboutHandle = setTimeout(() => {
+      wakeAboutHandle = null;
+      // Payload by the fresh state (design §4 API contract).
+      const st = readStateSync();
+      buildEmitFn()("billing:window_about_to_reset", {
+        provider: st?.provider ?? PROVIDER,
+        msRemaining: Math.max(0, p - Date.now()),
+      });
+    }, aboutAt - now);
+    wakeAboutHandle.unref();
+  }
+}
+
+/**
+ * A wake point fired (timer or sync-poller safety path). The head is
+ * consumed under the lock UNCONDITIONALLY (TD-004 op 1 -- a point is
+ * one-shot by definition; a no-op checkAndReset just means "window still
+ * alive", the next anchor restores precision). FR-012-10: a burned head
+ * (now > p + WAKE_BURNED_TTL_MS -- the machine slept through the boundary)
+ * is purged quietly with NO reset emit (design §8). Then the single reset
+ * path checkAndReset with note "wake HH:MM" (TD-008) and a re-arm from the
+ * remaining tail. runGuarded serializes overlaps with the watchdog fire;
+ * reset dedup (lastResetAt + DEDUP_WINDOW_MS) makes a double fire harmless.
+ */
+async function onWakeFire(): Promise<void> {
+  return runGuarded(async () => {
+    const now = Date.now();
+    const table = readWakeTable();
+    if (table !== null && table.points.length > 0) {
+      if (now > table.points[0] + WAKE_BURNED_TTL_MS) {
+        // Burned head: quiet purge, no shot into the past (FR-012-10).
+        await mutateWakeTable((cur) =>
+          cur === null ? { next: null } : { next: dropBurnedPoints(cur, Date.now()) },
+        );
+      } else {
+        const firedPoint = table.points[0];
+        await mutateWakeTable((cur) => {
+          if (cur === null || cur.points.length === 0) return { next: null };
+          return { next: { ...cur, points: cur.points.slice(1) } };
+        });
+        await checkAndReset(
+          buildEmitFn(),
+          historyMetaOf(currentCtx),
+          wakeNoteOf(firedPoint),
+        );
+      }
+    }
+    ensureWakeTimer();
+  });
+}
+
+/**
+ * Spec 012 (T5, TD-007): 60-second safety net inside the existing
+ * sync-poller. Bounds the wake delivery lag by WAKE_MARGIN_MS +
+ * SYNC_POLL_MS even when the one-shot setTimeout drifted or was lost under
+ * load. Burned points are purged quietly -- no shot into the past
+ * (FR-012-10); a due point goes through the exact onWakeFire path
+ * (consume under lock + checkAndReset "wake HH:MM") -- the double path
+ * (timer + poller) collapses into one reset via consume + reset dedup.
+ */
+async function wakeSyncTick(): Promise<void> {
+  const now = Date.now();
+  const table = readWakeTable();
+  if (table === null || table.points.length === 0) return;
+  if (dropBurnedPoints(table, now).points.length !== table.points.length) {
+    // Quiet purge of everything burned by a long sleep (FR-012-10).
+    await mutateWakeTable((cur) =>
+      cur === null ? { next: null } : { next: dropBurnedPoints(cur, Date.now()) },
+    );
+  }
+  // nextDuePoint is TTL-aware, so a skipped (ELOCKED) purge is harmless.
+  const p = nextDuePoint(table, now);
+  if (p !== null && now >= p) {
+    await onWakeFire();
+    return;
+  }
+  ensureWakeTimer(); // wall-clock re-arm against drift (TD-005)
 }
 
 // --- EventBus listeners -------------------------------------------------------
@@ -1896,6 +2049,10 @@ function shutdownTicker(): void {
  * notify() would just clutter logs there.
  */
 function handleWindowReset(_payload: unknown): void {
+  // Spec 012 (T4): a reset just happened -- re-arm the scheduler from the
+  // remaining tail of the wake table (design §3/§4: window_reset is one of
+  // the re-arm events).
+  ensureWakeTimer();
   const ctx = currentCtx;
   if (!ctx) return;
   if (!ctxIsTui(ctx)) return;
@@ -2084,8 +2241,8 @@ function adoptFreshRefs(ctx: unknown, source: string): boolean {
 /**
  * pi.on("session_start"): capture ctx, initialize state if missing, run a
  * one-shot checkAndReset() if the saved state is already expired, and
- * start the periodic ticker. Idempotent across reloads thanks to the
- * tickerStarted guard and the state file itself.
+ * arm the absolute wake scheduler from the persisted wake table. Idempotent
+ * across reloads: the table is file-backed, ensureWakeTimer() re-reads it.
  */
 async function onSessionStart(
   event: unknown,
@@ -2164,8 +2321,10 @@ async function onSessionStart(
         );
       }
     }
-    ensureTickerStarted();
     ensureSyncPoller();
+    // Spec 012 (T4): session_start is a scheduler re-arm event even on the
+    // blocked path (the wake table is process-global, not session-scoped).
+    ensureWakeTimer();
     return;
   }
 
@@ -2221,13 +2380,15 @@ async function onSessionStart(
   // a reset happens (also useful for future "about to reset" hooks).
   subscribeToBillingEvents();
 
-  // Start the periodic ticker and the status-bar updater FIRST, before any
+  // Arm the wake scheduler and the status-bar updater FIRST, before any
   // state I/O. If the state bootstrap below throws (e.g. a lock timeout while
   // another pi window holds the lock), pi swallows handler errors -- without
-  // this ordering the countdown and reset ticker would never start in this
+  // this ordering the countdown and reset scheduler would never start in this
   // session until /reload. With timers up first, a bootstrap failure degrades
   // to just a warning and everything keeps running.
-  ensureTickerStarted();
+  // Spec 012 (T4): re-arm the absolute wake scheduler from the persisted
+  // table (survives restarts; the watchdog stays session-scoped).
+  ensureWakeTimer();
 
   // Start the status-bar updater (live countdown) in TUI mode only.
   // startStatusUpdater itself returns a no-op stopper outside of TUI.
@@ -2251,7 +2412,7 @@ async function onSessionStart(
     if (existing === null) {
       await mutateState(() => ({ next: makeInitialState() }));
     } else if (Date.now() - existing.windowStartedAt >= existing.windowMs) {
-      // Window already expired while pi was off. Let the ticker machinery
+      // Window already expired while pi was off. Let the reset machinery
       // reset it -- this also fires billing:window_reset which our listener
       // will pick up and turn into a notify().
       await checkAndReset(buildEmitFn(), historyMetaOf(ctx));
@@ -2460,6 +2621,31 @@ async function onAfterProviderResponse(
   }
 
   if (firstCallJustEmitted) {
+    // Spec 012 (T4, FR-012-6): auto-init the wake table from the fresh
+    // anchor (state.firstCallEmittedAt). The anchor point = anchor +
+    // windowMs + WAKE_MARGIN_MS; R1 epsilon, tail top-up and depth
+    // truncation live in appendAnchorPoint (TD-004 op 2). Passive: a lock
+    // skip (ELOCKED) is quiet -- the next anchor/tick repeats it.
+    const anchorState = readStateSync();
+    const anchor = anchorState?.firstCallEmittedAt ?? timestamp;
+    const anchorWinMs = anchorState?.windowMs ?? WINDOW_MS;
+    await mutateWakeTable((cur) => ({
+      next: {
+        ...appendAnchorPoint(
+          cur ?? {
+            version: 1,
+            points: [],
+            updatedAt: Date.now(),
+            source: "firstCall",
+          },
+          anchor,
+          anchorWinMs,
+        ),
+        // The table's latest rebuild origin is now a firstCall anchor.
+        source: "firstCall",
+      },
+    }));
+    ensureWakeTimer();
     emit("llm:first_call", {
       provider: PROVIDER,
       timestamp,
@@ -2514,7 +2700,7 @@ function onModelSelect(
 }
 
 /**
- * pi.on("session_shutdown"): tear down ticker, EventBus subscriptions, and
+ * pi.on("session_shutdown"): tear down the wake scheduler, EventBus subscriptions, and
  * status updater. Re-runs cleanly on quit / reload / new / resume / fork.
  */
 function onSessionShutdown(_event: unknown, _ctx: ExtensionContext): void {
@@ -2524,7 +2710,6 @@ function onSessionShutdown(_event: unknown, _ctx: ExtensionContext): void {
   // Bump the epoch FIRST so deferred code still holding old-session refs
   // aborts instead of touching them (stale pi -> runtime error).
   sessionEpoch++;
-  shutdownTicker();
   unsubscribeFromBillingEvents();
   if (stopStatusFn) {
     try {

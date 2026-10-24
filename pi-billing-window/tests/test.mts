@@ -1,5 +1,5 @@
 /**
- * test.mts -- unit tests for pi-billing-window (state + ticker).
+ * test.mts -- unit tests for pi-billing-window (state + reset + wakeups).
  *
  * Run: .\node_modules\.bin\tsx.cmd test.mts
  */
@@ -20,11 +20,28 @@ import {
 } from "../src/state.ts";
 import {
   checkAndReset,
-  TICK_MS,
   ABOUT_TO_RESET_MS,
   DEDUP_WINDOW_MS,
   type EmitFn,
-} from "../src/ticker.ts";
+} from "../src/reset.ts";
+import {
+  WAKE_MARGIN_MS,
+  WAKE_DEPTH,
+  WAKE_BURNED_TTL_MS,
+  WAKE_APPEND_EPSILON_MS,
+  computeTableFromAnchor,
+  nextDuePoint,
+  dropBurnedPoints,
+  appendAnchorPoint,
+  readWakeTable,
+  mutateWakeTable,
+  setWakePaths as wakeSetPaths,
+  resetPaths as wakeResetPaths,
+  armWakeTimer,
+  clearWakeTimer,
+  hasRefForTests as wakeHasRefForTests,
+  type WakeTable,
+} from "../src/wakeups.ts";
 import {
   renderStatusBar,
   startStatusUpdater,
@@ -41,6 +58,14 @@ import {
   setPaths as historySetPaths,
   resetPaths as historyResetPaths,
 } from "../src/history.ts";
+import piBillingWindowFactory, {
+  setArmsLogPath,
+  __resetStaleStateForTests,
+  __ensureWakeTimerForTests,
+  __fireWakeForTests,
+  __wakeSyncTickForTests,
+  __stopWakeTimerForTests,
+} from "../src/index.ts";
 import {
   setPaths as armsSetPaths,
   resetPaths as armsResetPaths,
@@ -137,7 +162,7 @@ const testLockFile = join(tmpDir, "state.lock");
 setPaths(testStateFile, testLockFile);
 
 // Redirect the shared history CSV and the arms file too: checkAndReset()
-// (ticker) appends "window_reset" rows into history.csv, and ui.ts reads the
+// (reset.ts checkAndReset) appends "window_reset" rows into history.csv, and ui.ts reads the
 // arms file while rendering -- both must never touch the product files
 // during tests.
 const testHistoryFile = join(tmpDir, "history.csv");
@@ -299,17 +324,17 @@ async function main(): Promise<void> {
   const tmpFiles = fs.readdirSync(tmpDir).filter((f) => f.includes(".tmp"));
   assert(tmpFiles.length === 0, "writeStateSync: cleans up .tmp files");
 
-  // ---- ticker.ts tests ----
+  // ---- reset.ts tests ----
 
-  console.log("\n=== Ticker tests ===");
+  console.log("\n=== Reset tests (reset.ts) ===");
 
   // 1. checkAndReset returns false when state is null
   cleanState();
   {
     const emit = createMockEmit();
     const result = await checkAndReset(emit.emit);
-    assert(result === false, "ticker: returns false when state is null");
-    assert(emit.calls.length === 0, "ticker: emits nothing when state is null");
+    assert(result === false, "reset: returns false when state is null");
+    assert(emit.calls.length === 0, "reset: emits nothing when state is null");
   }
 
   // 2. checkAndReset returns false when window has not expired
@@ -321,7 +346,7 @@ async function main(): Promise<void> {
       next: makeState({ windowStartedAt: now - 10 * 60 * 1000 }), // 10 min in, 1h50 left
     }));
     const result = await checkAndReset(emit.emit);
-    assert(result === false, "ticker: returns false when window not expired");
+    assert(result === false, "reset: returns false when window not expired");
   }
 
   // 3. checkAndReset returns true and emits window_reset when window expired
@@ -336,10 +361,10 @@ async function main(): Promise<void> {
       }),
     }));
     const result = await checkAndReset(emit.emit);
-    assert(result === true, "ticker: returns true when window expired");
+    assert(result === true, "reset: returns true when window expired");
     assert(
       emit.calls.some((c) => c.event === "billing:window_reset"),
-      "ticker: emits billing:window_reset on reset",
+      "reset: emits billing:window_reset on reset",
     );
   }
 
@@ -356,10 +381,10 @@ async function main(): Promise<void> {
       }),
     }));
     const result = await checkAndReset(emit.emit);
-    assert(result === false, "ticker: dedup -> returns false on recent reset");
+    assert(result === false, "reset: dedup -> returns false on recent reset");
     assert(
       !emit.calls.some((c) => c.event === "billing:window_reset"),
-      "ticker: dedup -> does NOT emit window_reset",
+      "reset: dedup -> does NOT emit window_reset",
     );
   }
 
@@ -377,7 +402,7 @@ async function main(): Promise<void> {
     }));
     await checkAndReset(emit.emit);
     const after = readStateSync();
-    assert(after?.resetCount === 4, "ticker: increments resetCount (3 -> 4)");
+    assert(after?.resetCount === 4, "reset: increments resetCount (3 -> 4)");
   }
 
   // 6. checkAndReset resets callsInWindow to 0
@@ -395,10 +420,10 @@ async function main(): Promise<void> {
     }));
     await checkAndReset(emit.emit);
     const after = readStateSync();
-    assert(after?.callsInWindow === 0, "ticker: resets callsInWindow to 0");
+    assert(after?.callsInWindow === 0, "reset: resets callsInWindow to 0");
     assert(
       after?.firstCallEmittedAt === undefined,
-      "ticker: clears firstCallEmittedAt",
+      "reset: clears firstCallEmittedAt",
     );
   }
 
@@ -417,22 +442,22 @@ async function main(): Promise<void> {
       }),
     }));
     const result = await checkAndReset(emit.emit);
-    assert(result === false, "ticker: about_to_reset does not count as reset");
+    assert(result === false, "reset: about_to_reset does not count as reset");
     const aboutCall = emit.calls.find(
       (c) => c.event === "billing:window_about_to_reset",
     );
     assert(
       aboutCall !== undefined,
-      "ticker: emits billing:window_about_to_reset when 5 min remaining",
+      "reset: emits billing:window_about_to_reset when 5 min remaining",
     );
     const payload = aboutCall?.payload as { provider: string; msRemaining: number };
     assert(
       payload?.provider === "wormsoft",
-      "ticker: about_to_reset payload has provider",
+      "reset: about_to_reset payload has provider",
     );
     assert(
       typeof payload?.msRemaining === "number" && payload.msRemaining >= 0,
-      "ticker: about_to_reset payload has positive msRemaining",
+      "reset: about_to_reset payload has positive msRemaining",
     );
   }
 
@@ -453,9 +478,627 @@ async function main(): Promise<void> {
     await checkAndReset(emit.emit);
     assert(
       !emit.calls.some((c) => c.event === "billing:window_about_to_reset"),
-      "ticker: does NOT emit window_about_to_reset when > 5 min remaining",
+      "reset: does NOT emit window_about_to_reset when > 5 min remaining",
     );
   }
+
+  // 9. note (TD-008): custom note lands in the history row
+  cleanState();
+  {
+    const emit = createMockEmit();
+    const now = Date.now();
+    await mutateState(() => ({
+      next: makeState({
+        windowStartedAt: now - (2 * 60 * 60 * 1000 + 1000),
+        lastResetAt: 0,
+        resetCount: 7,
+      }),
+    }));
+    const result = await checkAndReset(
+      emit.emit,
+      { project: "waketest", session: "s1" },
+      "wake 09:00",
+    );
+    assert(result === true, "reset: note case -> resets window");
+    // appendHistory is fire-and-forget inside checkAndReset -- give it a beat
+    await new Promise((r) => setTimeout(r, 150));
+    const csv = fs.readFileSync(testHistoryFile, "utf8").trim();
+    const lastRow = csv.split(/\r?\n/).pop() ?? "";
+    const fields = lastRow.split(",");
+    assert(fields[2] === "window_reset", "reset: note case -> history kind=window_reset");
+    assert(
+      fields[11] === "wake 09:00",
+      `reset: custom note lands in history row (got '${fields[11]}')`,
+    );
+  }
+
+  // 10. note default is "auto" when the argument is omitted
+  cleanState();
+  {
+    const emit = createMockEmit();
+    const now = Date.now();
+    await mutateState(() => ({
+      next: makeState({
+        windowStartedAt: now - (2 * 60 * 60 * 1000 + 1000),
+        lastResetAt: 0,
+      }),
+    }));
+    await checkAndReset(emit.emit);
+    await new Promise((r) => setTimeout(r, 150));
+    const csv = fs.readFileSync(testHistoryFile, "utf8").trim();
+    const lastRow = csv.split(/\r?\n/).pop() ?? "";
+    const fields = lastRow.split(",");
+    assert(
+      fields[11] === "auto",
+      `reset: default note is 'auto' (got '${fields[11]}')`,
+    );
+  }
+
+  // ---- wakeups.ts tests (spec 012: T1 pure functions + T2 persistence/timer) ----
+
+  console.log("\n=== Wakeups tests (wakeups.ts) ===");
+
+  const testWakeFile = join(tmpDir, "wakeups.json");
+  const testWakeLock = join(tmpDir, "wakeups.lock");
+  const cleanWake = (): void => {
+    try {
+      if (fs.existsSync(testWakeFile)) fs.unlinkSync(testWakeFile);
+    } catch {}
+    try {
+      if (fs.existsSync(testWakeLock)) fs.unlinkSync(testWakeLock);
+    } catch {}
+  };
+
+  // 0. constants sanity (FR-012-3/4/10, R1)
+  assert(
+    WAKE_MARGIN_MS === 2 * 60_000 &&
+      WAKE_DEPTH === 12 &&
+      WAKE_BURNED_TTL_MS === 30 * 60_000 &&
+      WAKE_APPEND_EPSILON_MS === 60_000,
+    "wakeups: constants 2min / depth 12 / ttl 30min / epsilon 60s",
+  );
+
+  // 1. computeTableFromAnchor: depth, first element, step, tail
+  {
+    const anchor = 1_000_000;
+    const w = 2 * 60 * 60 * 1000;
+    const t = computeTableFromAnchor(anchor, w);
+    assert(t.points.length === WAKE_DEPTH, "computeTableFromAnchor: depth points");
+    assert(
+      t.points[0] === anchor + w + WAKE_MARGIN_MS,
+      "computeTableFromAnchor: first = anchor + window + margin",
+    );
+    assert(t.points[1] === t.points[0] + w, "computeTableFromAnchor: step = windowMs");
+    assert(
+      t.points[WAKE_DEPTH - 1] === t.points[0] + (WAKE_DEPTH - 1) * w,
+      "computeTableFromAnchor: tail = first + k*windowMs",
+    );
+    assert(
+      t.version === 1 && t.source === "firstCall",
+      "computeTableFromAnchor: version 1, source firstCall",
+    );
+  }
+
+  // 2. nextDuePoint (design §4: min non-burned point)
+  {
+    const w = 2 * 60 * 60 * 1000;
+    const base = Date.now();
+    const mk = (points: number[], source: WakeTable["source"] = "firstCall"): WakeTable => ({
+      version: 1,
+      points,
+      updatedAt: base,
+      source,
+    });
+    assert(nextDuePoint(null, base) === null, "nextDuePoint: no table -> null");
+    assert(nextDuePoint(mk([]), base) === null, "nextDuePoint: empty points -> null");
+    assert(
+      nextDuePoint(mk([base + w]), base) === base + w,
+      "nextDuePoint: future point -> it",
+    );
+    assert(
+      nextDuePoint(mk([base - 60_000]), base) === base - 60_000,
+      "nextDuePoint: past within TTL -> it",
+    );
+    assert(
+      nextDuePoint(mk([base - WAKE_BURNED_TTL_MS - 1]), base) === null,
+      "nextDuePoint: burned point -> null",
+    );
+    assert(
+      nextDuePoint(
+        mk([base - WAKE_BURNED_TTL_MS - 1, base - 60_000, base + w]),
+        base,
+      ) === base - 60_000,
+      "nextDuePoint: min non-burned of several",
+    );
+  }
+
+  // 3. dropBurnedPoints: strict boundary + mixed ages
+  {
+    const base = Date.now();
+    const w = 2 * 60 * 60 * 1000;
+    const p = base - 10_000;
+    const t: WakeTable = { version: 1, points: [p], updatedAt: base, source: "settimer" };
+    const alive = dropBurnedPoints(t, p + WAKE_BURNED_TTL_MS);
+    assert(
+      alive.points.length === 1,
+      "dropBurnedPoints: exactly p+ttl survives (strict >)",
+    );
+    const dead = dropBurnedPoints(t, p + WAKE_BURNED_TTL_MS + 1);
+    assert(dead.points.length === 0, "dropBurnedPoints: p+ttl+1 drops");
+    const mixed: WakeTable = {
+      version: 1,
+      points: [base - 40 * 60_000, base - 5 * 60_000, base + w],
+      updatedAt: base,
+      source: "firstCall",
+    };
+    const m = dropBurnedPoints(mixed, base);
+    assert(
+      m.points.length === 2 &&
+        m.points[0] === base - 5 * 60_000 &&
+        m.points[1] === base + w,
+      "dropBurnedPoints: mixed ages -> only burned dropped",
+    );
+  }
+
+  // 4. appendAnchorPoint: ascending insert + top-up + truncate + R1 epsilon
+  {
+    const w = 2 * 60 * 60 * 1000;
+    const base = Date.now();
+    // insertion in ascending order + top-up of the tail to depth
+    const t: WakeTable = { version: 1, points: [base + 10 * w], updatedAt: base, source: "settimer" };
+    const r1 = appendAnchorPoint(t, base, w); // target = base + w + margin
+    assert(
+      r1.points[0] === base + w + WAKE_MARGIN_MS && r1.points[1] === base + 10 * w,
+      "appendAnchorPoint: inserts in ascending order",
+    );
+    assert(r1.points.length === WAKE_DEPTH, "appendAnchorPoint: top-up tail to depth");
+    assert(
+      r1.points[WAKE_DEPTH - 1] === r1.points[1] + (WAKE_DEPTH - 2) * w,
+      "appendAnchorPoint: tail = last + k*windowMs",
+    );
+    // R1: anchor point closer than 60s to an existing one is NOT inserted
+    const near = base + w + WAKE_MARGIN_MS - 30_000;
+    const t2: WakeTable = { version: 1, points: [near], updatedAt: base, source: "firstCall" };
+    const r2 = appendAnchorPoint(t2, base, w);
+    assert(
+      r2.points[0] === near && !r2.points.includes(base + w + WAKE_MARGIN_MS),
+      "appendAnchorPoint: R1 -- point within 60s epsilon not inserted",
+    );
+    // truncation beyond depth cuts the far tail, never the head
+    const full = computeTableFromAnchor(base, w);
+    const q = base + 6 * w + WAKE_MARGIN_MS + 120_000; // lands between p5 and p6
+    const r3 = appendAnchorPoint(full, base + 5 * w + 120_000, w);
+    assert(r3.points.length === WAKE_DEPTH, "appendAnchorPoint: truncates to depth");
+    assert(r3.points[0] === full.points[0], "appendAnchorPoint: head kept on truncation");
+    assert(r3.points.includes(q), "appendAnchorPoint: mid insert survives truncation");
+    assert(
+      !r3.points.includes(full.points[WAKE_DEPTH - 1]),
+      "appendAnchorPoint: far tail point is cut",
+    );
+  }
+
+  // 5. persistence: write -> read round-trip under lock
+  cleanWake();
+  wakeSetPaths(testWakeFile, testWakeLock);
+  {
+    const w = 2 * 60 * 60 * 1000;
+    let sawNull = false;
+    const ok = await mutateWakeTable((cur) => {
+      sawNull = cur === null;
+      return { next: computeTableFromAnchor(1_000_000, w) };
+    });
+    assert(ok === true, "mutateWakeTable: returns true on write");
+    assert(sawNull, "mutateWakeTable: transform sees null when file missing");
+    const t = readWakeTable();
+    assert(
+      t !== null && t.points.length === WAKE_DEPTH && t.points[0] === 1_000_000 + w + WAKE_MARGIN_MS,
+      "readWakeTable: round-trip after write",
+    );
+  }
+
+  // 6. missing file -> null, silent
+  cleanWake();
+  {
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (m?: unknown) => {
+      warns.push(String(m));
+    };
+    try {
+      assert(readWakeTable() === null, "readWakeTable: missing file -> null");
+      assert(warns.length === 0, "readWakeTable: missing file is silent");
+    } finally {
+      console.warn = origWarn;
+    }
+  }
+
+  // 7. corrupt JSON / foreign schema -> null + ONE warn per process
+  cleanWake();
+  wakeSetPaths(testWakeFile, testWakeLock); // reset the warn flag
+  {
+    fs.writeFileSync(testWakeFile, "{definitely not json", "utf8");
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (m?: unknown) => {
+      warns.push(String(m));
+    };
+    try {
+      assert(readWakeTable() === null, "readWakeTable: corrupt JSON -> null");
+      assert(readWakeTable() === null, "readWakeTable: corrupt JSON -> null again");
+      assert(warns.length === 1, "readWakeTable: corrupt JSON warns exactly once");
+      // foreign schema (version 2) is also rejected
+      fs.writeFileSync(
+        testWakeFile,
+        JSON.stringify({ version: 2, points: [1], updatedAt: 1, source: "firstCall" }),
+        "utf8",
+      );
+      assert(readWakeTable() === null, "readWakeTable: version != 1 -> null");
+      // non-numeric points are rejected too
+      fs.writeFileSync(
+        testWakeFile,
+        JSON.stringify({ version: 1, points: [1, "two"], updatedAt: 1, source: "firstCall" }),
+        "utf8",
+      );
+      assert(readWakeTable() === null, "readWakeTable: non-numeric points -> null");
+    } finally {
+      console.warn = origWarn;
+    }
+  }
+
+  // 8. points: [] is a legal "window not started" state
+  cleanWake();
+  {
+    const ok = await mutateWakeTable(() => ({
+      next: { version: 1, points: [], updatedAt: Date.now(), source: "settimer" },
+    }));
+    assert(ok === true, "mutateWakeTable: empty table write ok");
+    const t = readWakeTable();
+    assert(
+      t !== null && t.points.length === 0 && t.source === "settimer",
+      "readWakeTable: points [] is legal",
+    );
+  }
+
+  // 9. two parallel mutations do not lose a point (lock serializes them)
+  cleanWake();
+  {
+    const seed: WakeTable = {
+      version: 1,
+      points: [1_000],
+      updatedAt: Date.now(),
+      source: "firstCall",
+    };
+    await mutateWakeTable(() => ({ next: seed }));
+    const pushPoint = (p: number) =>
+      mutateWakeTable((cur) => {
+        const base = cur ?? seed;
+        return { next: { ...base, points: [...base.points, p].sort((a, b) => a - b) } };
+      });
+    const [r1, r2] = await Promise.all([pushPoint(3_000), pushPoint(2_000)]);
+    assert(r1 === true && r2 === true, "parallel mutateWakeTable: both succeed");
+    const t = readWakeTable();
+    assert(
+      t !== null &&
+        t.points.length === 3 &&
+        t.points[0] === 1_000 &&
+        t.points[1] === 2_000 &&
+        t.points[2] === 3_000,
+      "parallel mutateWakeTable: no point lost (lock serializes)",
+    );
+  }
+
+  // 10. wake timer primitive: unref, clear, immediate fire, cancel-before-arm
+  {
+    let fired = false;
+    armWakeTimer(Date.now() + 60_000, () => {
+      fired = true;
+    });
+    assert(
+      wakeHasRefForTests() === false,
+      "armWakeTimer: handle is unref'd (does not hold event loop)",
+    );
+    clearWakeTimer();
+    assert(wakeHasRefForTests() === null, "clearWakeTimer: -> null");
+    // re-arm cancels the previous timer (watchdog.ts pattern)
+    let firstFired = false;
+    armWakeTimer(Date.now() + 20_000, () => {
+      firstFired = true;
+    });
+    armWakeTimer(Date.now() + 20_000, () => {
+      fired = true;
+    });
+    clearWakeTimer();
+    assert(!firstFired, "armWakeTimer: re-arm cancels the previous timer");
+    // a past moment fires with delay 0 (self-correcting max(0, when-now))
+    fired = false;
+    armWakeTimer(Date.now() - 5_000, () => {
+      fired = true;
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    assert(fired, "armWakeTimer: past whenMs fires immediately (delay 0)");
+    clearWakeTimer();
+  }
+
+  cleanWake();
+
+  // ---- wake scheduler integration (spec 012 T4: index.ts scheduler) ----
+
+  console.log("\n=== Wake scheduler integration (spec 012 T4) ===");
+
+  // Drive the real extension factory (pending-window-retry.test.mts pattern):
+  // mock pi/ctx, temp paths, manual hooks. The factory now writes wake
+  // anchors on the first call, so the arms log path is redirected too.
+  setArmsLogPath(join(tmpDir, "armslog.log"));
+  __resetStaleStateForTests(); // isolates fires + wake dirs; wake overridden below
+  cleanWake();
+  wakeSetPaths(testWakeFile, testWakeLock);
+  __stopWakeTimerForTests();
+  cleanState();
+
+  type SchedHandler = (event: unknown, ctx: unknown) => unknown;
+  const schedHandlers = new Map<string, SchedHandler[]>();
+  const schedCommands = new Map<
+    string,
+    (args: string, ctx: unknown) => Promise<void> | void
+  >();
+  const busEmits: Array<{ ch: string; data: unknown }> = [];
+  const busSubs = new Map<string, Array<(d: unknown) => void>>();
+  {
+    const pi = {
+      events: {
+        emit: (ch: string, data: unknown) => {
+          busEmits.push({ ch, data });
+        },
+        on: (ch: string, h: (d: unknown) => void) => {
+          const arr = busSubs.get(ch) ?? [];
+          arr.push(h);
+          busSubs.set(ch, arr);
+          return () => {
+            const i = arr.indexOf(h);
+            if (i >= 0) arr.splice(i, 1);
+          };
+        },
+      },
+      on: (ev: string, h: SchedHandler) => {
+        const arr = schedHandlers.get(ev) ?? [];
+        arr.push(h);
+        schedHandlers.set(ev, arr);
+      },
+      registerCommand: (
+        name: string,
+        spec: { handler: (args: string, ctx: unknown) => Promise<void> | void },
+      ) => {
+        schedCommands.set(name, spec.handler);
+      },
+      sendUserMessage: async () => undefined,
+    };
+    piBillingWindowFactory(pi as never);
+  }
+  const notifies: string[] = [];
+  const schedCtx = {
+    mode: "tui",
+    isIdle: () => true,
+    model: { provider: "wormsoft", id: "test/model-1" },
+    ui: {
+      notify: (msg: string) => {
+        notifies.push(msg);
+      },
+      setStatus: () => {},
+    },
+    sessionManager: {
+      getSessionFile: () => join(tmpDir, "sess-wake.jsonl"),
+      getCwd: () => "C:/tmp/fake-project",
+      getEntries: () => [
+        {
+          type: "message",
+          message: { role: "assistant", usage: { input: 10, output: 5 } },
+        },
+      ],
+    },
+  };
+  const sessionStart = schedHandlers.get("session_start")?.[0];
+  const afterResponse = schedHandlers.get("after_provider_response")?.[0];
+  if (!sessionStart || !afterResponse) {
+    throw new Error("extension did not register hooks");
+  }
+
+  const W2H = 2 * 60 * 60 * 1000;
+  const schedSeedState = async (over: Partial<State> = {}): Promise<void> => {
+    await mutateState(() => ({ next: makeState(over) }));
+  };
+  const schedHistoryLastRow = (): string[] => {
+    const csv = fs.readFileSync(testHistoryFile, "utf8").trim();
+    return (csv.split(/\r?\n/).pop() ?? "").split(",");
+  };
+
+  // A. first call -> anchor appended, table auto-initialized (FR-012-6)
+  await schedSeedState();
+  await sessionStart({}, schedCtx);
+  cleanWake();
+  const tA0 = Date.now();
+  await afterResponse({ status: 200, headers: {} }, schedCtx);
+  const tA1 = Date.now();
+  const tA = readWakeTable();
+  assert(
+    tA !== null && tA.source === "firstCall",
+    "wake scheduler: first call creates the table (source=firstCall)",
+  );
+  assert(
+    tA !== null && tA.points.length === WAKE_DEPTH,
+    "wake scheduler: anchor insert + tail top-up = depth points",
+  );
+  assert(
+    tA !== null &&
+      tA.points[0] >= tA0 + W2H + WAKE_MARGIN_MS &&
+      tA.points[0] <= tA1 + W2H + WAKE_MARGIN_MS,
+    "wake scheduler: first point = anchor + windowMs + margin",
+  );
+  assert(
+    tA !== null && tA.points[1] === tA.points[0] + W2H,
+    "wake scheduler: top-up tail steps by windowMs",
+  );
+  assert(
+    wakeHasRefForTests() === false,
+    "wake scheduler: timer armed & unref'd after the anchor",
+  );
+
+  // B. expired window + due point -> wake fire resets with note "wake HH:MM"
+  busEmits.length = 0;
+  cleanWake();
+  const headB = Date.now() - 60_000; // due, within the 30-min TTL
+  const tailB = Date.now() + 3 * 60 * 60 * 1000;
+  await mutateWakeTable(() => ({
+    next: {
+      version: 1,
+      points: [headB, tailB],
+      updatedAt: Date.now(),
+      source: "firstCall",
+    },
+  }));
+  await schedSeedState({ windowStartedAt: Date.now() - W2H - 5_000 });
+  await __fireWakeForTests();
+  await new Promise((r) => setTimeout(r, 150)); // appendHistory is fire-and-forget
+  assert(
+    busEmits.some((e) => e.ch === "billing:window_reset"),
+    "wake scheduler: wake fire emits billing:window_reset",
+  );
+  const tB = readWakeTable();
+  assert(
+    tB !== null && tB.points.length === 1 && tB.points[0] === tailB,
+    "wake scheduler: head consumed, tail kept",
+  );
+  const noteB = `wake ${String(new Date(headB).getHours()).padStart(2, "0")}:${String(new Date(headB).getMinutes()).padStart(2, "0")}`;
+  const rowB = schedHistoryLastRow();
+  assert(
+    rowB[2] === "window_reset",
+    "wake scheduler: history row kind=window_reset",
+  );
+  assert(
+    rowB[11] === noteB,
+    `wake scheduler: history note "${noteB}" (got '${rowB[11]}')`,
+  );
+  assert(
+    wakeHasRefForTests() === false,
+    "wake scheduler: re-armed at the next point after the fire",
+  );
+
+  // C. speculative point before the boundary -> no-op reset, point consumed
+  busEmits.length = 0;
+  cleanWake();
+  const headC = Date.now() - 30_000;
+  await mutateWakeTable(() => ({
+    next: {
+      version: 1,
+      points: [headC],
+      updatedAt: Date.now(),
+      source: "firstCall",
+    },
+  }));
+  await schedSeedState(); // fresh window, NOT expired
+  await __fireWakeForTests();
+  await new Promise((r) => setTimeout(r, 100));
+  assert(
+    !busEmits.some((e) => e.ch === "billing:window_reset"),
+    "wake scheduler: speculative point -> no reset emit",
+  );
+  const tC = readWakeTable();
+  assert(
+    tC !== null && tC.points.length === 0,
+    "wake scheduler: speculative point is still consumed",
+  );
+  assert(
+    wakeHasRefForTests() === null,
+    "wake scheduler: no timer when the table is empty",
+  );
+
+  // D. the armed setTimeout really fires (short-delay end-to-end)
+  busEmits.length = 0;
+  cleanWake();
+  await schedSeedState({ windowStartedAt: Date.now() - W2H - 5_000 });
+  const headD = Date.now() + 120;
+  await mutateWakeTable(() => ({
+    next: {
+      version: 1,
+      points: [headD],
+      updatedAt: Date.now(),
+      source: "firstCall",
+    },
+  }));
+  __ensureWakeTimerForTests();
+  await new Promise((r) => setTimeout(r, 600));
+  assert(
+    busEmits.some((e) => e.ch === "billing:window_reset"),
+    "wake scheduler: armed setTimeout fires and resets the window",
+  );
+  const tD = readWakeTable();
+  assert(
+    tD !== null && tD.points.length === 0,
+    "wake scheduler: timer fire consumes the point",
+  );
+
+  // E. T5: burned head (older than the 30-min TTL) -> quiet purge, no emit
+  busEmits.length = 0;
+  cleanWake();
+  await mutateWakeTable(() => ({
+    next: {
+      version: 1,
+      points: [Date.now() - 40 * 60_000], // burned (FR-012-10)
+      updatedAt: Date.now(),
+      source: "firstCall",
+    },
+  }));
+  await schedSeedState({ windowStartedAt: Date.now() - W2H - 5_000 });
+  await __wakeSyncTickForTests();
+  await new Promise((r) => setTimeout(r, 100));
+  assert(
+    !busEmits.some((e) => e.ch === "billing:window_reset"),
+    "wake sync tick: burned point purged without a reset emit",
+  );
+  const tE = readWakeTable();
+  assert(
+    tE !== null && tE.points.length === 0,
+    "wake sync tick: burned point dropped from the table",
+  );
+  assert(
+    wakeHasRefForTests() === null,
+    "wake sync tick: nothing left to arm after the purge",
+  );
+
+  // F. T5: due head within the TTL -> the sync tick drives the wake path
+  busEmits.length = 0;
+  cleanWake();
+  const headF = Date.now() - 2 * 60_000; // due, within TTL
+  await mutateWakeTable(() => ({
+    next: {
+      version: 1,
+      points: [headF],
+      updatedAt: Date.now(),
+      source: "firstCall",
+    },
+  }));
+  await schedSeedState({ windowStartedAt: Date.now() - W2H - 5_000 });
+  await __wakeSyncTickForTests();
+  await new Promise((r) => setTimeout(r, 150));
+  assert(
+    busEmits.some((e) => e.ch === "billing:window_reset"),
+    "wake sync tick: due point fires the reset",
+  );
+  const tF = readWakeTable();
+  assert(
+    tF !== null && tF.points.length === 0,
+    "wake sync tick: due point consumed",
+  );
+  const noteF = `wake ${String(new Date(headF).getHours()).padStart(2, "0")}:${String(new Date(headF).getMinutes()).padStart(2, "0")}`;
+  const rowF = schedHistoryLastRow();
+  assert(
+    rowF[2] === "window_reset" && rowF[11] === noteF,
+    `wake sync tick: history note "${noteF}" (got kind='${rowF[2]}' note='${rowF[11]}')`,
+  );
+
+  // teardown: no scheduler timer may survive the block
+  __stopWakeTimerForTests();
+  cleanWake();
+  cleanState();
 
   // ---- ui.ts tests ----
 
@@ -1163,6 +1806,7 @@ async function main(): Promise<void> {
   resetPaths();
   historyResetPaths();
   armsResetPaths();
+  wakeResetPaths();
   restoreMock();
 
   console.log("\n========================================");

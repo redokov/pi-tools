@@ -23,7 +23,7 @@
  *
  * Failure policy: appendHistory/trimHistory never throw -- they return
  * false / 0 and warn. History is a passive observer; it must never break
- * billing, the ticker, or the host pi process (same policy as notifier.ts).
+ * billing, the wake scheduler, or the host pi process (same policy as notifier.ts).
  */
 
 import * as fs from "node:fs";
@@ -88,6 +88,7 @@ let historyLock = path.join(
 export function setPaths(newFile: string, newLock: string): void {
   historyFile = newFile;
   historyLock = newLock;
+  warnedForeignHeader = false;
 }
 
 export function resetPaths(): void {
@@ -103,6 +104,7 @@ export function resetPaths(): void {
     "agent",
     "pi-billing-window-history.lock",
   );
+  warnedForeignHeader = false;
 }
 
 export function getHistoryFile(): string {
@@ -173,23 +175,97 @@ async function withHistoryLock<T>(fn: () => T): Promise<T> {
 }
 
 /**
+ * Foreign (unrecognized) header warning -- at most ONCE per process (spec 013
+ * FR-003): the previous per-append warning spammed every pi window on every
+ * event. Flag lives for the process lifetime and is reset by setPaths() /
+ * resetPaths() so tests with multiple files start clean.
+ */
+let warnedForeignHeader = false;
+
+/**
+ * Silent repair of a NUL-corrupted history file (spec 013 FR-001/FR-002/FR-004).
+ * Caller holds the lock. A leading run of NUL bytes is always the result of a
+ * crashed write (NTFS zero-fills the allocation after power loss), never a
+ * deliberate foreign format -- so we repair it WITHOUT any warning.
+ *
+ * Algorithm: strip the leading NUL block, restore the file head as BOM +
+ * HEADER, keep the surviving data rows byte-for-byte, EOL style taken from the
+ * surviving content (CRLF file stays CRLF). The rewrite goes through a tmp
+ * file + renameSync (same pattern as the LEGACY migration), so a crash
+ * mid-repair leaves either the old (corrupted) or the new (repaired) file,
+ * never a mix. Never throws outward: on failure we warn and leave the file
+ * untouched (passive observer policy).
+ */
+function repairNulPrefixLocked(buf: Buffer): void {
+  const tmp = historyFile + ".tmp." + process.pid;
+  try {
+    // Strip the leading NUL block.
+    let offset = 0;
+    while (offset < buf.length && buf[offset] === 0) offset++;
+    let rest = buf.subarray(offset).toString("utf8");
+    // A stray BOM may have survived right before the first data row; the new
+    // head always carries a fresh BOM, so cut the old one to avoid doubling.
+    if (rest.startsWith("\uFEFF")) rest = rest.slice(1);
+    // Pathological case: the first surviving line still contains NUL bytes
+    // (non-leading corruption) -- that line is destroyed beyond repair, drop
+    // it and keep everything after it.
+    const firstNl = rest.indexOf("\n");
+    const firstLine = firstNl === -1 ? rest : rest.slice(0, firstNl);
+    if (firstLine.includes("\x00")) {
+      rest = firstNl === -1 ? "" : rest.slice(firstNl + 1);
+    }
+    // EOL style from the surviving content (same rule as LEGACY migration).
+    const eol = rest.includes("\r\n") ? "\r\n" : "\n";
+    fs.writeFileSync(tmp, "\uFEFF" + HEADER + eol + rest, "utf8");
+    fs.renameSync(tmp, historyFile);
+  } catch (err) {
+    console.warn("pi-billing-window: history NUL repair failed:", err);
+  } finally {
+    // Never leave an orphan .tmp behind (rename may have failed midway).
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // already renamed away or never written -- nothing to clean up
+    }
+  }
+}
+
+/**
  * Ensure the file exists AND carries the current schema. Caller holds the lock.
  *
  * - Missing file: create with BOM + HEADER.
+ * - First line contains NUL bytes (crashed-write corruption, spec 013): silent
+ *   repair via repairNulPrefixLocked() -- strip the NUL prefix, restore the
+ *   BOM + HEADER head, keep surviving rows. No warning: this is damage
+ *   recovery, not a foreign format.
  * - Legacy 12-column header (pre-model): one-time migration to the 13-column
  *   HEADER. Only the first line is replaced; data rows are copied untouched
  *   (old rows stay positionally valid: model is the LAST column). The rewrite
  *   goes through a tmp file + renameSync (same pattern as state.ts), so a
  *   crash mid-migration leaves either the old or the new file, never a mix.
  * - Current header: no-op (idempotent).
- * - Foreign header: warn and leave the file alone (fire-and-forget policy).
+ * - Foreign header (no NUL): leave the file alone (fire-and-forget policy)
+ *   and warn at most once per process.
  */
 function ensureSchemaLocked(): void {
   if (!fs.existsSync(historyFile)) {
     fs.writeFileSync(historyFile, "\uFEFF" + HEADER + "\n", "utf8");
     return;
   }
-  const raw = fs.readFileSync(historyFile, "utf8");
+  // Byte-level read (Buffer): the NUL detection below compares raw bytes, so
+  // we never need to decode a multi-MB NUL block, and the same buffer feeds
+  // every branch (repair / header / legacy / foreign) after one decode.
+  const buf = fs.readFileSync(historyFile);
+  const raw = buf.toString("utf8");
+  // NUL detection: any 0x00 byte within the first line (up to the first \n;
+  // a file without \n counts as one line). NUL is never valid in a UTF-8 CSV
+  // header, so this cannot false-positive on a foreign-but-valid file.
+  const nlIdx = buf.indexOf(0x0a);
+  const firstLineBytes = buf.subarray(0, nlIdx === -1 ? buf.length : nlIdx);
+  if (firstLineBytes.includes(0)) {
+    repairNulPrefixLocked(buf);
+    return; // the current append then writes into the repaired file
+  }
   // Detect the file's EOL style BEFORE rewriting, so a CRLF legacy file stays
   // uniformly CRLF after migration (header and data rows share one EOL).
   const eol = raw.includes("\r\n") ? "\r\n" : "\n";
@@ -199,11 +275,14 @@ function ensureSchemaLocked(): void {
   const first = (lines[0] ?? "").replace(/^\uFEFF/, "");
   if (first === HEADER) return; // already current schema
   if (first !== LEGACY_HEADER) {
-    console.warn(
-      "pi-billing-window: unrecognized history header, skipping schema " +
-        "migration; rows will still be APPENDED to this file with its " +
-        "foreign header, so columns may not line up with the expected schema",
-    );
+    if (!warnedForeignHeader) {
+      console.warn(
+        "pi-billing-window: unrecognized history header, skipping schema " +
+          "migration; rows will still be APPENDED to this file with its " +
+          "foreign header, so columns may not line up with the expected schema",
+      );
+      warnedForeignHeader = true;
+    }
     return;
   }
   const hadBom = (lines[0] ?? "").startsWith("\uFEFF");

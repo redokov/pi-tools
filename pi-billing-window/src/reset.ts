@@ -1,20 +1,20 @@
 /**
- * ticker.ts -- 5-minute ticker for window reset detection.
+ * reset.ts -- window reset detection for pi-billing-window (spec 012, TD-002).
  *
- * Every TICK_MS we call checkAndReset(emit) which, under a lock:
- *   - reads the current state
- *   - if it is null -> nothing to do
- *   - if window has expired -> dedup check, then reset (emit "billing:window_reset")
- *   - if window is about to expire (<= ABOUT_TO_RESET_MS remaining) -> emit "billing:window_about_to_reset"
+ * `checkAndReset` перенесён из ticker.ts ДОСЛОВНО (DEDUP_WINDOW_MS,
+ * ABOUT_TO_RESET_MS, EmitFn, HistoryMeta); единственное изменение сигнатуры --
+ * опциональный параметр `note` (default "auto"), попадающий в history-строку
+ * window_reset (TD-008: wake-вызовы передают "wake HH:MM" локального времени
+ * сработавшей точки, существующие вызовы не меняются).
  *
- * startTicker(emit) starts a module-level setInterval.
- * stopTicker() clears it (safe to call multiple times).
+ * Интервальная механика (TICK_MS, startTicker/stopTicker) НЕ переносится --
+ * "когда проверять" теперь решает планировщик wakeups.ts, "как проверять" --
+ * этот модуль. Passive observer: checkAndReset никогда не роняет хост-процесс.
  */
 
 import { mutateState, type State } from "./state.js";
 import { appendHistory } from "./history.js";
 
-export const TICK_MS = 5 * 60 * 1000;
 export const ABOUT_TO_RESET_MS = 5 * 60 * 1000;
 export const DEDUP_WINDOW_MS = 10 * 60 * 1000;
 
@@ -26,6 +26,7 @@ export type HistoryMeta = { project?: string; session?: string };
 export async function checkAndReset(
   emit: EmitFn,
   meta?: HistoryMeta,
+  note = "auto",
 ): Promise<boolean> {
   try {
     let didReset = false;
@@ -81,7 +82,7 @@ export async function checkAndReset(
         session: meta?.session,
         callsInWindow: fresh?.callsInWindow,
         resetCount: fresh?.resetCount,
-        note: "auto",
+        note,
       });
     } else if (aboutToReset !== null) {
       emit("billing:window_about_to_reset", aboutToReset);
@@ -89,7 +90,7 @@ export async function checkAndReset(
 
     return didReset;
   } catch (err) {
-    // Never let a ticker failure kill the host process.
+    // Never let a reset check kill the host process.
     // ELOCKED (state-lock contention with another window/process holding
     // it longer than the retry budget) is NOT fatal: the other holder did
     // the check, and the next tick retries. Do not spam the agent window
@@ -104,41 +105,4 @@ export async function checkAndReset(
     console.warn("pi-billing-window: checkAndReset failed:", msg);
     return false;
   }
-}
-
-let intervalHandle: ReturnType<typeof setInterval> | null = null;
-
-export function startTicker(emit: EmitFn): () => void {
-  // If already running, stop the previous one so we never have two intervals.
-  if (intervalHandle !== null) {
-    clearInterval(intervalHandle);
-    intervalHandle = null;
-  }
-
-  intervalHandle = setInterval(() => {
-    void checkAndReset(emit);
-  }, TICK_MS);
-  intervalHandle.unref();
-
-  return () => {
-    if (intervalHandle !== null) {
-      clearInterval(intervalHandle);
-      intervalHandle = null;
-    }
-  };
-}
-
-export function stopTicker(): void {
-  if (intervalHandle !== null) {
-    clearInterval(intervalHandle);
-    intervalHandle = null;
-  }
-}
-
-/**
- * Spec 003 (exit hygiene): test probe -- whether the running interval is
- * ref'd (keeps the event loop alive). null = no interval running.
- */
-export function hasRefForTests(): boolean | null {
-  return intervalHandle === null ? null : intervalHandle.hasRef();
 }

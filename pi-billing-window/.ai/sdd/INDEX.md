@@ -16,3 +16,5 @@
 | `009-flag-follows-continuation` | implementation:done | design.md, tasks.md |
 | `010-command-ctx-selfhealing` | implementation:done | design.md, tasks.md |
 | `011-arm-gone-notify-misroute-gating` | review:done | requirements.md, design.md, tasks.md, review.md |
+| `012-absolute-wake-scheduler` | implementation:done | requirements.md, design.md, tasks.md |
+| `013-history-nul-repair` | implementation:done | requirements.md, design.md, tasks.md |

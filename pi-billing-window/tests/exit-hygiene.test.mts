@@ -4,7 +4,7 @@
  * Run: npx tsx tests/exit-hygiene.test.mts
  *
  * Two layers:
- *  1. unit: the extension's periodic intervals (ticker.ts, ui.ts) must NOT
+ *  1. unit: the extension's periodic timers (wakeups.ts, ui.ts) must NOT
  *     keep the event loop alive on their own (unref parity with the
  *     watchdog timers in index.ts). Checked via hasRefForTests() probes.
  *  2. e2e: spawn every existing suite with the tsx CLI and require exit
@@ -19,7 +19,7 @@
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 
-import * as ticker from "../src/ticker.ts";
+import * as wakeups from "../src/wakeups.ts";
 import * as ui from "../src/ui.ts";
 
 // --- tiny assert harness (tests/*.test.mts house style) ----------------------
@@ -42,20 +42,20 @@ function assert(cond: boolean, name: string): void {
 
 /**
  * The unref parity contract: like the watchdog timers in index.ts, the
- * ticker and statusUpdater intervals must not keep a (test) process alive
- * once nothing else references the loop. hasRefForTests() returns null
- * when the interval is not running.
+ * wake timer and statusUpdater intervals must not keep a (test) process
+ * alive once nothing else references the loop. hasRefForTests() returns
+ * null when the timer is not armed.
  */
 function unitUnrefContract(): void {
-  ticker.startTicker(() => {});
+  wakeups.armWakeTimer(Date.now() + 60_000, () => {});
   assert(
-    ticker.hasRefForTests() === false,
-    "unit: ticker interval unref (hasRef false после startTicker)",
+    wakeups.hasRefForTests() === false,
+    "unit: wake timer unref (hasRef false после armWakeTimer)",
   );
-  ticker.stopTicker();
+  wakeups.clearWakeTimer();
   assert(
-    ticker.hasRefForTests() === null,
-    "unit: ticker interval очищен после stopTicker",
+    wakeups.hasRefForTests() === null,
+    "unit: wake timer очищен после clearWakeTimer",
   );
 
   const stop = ui.startStatusUpdater({
