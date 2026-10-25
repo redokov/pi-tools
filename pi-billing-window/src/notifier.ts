@@ -46,6 +46,27 @@ export type NotifyPayload = {
   title: string;
   body: string;
   timestamp: number;
+} | {
+  /** Spec 014 (FR-014-2): night plan re-armed the vanished flag automatically. */
+  type: "billing:night-plan-rearm";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
+} | {
+  /** Spec 014 (FR-014-3): night plan could not insure the night (escalate, rate-limited). */
+  type: "billing:night-plan-uninsured";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
+} | {
+  /** Spec 014 (FR-014-5): morning report digest (2 lines). */
+  type: "billing:night-report";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
 };
 
 export type NotifyOptions = {

@@ -54,6 +54,16 @@ export async function checkAndReset(
           resetCount: state.resetCount + 1,
           callsInWindow: 0,
           firstCallEmittedAt: undefined,
+          // Spec 014 (FR-014-4): итоги завершившегося окна уходят в prev*
+          // (ночная книга читает их из payload billing:window_reset),
+          // аккумулирующие поля нового окна стартуют с нуля.
+          windowInput: 0,
+          windowOutput: 0,
+          windowCacheRead: 0,
+          prevWindowCalls: state.callsInWindow,
+          prevWindowInput: state.windowInput ?? 0,
+          prevWindowOutput: state.windowOutput ?? 0,
+          prevWindowCacheRead: state.windowCacheRead ?? 0,
         };
 
         didReset = true;

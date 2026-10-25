@@ -22,6 +22,22 @@ export type State = {
   firstCallEmittedAt?: number;
   /** Timestamp of the most recent 429 (limit exhausted) from the provider. */
   last429At?: number;
+  /**
+   * Spec 014 (FR-014-4): аккумулируемые токены ТЕКУЩЕГО окна (пишутся на
+   * каждом after_provider_response, обнуляются на reset).
+   */
+  windowInput?: number;
+  windowOutput?: number;
+  windowCacheRead?: number;
+  /**
+   * Spec 014 (FR-014-4): итоги окна, которое ТОЛЬКО ЧТО закончилось --
+   * пишутся в момент reset (reset.ts и ручные сбросы), читаются подписчиком
+   * billing:window_reset для строки ночной книги.
+   */
+  prevWindowCalls?: number;
+  prevWindowInput?: number;
+  prevWindowOutput?: number;
+  prevWindowCacheRead?: number;
 };
 
 let stateFile = path.join(os.homedir(), ".pi", "agent", "pi-billing-window.json");

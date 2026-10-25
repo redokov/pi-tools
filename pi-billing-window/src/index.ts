@@ -64,10 +64,11 @@ import {
   forceUpdate as forceUpdateStatus,
 } from "./ui.js";
 import { parseDuration, formatDuration } from "./parser.js";
-import { sendNotify } from "./notifier.js";
+import { sendNotify, type NotifyPayload } from "./notifier.js";
 import {
   appendHistory,
   trimHistory,
+  isoLocal,
   type HistoryUsage,
 } from "./history.js";
 import {
@@ -98,6 +99,26 @@ import {
   clearWatchdog,
   computeFireAt,
 } from "./watchdog.js";
+// Spec 014 (night plan): ночной контракт -- план-файл, интервальная
+// математика, ночная книга и сборка утреннего отчёта.
+import {
+  readPlan,
+  writePlan,
+  clearPlan,
+  inInterval,
+  parseHHMM,
+  fmtHHMM,
+  nextOccurrence,
+  previousOccurrence,
+  nightDateFor,
+  appendLedger,
+  readLedger,
+  readHistoryRows,
+  buildMorningReport,
+  reportPathFor,
+  type NightPlan,
+  type LedgerRow,
+} from "./nightplan.js";
 
 export { setArmsLogPath };
 // Spec 007: direct unit-test exports for the new delivery/gating helpers.
@@ -105,6 +126,14 @@ export { verifyDelivered, isTokenBearing, ownerQuiet };
 
 const PROVIDER = "wormsoft";
 const WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+/**
+ * Spec 014 (FR-014-6): version stamp формата 014.<date>. Дописывается
+ * как токен v= через withAttr (только добавляет, существующие токены не
+ * трогает), показывается в /billing-status и в шапке утреннего отчёта --
+ * защита от повторения deploy-разрыва 24.10 («ночь работала на коде N»).
+ */
+export const VERSION = "014.2026-10-25";
 
 /**
  * Build a fresh State for a brand-new window.
@@ -173,6 +202,12 @@ let unsubscribeAboutToReset: (() => void) | null = null;
  * handlers can evolve independently.
  */
 let unsubscribeWindowResetNotify: (() => void) | null = null;
+
+/**
+ * Spec 014 (FR-014-4): unsubscriber для подписчика ночной книги
+ * (ledger-строка на каждый billing:window_reset в интервале плана).
+ */
+let unsubscribeWindowResetLedger: (() => void) | null = null;
 
 /**
  * Stopper returned by startStatusUpdater(). Called on session_shutdown so
@@ -292,6 +327,8 @@ function withAttr(
   if (!/\bpid=/.test(out)) out += ` pid=${process.pid}`;
   if (!/\bhost=/.test(out)) out += ` host=${hostId}`;
   if (!/\bep=/.test(out)) out += ` ep=${sessionEpoch}`;
+  // Spec 014 (FR-014-6): версия кода, обрабатывавшего ночь (additive).
+  if (!/\bv=/.test(out)) out += ` v=${VERSION}`;
   let src: "probe" | "epoch-guard" | "drain" | null = null;
   let mismatch = false;
   if (stale) {
@@ -1021,11 +1058,16 @@ function ensureSyncPoller(): void {
     syncTimer = setInterval(() => {
       syncWatchdog();
       void wakeSyncTick();
+      // Spec 014: инвариант страховки + перевзвод утреннего таймера.
+      void nightPlanTick();
+      ensureMorningTimer();
     }, SYNC_POLL_MS);
     syncTimer.unref();
   }
   syncWatchdog();
   void wakeSyncTick();
+  void nightPlanTick();
+  ensureMorningTimer();
 }
 
 /**
@@ -1086,7 +1128,11 @@ function syncWatchdog(): void {
     arm !== null
   ) {
     lastTtlExtendedReset = st.lastResetAt;
-    void armsExtendArmTtl(armsGetKey(), ARMS_TTL_MS);
+    // Fire-and-forget с ЯВНЫМ .catch: неудача продления TTL не критична
+    // (следующий тик повторит), а голый void здесь ронял процесс
+    // unhandled-rejection'ом, когда e2e-cleanup удалял tmp-каталог под
+    // ногами ждущего лок (ENOENT mkdir arms.lock.lock).
+    void armsExtendArmTtl(armsGetKey(), ARMS_TTL_MS).catch(() => {});
   }
 
   // Spec 006 (D-603c / FR-102): форс-перерис доставки на ПЕРВОМ же sync-тике,
@@ -1180,15 +1226,28 @@ function syncWatchdog(): void {
             `флаг исчез/истёк (sync-poller продолжает жить), reason=${reason}`,
           ),
         );
-        // Spec 011 (D1): уведомление об исчезновении/истечении флага —
-        // новый type в union NotifyPayload (notifier.ts).
-        void sendNotify({
-          type: "billing:cont-after-reset-arm-gone",
-          provider: PROVIDER,
-          title: "cont-after-reset: флаг сгорел",
-          body: bodyText,
-          timestamp: Date.now(),
-        });
+        // Spec 014 (FR-014-3, §5.2): в интервале активного плана arm-gone-notify
+        // ГАСИТСЯ: инвариант на этом же тике (или следующим, ≤60 с) либо уже
+        // перевзводит флаг (одно событие night-plan-rearm), либо шлёт
+        // night-plan-uninsured. Дублировать пользователя не нужно.
+        if (activePlanForKey(key) !== null) {
+          armsLog(
+            "night-plan:arm-gone-suppressed",
+            withAttr(
+              `billing:cont-after-reset-arm-gone погашен (reason=${reason}): инвариант плана разберётся`,
+            ),
+          );
+        } else {
+          // Spec 011 (D1): уведомление об исчезновении/истечении флага —
+          // новый type в union NotifyPayload (notifier.ts).
+          void sendNotify({
+            type: "billing:cont-after-reset-arm-gone",
+            provider: PROVIDER,
+            title: "cont-after-reset: флаг сгорел",
+            body: bodyText,
+            timestamp: Date.now(),
+          });
+        }
       }
       // Spec 011 (D1): снимок сбрасывается вместе с ключом перехода —
       // повторные тики без флага не считаются новым переходом (no dup).
@@ -2131,12 +2190,23 @@ function subscribeToBillingEvents(): void {
     } catch {}
     unsubscribeWindowResetNotify = null;
   }
+  if (unsubscribeWindowResetLedger) {
+    try {
+      unsubscribeWindowResetLedger();
+    } catch {}
+    unsubscribeWindowResetLedger = null;
+  }
 
   try {
     unsubscribeWindowReset = bus.on("billing:window_reset", handleWindowReset);
     unsubscribeWindowResetNotify = bus.on(
       "billing:window_reset",
       handleWindowResetForNotify,
+    );
+    // Spec 014 (FR-014-4): ночная книга -- третий подписчик канала.
+    unsubscribeWindowResetLedger = bus.on(
+      "billing:window_reset",
+      handleWindowResetForLedger,
     );
     unsubscribeAboutToReset = bus.on(
       "billing:window_about_to_reset",
@@ -2165,6 +2235,12 @@ function unsubscribeFromBillingEvents(): void {
       unsubscribeWindowResetNotify();
     } catch {}
     unsubscribeWindowResetNotify = null;
+  }
+  if (unsubscribeWindowResetLedger) {
+    try {
+      unsubscribeWindowResetLedger();
+    } catch {}
+    unsubscribeWindowResetLedger = null;
   }
 }
 
@@ -2330,6 +2406,9 @@ async function onSessionStart(
     // Spec 012 (T4): session_start is a scheduler re-arm event even on the
     // blocked path (the wake table is process-global, not session-scoped).
     ensureWakeTimer();
+    // Spec 014 (FR-014-5): утренний таймер -- тоже process-global (план
+    // живёт вне беседы), перевзводим и на blocked-пути.
+    ensureMorningTimer();
     return;
   }
 
@@ -2445,6 +2524,23 @@ async function onSessionStart(
     const key = sessionKeyOf(ctx);
     const reason = (event as { reason?: string } | null)?.reason;
     if (remapKey(reason ?? "") === "carry") {
+      // Spec 014 (design §8): /new унёс разговор (и флаг) -- если активный
+      // план страховал прежний ключ, запоминаем carry-ключ: инвариант
+      // продолжит страховать унесённый ключ, план не перезаписываем.
+      const prevKey = armsGetKey();
+      if (
+        prevKey !== null &&
+        prevKey !== key &&
+        activePlanForKey(prevKey) !== null
+      ) {
+        nightPlanCarryKey = key;
+        armsLog(
+          "night-plan:carry",
+          withAttr(
+            `план следует за сессией: ${sessionKeyBase(prevKey)} -> ${sessionKeyBase(key)}`,
+          ),
+        );
+      }
       await armsCarryArmTo(key);
     } else {
       armsSwitchKey(key);
@@ -2453,6 +2549,9 @@ async function onSessionStart(
     // an external writer (night-agent helper scripts/arm_cont_after_reset.py),
     // and a live sync-poller is what notices and re-arms the watchdog.
     ensureSyncPoller();
+    // Spec 014 (FR-014-5): session_start владельца -- перевзвод утреннего
+    // таймера плана (wall-clock, unref).
+    ensureMorningTimer();
     refreshMarker();
   } catch (err) {
     console.warn("pi-billing-window: arms session init failed:", err);
@@ -2539,6 +2638,10 @@ async function onAfterProviderResponse(
   const emit = buildEmitFn();
   const timestamp = Date.now();
 
+  // Spec 014 (FR-014-4): usage читается ОДИН раз -- аккумуляция токенов
+  // окна в State и history-строка используют один и тот же снимок.
+  const usage = lastAssistantUsage(ctx);
+
   // Read state once outside the lock to grab windowStartedAt for the
   // first_call payload (avoids re-reading after the lock).
   const before = readStateSync();
@@ -2553,6 +2656,11 @@ async function onAfterProviderResponse(
     const next: State = {
       ...cur,
       callsInWindow: cur.callsInWindow + 1,
+      // Spec 014 (FR-014-4): аккумулируемые токены окна (обнуляются на
+      // reset в reset.ts; ночная книга читает их через prevWindow*).
+      windowInput: (cur.windowInput ?? 0) + (usage?.input ?? 0),
+      windowOutput: (cur.windowOutput ?? 0) + (usage?.output ?? 0),
+      windowCacheRead: (cur.windowCacheRead ?? 0) + (usage?.cacheRead ?? 0),
     };
 
     if (cur.firstCallEmittedAt === undefined) {
@@ -2580,7 +2688,7 @@ async function onAfterProviderResponse(
     respKey2 === ownerKey &&
     !respKey2.startsWith("ephemeral:") &&
     pendingFiredResetAt !== null &&
-    isTokenBearing(lastAssistantUsage(ctx));
+    isTokenBearing(usage);
   const armState = readStateSync();
   const confirmed = confirmEligible
     ? await armsConfirmSuccess(Date.now(), {
@@ -2670,7 +2778,7 @@ async function onAfterProviderResponse(
     model: modelId,
     callsInWindow: fresh?.callsInWindow,
     resetCount: fresh?.resetCount,
-    usage: lastAssistantUsage(ctx),
+    usage,
   });
 
   // Refresh the status bar so the callsInWindow counter and any freshly
@@ -2743,7 +2851,10 @@ function registerBillingStatus(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => {
       const s = readStateSync();
       if (s === null) {
-        ctx.ui.notify("pi-billing-window: state не инициализирован", "info");
+        ctx.ui.notify(
+          `pi-billing-window: state не инициализирован (v=${VERSION})`,
+          "info",
+        );
         return;
       }
       const remain = Math.max(0, s.windowMs - (Date.now() - s.windowStartedAt));
@@ -2752,8 +2863,9 @@ function registerBillingStatus(pi: ExtensionAPI): void {
       const m = mm % 60;
       const hhStr = String(hh).padStart(2, "0");
       const mmStr = String(m).padStart(2, "0");
+      // Spec 014 (FR-014-6): version stamp в /billing-status.
       ctx.ui.notify(
-        `${s.provider}: до reset ${hhStr}:${mmStr} ч:мин (calls=${s.callsInWindow}, resets=${s.resetCount})`,
+        `${s.provider}: до reset ${hhStr}:${mmStr} ч:мин (calls=${s.callsInWindow}, resets=${s.resetCount}) v=${VERSION}`,
         "info",
       );
     },
@@ -2809,6 +2921,14 @@ function registerBillingReset(pi: ExtensionAPI): void {
           resetCount: cur.resetCount + 1,
           callsInWindow: 0,
           firstCallEmittedAt: undefined,
+          // Spec 014 (FR-014-4): итоги окна -- в prev*, аккумуляторы -- в 0.
+          windowInput: 0,
+          windowOutput: 0,
+          windowCacheRead: 0,
+          prevWindowCalls: cur.callsInWindow,
+          prevWindowInput: cur.windowInput ?? 0,
+          prevWindowOutput: cur.windowOutput ?? 0,
+          prevWindowCacheRead: cur.windowCacheRead ?? 0,
         };
         return { next };
       });
@@ -2906,6 +3026,14 @@ function registerSettimer(pi: ExtensionAPI): void {
               resetCount: cur.resetCount + 1,
               callsInWindow: 0,
               firstCallEmittedAt: undefined,
+              // Spec 014 (FR-014-4): итоги окна -- в prev*, аккумуляторы -- в 0.
+              windowInput: 0,
+              windowOutput: 0,
+              windowCacheRead: 0,
+              prevWindowCalls: cur.callsInWindow,
+              prevWindowInput: cur.windowInput ?? 0,
+              prevWindowOutput: cur.windowOutput ?? 0,
+              prevWindowCacheRead: cur.windowCacheRead ?? 0,
             },
           };
         });
@@ -3132,6 +3260,579 @@ function registerContAfterReset(pi: ExtensionAPI): void {
   });
 }
 
+// --- Spec 014: night plan (ночной контракт страховки ночной сессии) -------------
+
+/**
+ * Spec 014 (§12): injectable notify-транспорт ночи — тесты перехватывают
+ * rearm/uninsured/report без реального HTTP; в проде — sendNotify.
+ */
+type NightNotifyPayload = Extract<
+  NotifyPayload,
+  {
+    type:
+      | "billing:night-plan-rearm"
+      | "billing:night-plan-uninsured"
+      | "billing:night-report";
+  }
+>;
+
+let nightNotifyHook: ((p: NightNotifyPayload) => void) | null = null;
+
+/** fire-and-forget notify ночи (хук тестов или sendNotify, никогда не бросает). */
+function nightNotify(p: NightNotifyPayload): void {
+  if (nightNotifyHook !== null) {
+    try {
+      nightNotifyHook(p);
+    } catch {}
+    return;
+  }
+  void sendNotify(p);
+}
+
+/** Rate-limit notify night-plan-uninsured (память процесса, design §5.2). */
+let uninsuredNotifyRateMs = 10 * 60_000;
+/** Порог «флаг снят снова»: перевзвод чаще — escalate (FR-014-3). */
+let rearmRepeatEscalateMs = 30 * 60_000;
+/** Сгоревший утренний таймер: тишина после to + N минут (§8 edge). */
+let morningGraceMs = 30 * 60_000;
+
+/** Spec 014 (§8): carry-ключ плана — куда /new унёс разговор этой ночи. */
+let nightPlanCarryKey: string | null = null;
+
+/** Пейсинг инварианта и эскалации по ключу плана (память процесса). */
+const lastAutoRearmAt = new Map<string, number>();
+const lastUninsuredNotifyAt = new Map<string, number>();
+
+/** In-memory счётчики ночи для утреннего отчёта (§7). */
+const nightStats = {
+  nightDate: null as string | null,
+  rearm: 0,
+  uninsured: 0,
+};
+
+function bumpNightStats(plan: NightPlan, kind: "rearm" | "uninsured"): void {
+  if (nightStats.nightDate !== plan.nightDate) {
+    nightStats.nightDate = plan.nightDate;
+    nightStats.rearm = 0;
+    nightStats.uninsured = 0;
+  }
+  nightStats[kind]++;
+}
+
+/**
+ * Живой план, чьё страхование связано с ключом key: план есть, не истёк,
+ * интервал идёт, key — это plan.key или carry-ключ (§8). null — нет/чужой.
+ * O(1) файловое чтение; используется инвариантом и гашением arm-gone.
+ */
+function activePlanForKey(key: string | null): NightPlan | null {
+  if (key === null) return null;
+  const plan = readPlan();
+  if (plan === null) return null;
+  const now = Date.now();
+  if (now > plan.expiresAt) return null;
+  if (!inInterval(now, plan.fromLocal, plan.toLocal)) return null;
+  if (key !== plan.key && key !== nightPlanCarryKey) return null;
+  return plan;
+}
+
+/**
+ * Инвариант страховки (FR-014-2, design §5.1): на каждом sync-тике при
+ * живом плане и незастрахованном ключе — auto-rearm (arm + armslog +
+ * notify). Неудача arm() или слишком частый перевзвод — escalate
+ * night-plan-uninsured с rate-limit (§5.2). Никогда не бросает наружу
+ * (NFR-014-2); все тайминги — параметры (тест-хуки ниже, NFR-014-1).
+ */
+async function nightPlanTick(): Promise<void> {
+  try {
+    const plan = readPlan();
+    if (plan === null) return;
+    const now = Date.now();
+    if (now > plan.expiresAt) return;
+    if (!inInterval(now, plan.fromLocal, plan.toLocal)) return;
+    const curKey = armsGetKey();
+    if (curKey === null) return;
+
+    // Застрахован ли план: флаг под plan.key или (carry-случай §8) под
+    // текущим ключом этого процесса.
+    const armPlan = armsGetArmForKey(plan.key);
+    const armHere = curKey === plan.key ? armPlan : armsGetArmForKey(curKey);
+    if (armPlan !== null || armHere !== null) {
+      // Страховка жива — сбросить escalate-состояние (design §5.1 п.3).
+      lastUninsuredNotifyAt.delete(plan.key);
+      return;
+    }
+
+    // Owner-guard (NFR-014-4, паттерн D-607/D-608): перевзводит ТОЛЬКО
+    // процесс, показывающий разговор плана (или его carry-наследника).
+    // Чужие процессы — только наблюдение, без мутаций.
+    const isOwner = curKey === plan.key || curKey === nightPlanCarryKey;
+    if (!isOwner) return;
+
+    const prevRearm = lastAutoRearmAt.get(plan.key);
+    lastAutoRearmAt.set(plan.key, now);
+
+    const st = readStateSync();
+    let armedOk = false;
+    try {
+      const rec = await armsArm(st?.lastResetAt ?? 0, now, plan.repeat);
+      armedOk = rec !== null;
+      // TTL флага — до конца плана (FR-014-2): arm() сам даёт 8 ч,
+      // extendArmTtl добирает остаток (никогда не укорачивает).
+      if (armedOk && plan.expiresAt - now > ARMS_TTL_MS) {
+        await armsExtendArmTtl(curKey, plan.expiresAt - now, now);
+      }
+    } catch (err) {
+      armedOk = false;
+      armsLog(
+        "night-plan:auto-rearm-error",
+        withAttr(String((err as Error)?.message ?? err).slice(0, 160)),
+      );
+    }
+
+    if (armedOk) {
+      bumpNightStats(plan, "rearm");
+      armsLog(
+        "night-plan:auto-rearm",
+        withAttr(
+          `auto-rearm:from-plan repeat=${plan.repeat} ${plan.fromLocal}-${plan.toLocal} night=${plan.nightDate}`,
+        ),
+      );
+      nightNotify({
+        type: "billing:night-plan-rearm",
+        provider: PROVIDER,
+        title: "night plan: флаг восстановлен автоматически",
+        body: `План ${plan.fromLocal}–${plan.toLocal}: снятый флаг cont-after-reset перевзведён (repeat=${plan.repeat}). Ночь застрахована.`,
+        timestamp: now,
+      });
+      // FR-014-3: флаг снят снова и перевзводится чаще порога — escalate.
+      if (prevRearm !== undefined && now - prevRearm < rearmRepeatEscalateMs) {
+        nightPlanEscalate(
+          plan,
+          `флаг снят снова в интервале плана (перевзвод чаще ${Math.round(rearmRepeatEscalateMs / 60_000)} мин)`,
+        );
+      }
+      // Свежий флаг — пересинхронизировать watchdog/маркер под него.
+      syncWatchdog();
+      refreshMarker();
+    } else {
+      nightPlanEscalate(
+        plan,
+        "arm() не смог восстановить флаг (lock/ошибка записи arms.json)",
+      );
+    }
+  } catch (err) {
+    console.warn("pi-billing-window: night-plan tick failed:", err);
+  }
+}
+
+/**
+ * Escalate (FR-014-3): armslog night-plan:uninsured на КАЖДОМ событии
+ * (полный лог, без пейсинга), notify billing:night-plan-uninsured —
+ * rate-limited (по умолчанию 10 мин), пока план активен и ключ
+ * незастрахован. Память процесса — новых файлов нет (design §2).
+ */
+function nightPlanEscalate(plan: NightPlan, reason: string): void {
+  const now = Date.now();
+  bumpNightStats(plan, "uninsured");
+  armsLog("night-plan:uninsured", withAttr(`${reason} night=${plan.nightDate}`));
+  const last = lastUninsuredNotifyAt.get(plan.key) ?? 0;
+  if (now - last < uninsuredNotifyRateMs) return;
+  lastUninsuredNotifyAt.set(plan.key, now);
+  nightNotify({
+    type: "billing:night-plan-uninsured",
+    provider: PROVIDER,
+    title: "night plan: ночь НЕ застрахована",
+    body: `План ${plan.fromLocal}–${plan.toLocal}: ${reason}. Проверь arms.json/сессию вручную (/cont-after-reset N или /night-plan off).`,
+    timestamp: now,
+  });
+}
+
+// --- Spec 014: утренний отчёт (wall-clock таймер, FR-014-5) ---------------------
+
+let morningTimer: ReturnType<typeof setTimeout> | null = null;
+let morningScheduledFor: number | null = null;
+/** `${key}@${nightDate}` последнего сгенерированного отчёта (анти-дубликат). */
+let morningDoneKey: string | null = null;
+let warnedMorningOnce = false;
+
+function clearMorningTimer(): void {
+  if (morningTimer !== null) {
+    clearTimeout(morningTimer);
+    morningTimer = null;
+  }
+  morningScheduledFor = null;
+}
+
+/**
+ * Взвести one-shot wall-clock таймер на ближайший toLocal активного плана
+ * (unref, перевзвод на каждом sync-тике и session_start; watchdog.ts
+ * паттерн: cancel-before-arm, delay = max(0, when - now)). Мёртвый/чужой
+ * план — тихо снять. Таймер НЕ останавливается на session_shutdown:
+ * он план-скоуп, не сессия-скоуп (пишет только файлы + notify).
+ */
+function ensureMorningTimer(): void {
+  try {
+    const plan = readPlan();
+    if (plan === null || Date.now() > plan.expiresAt) {
+      clearMorningTimer();
+      return;
+    }
+    const now = Date.now();
+    const when = nextOccurrence(now, plan.toLocal);
+    if (when === null) {
+      clearMorningTimer();
+      return;
+    }
+    if (morningTimer !== null && morningScheduledFor === when) return;
+    clearMorningTimer();
+    morningScheduledFor = when;
+    morningTimer = setTimeout(() => {
+      morningTimer = null;
+      morningScheduledFor = null;
+      void runGuarded(fireMorningReport);
+    }, Math.max(0, when - now));
+    morningTimer.unref();
+  } catch {
+    // quiet (NFR-014-2)
+  }
+}
+
+/**
+ * Сгенерировать утренний отчёт (FR-014-5): nights/report-<nightDate>.md
+ * (ledger + history.csv, version в шапке — «ночь работала на коде N») +
+ * notify billing:night-report с 2-строчным дайджестом. Сгоревший таймер
+ * (машина спала: now > to + morningGraceMs) тихо гасится (design §8),
+ * книга ночи доступна через /night-plan status. Никогда не бросает.
+ */
+async function fireMorningReport(): Promise<void> {
+  try {
+    const plan = readPlan();
+    if (plan === null || Date.now() > plan.expiresAt) return;
+    const now = Date.now();
+    const recentTo = previousOccurrence(now, plan.toLocal);
+    if (recentTo === null || now - recentTo > morningGraceMs) {
+      morningDoneKey = `${plan.key}@${plan.nightDate}`;
+      armsLog(
+        "night-plan:morning-report",
+        withAttr(
+          "сгоревший таймер (машина спала?) — отчёт пропущен, книга ночи доступна через /night-plan status",
+        ),
+      );
+      return;
+    }
+    const doneKey = `${plan.key}@${plan.nightDate}`;
+    if (morningDoneKey === doneKey) return;
+    const ledgerRows = readLedger(plan.nightDate);
+    const historyRows = readHistoryRows(plan.createdAt, now);
+    const md = buildMorningReport(plan, ledgerRows, historyRows, {
+      version: VERSION,
+      nowMs: now,
+      rearmCount: nightStats.nightDate === plan.nightDate ? nightStats.rearm : 0,
+      uninsuredCount:
+        nightStats.nightDate === plan.nightDate ? nightStats.uninsured : 0,
+    });
+    const file = reportPathFor(plan.nightDate);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, md, "utf8");
+    morningDoneKey = doneKey;
+    const used = ledgerRows.filter((r) => r.verdict === "used").length;
+    const idle = ledgerRows.length - used;
+    const totIn = ledgerRows.reduce((s, r) => s + r.input, 0);
+    armsLog(
+      "night-plan:morning-report",
+      withAttr(
+        `отчёт записан: ${file} (окон ${ledgerRows.length}, used ${used}, idle ${idle})`,
+      ),
+    );
+    nightNotify({
+      type: "billing:night-report",
+      provider: PROVIDER,
+      title: `Ночь ${plan.nightDate}: использовано окон ${used}/${ledgerRows.length}`,
+      body: `Простаивало: ${idle}. Input за ночь: ${totIn}. auto-rearm: ${
+        nightStats.nightDate === plan.nightDate ? nightStats.rearm : 0
+      }. Полный отчёт: ${file}`,
+      timestamp: now,
+    });
+  } catch (err) {
+    if (!warnedMorningOnce) {
+      warnedMorningOnce = true;
+      console.warn("pi-billing-window: morning report failed:", err);
+    }
+  }
+}
+
+// --- Spec 014: ночная книга (подписчик billing:window_reset, FR-014-4) ----------
+
+/**
+ * Строку книги пишет процесс, выполнивший сброс: он же единственный
+ * эмиттер billing:window_reset на своей шине (checkAndReset дедупится по
+ * lastResetAt), и именно у него в payload — итоги завершившегося окна
+ * (prevWindow*, аккумулируемые в State). Сброс ИЛИ начало окна вне
+ * интервала плана — строка не пишется. Никогда не бросает наружу.
+ */
+const handleWindowResetForLedger = (payload: unknown): void => {
+  void nightPlanLedgerRow(payload);
+};
+
+async function nightPlanLedgerRow(payload: unknown): Promise<void> {
+  try {
+    const plan = readPlan();
+    if (plan === null) return;
+    const now = Date.now();
+    if (now > plan.expiresAt) return;
+    const p = payload as Partial<State> | null;
+    const resetAt =
+      typeof p?.lastResetAt === "number" && p.lastResetAt > 0
+        ? p.lastResetAt
+        : now;
+    const startedAt =
+      typeof p?.windowStartedAt === "number" ? p.windowStartedAt : resetAt;
+    const resetIn = inInterval(resetAt, plan.fromLocal, plan.toLocal);
+    const startedIn = inInterval(startedAt, plan.fromLocal, plan.toLocal);
+    if (!resetIn && !startedIn) return;
+    const calls = p?.prevWindowCalls ?? 0;
+    // armPhase: свежий arm не имеет поля phase (оно появляется после
+    // markFired) — семантика design §6: undefined => "armed".
+    const armRec = armsGetArmForKey(plan.key);
+    const row: LedgerRow = {
+      tsIso: isoLocal(new Date(now)),
+      epochMs: now,
+      nightDate: plan.nightDate,
+      resetAt,
+      callsInWindow: calls,
+      input: p?.prevWindowInput ?? 0,
+      output: p?.prevWindowOutput ?? 0,
+      cacheRead: p?.prevWindowCacheRead ?? 0,
+      armPhase: armRec === null ? "none" : (armRec.phase ?? "armed"),
+      verdict: calls > 0 ? "used" : "idle",
+    };
+    await appendLedger(row);
+  } catch (err) {
+    console.warn("pi-billing-window: night ledger append failed:", err);
+  }
+}
+
+// --- Spec 014: тест-хуки (design §11) -------------------------------------------
+
+/** Инвариант вручную — детерминизм без 60-с тика. */
+export function __nightPlanTickForTests(): Promise<void> {
+  return nightPlanTick();
+}
+
+/** Утренний отчёт вручную — без wall-clock ожидания toLocal. */
+export function __fireMorningForTests(): Promise<void> {
+  return fireMorningReport();
+}
+
+/** Перехватить ночные notify (rearm/uninsured/report) в тестах; null — проде. */
+export function __setNightPlanNotifyForTests(
+  fn: ((p: NightNotifyPayload) => void) | null,
+): void {
+  nightNotifyHook = fn;
+}
+
+/** Параметры пейсинга эскалации (прод-значения: 10 мин / 30 мин). */
+export function setNightPlanEscalateForTests(
+  notifyRateMs: number,
+  repeatEscalateMs: number,
+): void {
+  uninsuredNotifyRateMs = notifyRateMs;
+  rearmRepeatEscalateMs = repeatEscalateMs;
+}
+
+/** Grace сгоревшего утреннего таймера (прод-значение: 30 мин). */
+export function setNightPlanMorningGraceForTests(ms: number): void {
+  morningGraceMs = ms;
+}
+
+/** Сброс in-memory состояния ночи между тестами. */
+export function __resetNightPlanStateForTests(): void {
+  lastAutoRearmAt.clear();
+  lastUninsuredNotifyAt.clear();
+  nightPlanCarryKey = null;
+  nightStats.nightDate = null;
+  nightStats.rearm = 0;
+  nightStats.uninsured = 0;
+  morningDoneKey = null;
+  warnedMorningOnce = false;
+  clearMorningTimer();
+  nightNotifyHook = null;
+  uninsuredNotifyRateMs = 10 * 60_000;
+  rearmRepeatEscalateMs = 30 * 60_000;
+  morningGraceMs = 30 * 60_000;
+}
+
+/**
+ * /night-plan — ночной контракт (spec 014, FR-014-1): создать/обновить план
+ * на текущую ночь для текущей беседы. План живёт ВНЕ беседы: переживает
+ * дисарм агента; инвариант на sync-тике перевзвёлит флаг по мере
+ * необходимости, в toLocal приходит утренний отчёт, в toLocal+1ч план
+ * истекает. Взвод плана НЕ взводит флаг cont-after-reset сам.
+ *   /night-plan                              — 22:00-08:00, repeat=6
+ *   /night-plan 22:00-08:00 repeat=3 backlog=C:/tasks/night.md
+ *   /night-plan off                          — снять досрочно
+ *   /night-plan status                       — план/флаг/книга ночи
+ */
+function registerNightPlan(pi: ExtensionAPI): void {
+  pi.registerCommand("night-plan", {
+    description:
+      "Ночной план: авто-перевзвод cont-after-reset в интервале (default 22:00-08:00), ночная книга и утренний отчёт. 'off' — снять, 'status' — показать.",
+    handler: async (args, ctx) => {
+      try {
+        const argv = String(args ?? "")
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean);
+        const sub = argv[0]?.toLowerCase();
+
+        if (sub === "off") {
+          const removed = await clearPlan();
+          clearMorningTimer();
+          lastAutoRearmAt.clear();
+          lastUninsuredNotifyAt.clear();
+          nightPlanCarryKey = null;
+          armsLog(
+            "night-plan:off",
+            withAttr(removed ? "план снят командой" : "плана не было (no-op)"),
+          );
+          ctx.ui.notify(
+            removed
+              ? "night plan: план снят (инвариант больше не перевзводит флаг)"
+              : "night plan: активного плана не было",
+            "info",
+          );
+          return;
+        }
+
+        if (sub === "status") {
+          const plan = readPlan();
+          if (plan === null) {
+            ctx.ui.notify(
+              "night plan: плана нет. /night-plan [HH:MM-HH:MM] [repeat=N] [backlog=<path>]",
+              "info",
+            );
+            return;
+          }
+          const now = Date.now();
+          const active = now <= plan.expiresAt;
+          const inInt = active && inInterval(now, plan.fromLocal, plan.toLocal);
+          const arm = armsGetArmForKey(plan.key);
+          const nights = readLedger(plan.nightDate);
+          const used = nights.filter((r) => r.verdict === "used").length;
+          ctx.ui.notify(
+            `night plan: ${plan.fromLocal}–${plan.toLocal} (repeat=${plan.repeat}), ночь ${plan.nightDate}\n` +
+              `план ${active ? "активен" : "истёк"}${inInt ? ", интервал идёт" : ""}; ` +
+              `флаг: ${arm === null ? "нет" : (arm.phase ?? "armed")}\n` +
+              `backlog: ${plan.backlogPath ?? "—"}; книга ночи: ${nights.length} окон (used ${used})\n` +
+              `истекает: ${new Date(plan.expiresAt).toLocaleTimeString()}`,
+            "info",
+          );
+          return;
+        }
+
+        // Создание/обновление плана на текущую ночь.
+        let fromLocal = "22:00";
+        let toLocal = "08:00";
+        let repeat = 6;
+        let backlogPath: string | null = null;
+        for (const tok of argv) {
+          if (/^\d{1,2}:\d{2}-\d{1,2}:\d{2}$/.test(tok)) {
+            const parts = tok.split("-");
+            fromLocal = parts[0];
+            toLocal = parts[1];
+            continue;
+          }
+          const rm = /^repeat=(\d+)$/i.exec(tok);
+          if (rm) {
+            repeat = Math.min(99, Math.max(1, Number(rm[1])));
+            continue;
+          }
+          const bm = /^backlog=(.+)$/i.exec(tok);
+          if (bm) {
+            backlogPath = bm[1];
+            continue;
+          }
+          ctx.ui.notify(
+            `night plan: неизвестный аргумент '${tok}'. Формат: ` +
+              "/night-plan [HH:MM-HH:MM] [repeat=N] [backlog=<path>] | off | status",
+            "error",
+          );
+          return;
+        }
+
+        const fromMin = parseHHMM(fromLocal);
+        const toMin = parseHHMM(toLocal);
+        if (fromMin === null || toMin === null || fromMin === toMin) {
+          ctx.ui.notify(
+            `night plan: неверный интервал ${fromLocal}-${toLocal} (нужно HH:MM-HH:MM, from != to)`,
+            "error",
+          );
+          return;
+        }
+        fromLocal = fmtHHMM(fromMin);
+        toLocal = fmtHHMM(toMin);
+
+        const now = Date.now();
+        const key = sessionKeyOf(ctx);
+        const toAt = nextOccurrence(now, toLocal);
+        if (toAt === null) {
+          ctx.ui.notify("night plan: не удалось вычислить момент отчёта", "error");
+          return;
+        }
+        const nightDate = nightDateFor(now, fromLocal, toLocal);
+        if (nightDate === null) {
+          ctx.ui.notify("night plan: не удалось вычислить дату ночи", "error");
+          return;
+        }
+        const plan: NightPlan = {
+          key,
+          fromLocal,
+          toLocal,
+          repeat,
+          backlogPath,
+          createdAt: now,
+          expiresAt: toAt + 60 * 60_000, // toLocal + 1 ч (FR-014-1)
+          nightDate,
+        };
+        const ok = await writePlan(plan);
+        if (!ok) {
+          ctx.ui.notify(
+            "night plan: не удалось записать план (лок занят?) — попробуй ещё раз",
+            "error",
+          );
+          return;
+        }
+        // Свежий план — чистое in-memory состояние ночи.
+        lastAutoRearmAt.delete(plan.key);
+        lastUninsuredNotifyAt.delete(plan.key);
+        nightPlanCarryKey = null;
+        if (nightStats.nightDate !== plan.nightDate) {
+          nightStats.nightDate = plan.nightDate;
+          nightStats.rearm = 0;
+          nightStats.uninsured = 0;
+        }
+        morningDoneKey = null;
+        armsLog(
+          "night-plan:armed",
+          withAttr(
+            `${plan.fromLocal}-${plan.toLocal} repeat=${plan.repeat} night=${plan.nightDate} expires=${new Date(plan.expiresAt).toISOString()}` +
+              `${plan.backlogPath ? ` backlog=${plan.backlogPath}` : ""}`,
+          ),
+        );
+        ensureMorningTimer();
+        ctx.ui.notify(
+          `night plan: взведён на ${plan.fromLocal}–${plan.toLocal} (ночь ${plan.nightDate}, repeat=${repeat}). ` +
+            `Отчёт в ${plan.toLocal}, план истекает ${new Date(plan.expiresAt).toLocaleTimeString()}. ` +
+            "Флаг cont-after-reset НЕ взведён: инвариант перевзведёт его по мере необходимости (или /cont-after-reset N вручную).",
+          "info",
+        );
+      } catch (err) {
+        console.warn("pi-billing-window: /night-plan failed:", err);
+      }
+    },
+  });
+}
+
 // --- Extension entrypoint -----------------------------------------------------
 
 export default function (pi: ExtensionAPI): void {
@@ -3172,6 +3873,8 @@ export default function (pi: ExtensionAPI): void {
   registerSettimer(pi);
   registerContAfterReset(pi);
   registerSelfReload(pi);
+  // Spec 014: ночной план — новый контракт поверх cont-after-reset.
+  registerNightPlan(pi);
 
   // Touch renderStatusBar so the import is retained for downstream tools
   // and linters that flag unused imports. The function is also exposed for
