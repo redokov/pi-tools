@@ -39,6 +39,7 @@ $files = @(
     "armslog.ts",
     "watchdog.ts",
     "firelease.ts",
+    "nightplan.ts",  # spec 014: ночной план (auto-rearm, ledger, утренний отчёт)
     "package.json"
 )
 
