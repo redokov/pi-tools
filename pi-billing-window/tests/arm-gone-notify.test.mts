@@ -489,6 +489,79 @@ async function testRepeatExhaustedNotify(): Promise<void> {
   }
 }
 
+// --- 2b. external-removal (живой флаг стерли из arms.json извне) --------------
+// Инцидент APKScenTest 24.10: ночной агент снял флаг сам (arm_cont_after_reset.py
+// --remove по стоп-условию), TTL был жив — причина обязана быть external-removal,
+// а не ложный ttl-expired.
+async function testExternalRemovalNotify(): Promise<void> {
+  const tmp = mkdtempSync(join(tmpdir(), "pbi-armgone-"));
+  applyPaths(tmp);
+  __resetStaleStateForTests();
+  const originalFetch = globalThis.fetch;
+  const fetched: Fetched[] = [];
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    fetched.push({
+      url: String(url),
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+      headers: init?.headers,
+    });
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+  try {
+    const { pi, handlers, commands } = makeMockPi();
+    piBillingWindowFactory(pi as never);
+
+    const ctx = makeCtx(join(tmp, "sess-ext.jsonl"));
+    await seedArmed(commands, handlers, ctx);
+    // TTL далеко в будущем, phase=armed — запись заведомо живая.
+    rewriteArm(tmp, (rec) => ({
+      ...rec,
+      phase: "armed",
+      repeat: 8,
+      expiresAt: Date.now() + 6 * 60 * 60 * 1000,
+    }));
+    __syncWatchdogForTests(); // arm-seen: снимок := { armed, 8, TTL жив }
+
+    // Внешний писатель (скрипт/другой процесс) вытер arms.json целиком.
+    writeArmsMap(tmp, {});
+    __syncWatchdogForTests(); // переход arm-gone → reason external-removal
+    await sleep(300);
+
+    const notifies = armGoneNotifies(fetched);
+    assert(
+      notifies.length === 1,
+      `ext: arm-gone-notify РОВНО 1 (получено ${notifies.length})`,
+    );
+    if (notifies.length > 0) {
+      const body = (notifies[0].body as { body?: string }).body ?? "";
+      assert(
+        body.includes("внешнее изменение"),
+        "ext: body сообщает «внешнее изменение»",
+      );
+      assert(
+        body.includes("/cont-after-reset"),
+        "ext: body содержит подсказку взвести снова",
+      );
+    }
+    const log = readFileSync(join(tmp, "armslog.log"), "utf8");
+    assert(log.includes("arm-gone"), "ext: armslog содержит arm-gone");
+    assert(
+      log.includes("reason=external-removal"),
+      "ext: armslog содержит reason=external-removal (НЕ ttl-expired)",
+    );
+    assert(
+      !log.includes("reason=ttl-expired"),
+      "ext: ложный reason=ttl-expired отсутствует",
+    );
+
+    await handlerOf(handlers, "session_shutdown")({}, ctx);
+  } finally {
+    globalThis.fetch = originalFetch;
+    __resetStaleStateForTests();
+    cleanupPaths(tmp);
+  }
+}
+
 // --- 3. /cont-after-reset off — само-снятие, notify НЕТ ------------------------
 
 async function testOffNoNotify(): Promise<void> {
@@ -836,6 +909,7 @@ async function main(): Promise<void> {
   );
   await testTtlExpiredNotify();
   await testRepeatExhaustedNotify();
+  await testExternalRemovalNotify();
   await testOffNoNotify();
   await testCapitulationOnlyCapitulationNotify();
   // Спека 011 (D3, T4): confirmed-notify после успешного токен-ответа.

@@ -29,7 +29,8 @@ if (-not (Test-Path $dstDir)) {
 $files = @(
     "index.ts",
     "state.ts",
-    "ticker.ts",
+    "reset.ts",      # spec 012: переименован из ticker.ts
+    "wakeups.ts",    # spec 012: абсолютные wake-точки
     "ui.ts",
     "parser.ts",
     "notifier.ts",

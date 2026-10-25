@@ -1147,7 +1147,10 @@ function syncWatchdog(): void {
         // определить причину по снимку последней живой записи и уведомить
         // пользователя (fire-and-forget, как capitulation-notify).
         const seen = lastArmSeen;
-        let reason: "ttl-expired" | "repeat-exhausted" = "ttl-expired";
+        let reason:
+          | "ttl-expired"
+          | "repeat-exhausted"
+          | "external-removal" = "ttl-expired";
         let bodyText: string;
         if (seen !== null && Date.now() > seen.expiresAt) {
           reason = "ttl-expired";
@@ -1162,10 +1165,12 @@ function syncWatchdog(): void {
           bodyText =
             "автопродолжения исчерпаны (последний «продолжи» подтвердился и снял флаг). Для продолжения взведите снова: /cont-after-reset N";
         } else {
-          // Внешнее удаление записи из arms.json (не нами): канонических
-          // значений reason два — оставляем ttl-expired, текст поясняет
-          // суть (см. D-011-1).
-          reason = "ttl-expired";
+          // Внешнее удаление записи из arms.json (не нами): отдельная метка
+          // reason=external-removal. Инцидент APKScenTest 24.10: ночной агент
+          // снял флаг сам (arm_cont_after_reset.py --remove по стоп-условию),
+          // а armslog сообщил reason=ttl-expired -- ложный след для
+          // диагностики (TTL был жив ещё 6 часов).
+          reason = "external-removal";
           bodyText =
             "запись исчезла из arms.json (внешнее изменение). Для продолжения взведите снова: /cont-after-reset N";
         }
