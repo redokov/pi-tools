@@ -115,10 +115,28 @@ import {
   readLedger,
   readHistoryRows,
   buildMorningReport,
+  fallbackWindowsFromHistory,
   reportPathFor,
+  getNightsDir,
   type NightPlan,
   type LedgerRow,
 } from "./nightplan.js";
+import {
+  initRunnerFromPlan,
+  resumeRunner,
+  pauseRunner,
+  stopRunner,
+  skipCurrentTask,
+  getRunnerStatus,
+  dispatchCurrentTask,
+  applyTaskResult,
+  extractTaskResult,
+} from "./nightrun.js";
+import { readState as readNightRunState } from "./nightrun-state.js";
+import {
+  suggestBacklogPath,
+  buildNightCreatePrompt,
+} from "./nightcreate.js";
 
 export { setArmsLogPath };
 // Spec 007: direct unit-test exports for the new delivery/gating helpers.
@@ -1972,12 +1990,24 @@ async function fireContinue(): Promise<void> {
 function buildEmitFn(): EmitFn {
   return (event: string, payload: unknown) => {
     const bus = eventBus;
-    if (!bus) return;
-    try {
-      bus.emit(event, payload);
-    } catch {
-      // Never let a listener failure kill the scheduler. The bus already wraps
-      // individual handlers, but our own .emit must not throw either.
+    if (bus) {
+      try {
+        bus.emit(event, payload);
+      } catch {
+        // Never let a listener failure kill the scheduler. The bus already wraps
+        // individual handlers, but our own .emit must not throw either.
+      }
+    }
+    // Spec 015-fix: ПРЯМОЙ путь ночной книги. Запись ledger больше не
+    // зависит от живой EventBus-подписки (инцидент 25→26.10: сессию вымесло
+    // чужой session_start, session_shutdown снял подписки, blocked-путь их
+    // не вернул — 6 сбросов ушли в шину без слушателей). Дубль с подписчиком
+    // исключает идемпотентность appendLedger по (nightDate, resetAt, resetCount).
+    if (event === "billing:window_reset") {
+      void nightPlanLedgerRow(payload);
+      // Spec 015: re-drive ночной очереди на новом окне (только если
+      // runner запущен явно и userStop не стоит).
+      nightRunRedriveOnReset();
     }
   };
 }
@@ -2629,6 +2659,16 @@ async function onAfterProviderResponse(
       resetCount: fresh429?.resetCount,
       note: "limit exhausted",
     });
+    // Spec 015 (FR-015-4): ночная задача на 429 НЕ считается выполненной —
+    // paused с причиной 429, cursor сохраняется; re-drive на новом окне.
+    const nr429 = readNightRunState();
+    if (nr429 !== null && nr429.status === "awaiting-result") {
+      await applyTaskResult("429");
+      armsLog(
+        "night-run:429",
+        withAttr(`задача ${nr429.currentTask} сохранена, runner в paused (429)`),
+      );
+    }
     return;
   }
 
@@ -2792,6 +2832,10 @@ async function onAfterProviderResponse(
   // is idempotent and dedups via lastResetAt, so calling it here is safe and
   // handles the edge case without waiting up to TICK_MS for the next tick.
   await checkAndReset(emit, meta);
+
+  // Spec 015 (design §6): если ночной runner ждёт результат — ищем явный
+  // маркер TASK_RESULT в последнем ответе. Обычный текст НЕ считается PASS.
+  await nightRunObserveResult(ctx);
 }
 
 /**
@@ -2929,6 +2973,8 @@ function registerBillingReset(pi: ExtensionAPI): void {
           prevWindowInput: cur.windowInput ?? 0,
           prevWindowOutput: cur.windowOutput ?? 0,
           prevWindowCacheRead: cur.windowCacheRead ?? 0,
+          // Spec 015-fix: начало завершившегося окна — в payload ledger.
+          prevWindowStartedAt: cur.windowStartedAt,
         };
         return { next };
       });
@@ -2948,6 +2994,11 @@ function registerBillingReset(pi: ExtensionAPI): void {
         try {
           bus.emit("billing:window_reset", fresh);
         } catch {}
+      }
+      // Spec 015-fix: прямой путь ledger — ручной сброс тоже не зависит
+      // от живой подписки (дубль отсечён идемпотентностью).
+      if (fresh) {
+        void nightPlanLedgerRow(fresh);
       }
       // History: manual reset row.
       const meta = historyMetaOf(ctx);
@@ -3034,6 +3085,8 @@ function registerSettimer(pi: ExtensionAPI): void {
               prevWindowInput: cur.windowInput ?? 0,
               prevWindowOutput: cur.windowOutput ?? 0,
               prevWindowCacheRead: cur.windowCacheRead ?? 0,
+              // Spec 015-fix: начало завершившегося окна — в payload ledger.
+              prevWindowStartedAt: cur.windowStartedAt,
             },
           };
         });
@@ -3042,6 +3095,10 @@ function registerSettimer(pi: ExtensionAPI): void {
           try {
             eventBus.emit("billing:window_reset", fresh);
           } catch {}
+        }
+        // Spec 015-fix: прямой путь ledger (дубль отсечён идемпотентностью).
+        if (fresh) {
+          void nightPlanLedgerRow(fresh);
         }
         // History: /settimer 0 performs a real reset.
         const meta = historyMetaOf(ctx);
@@ -3524,6 +3581,14 @@ async function fireMorningReport(): Promise<void> {
     if (morningDoneKey === doneKey) return;
     const ledgerRows = readLedger(plan.nightDate);
     const historyRows = readHistoryRows(plan.createdAt, now);
+    // Spec 015-fix: книга пуста, но сбросы в history есть — считаем окна
+    // по fallback, чтобы armslog/notify не врали «0 из 0» (инцидент 25→26.10).
+    const fallbackRows =
+      ledgerRows.length === 0
+        ? fallbackWindowsFromHistory(plan, historyRows)
+        : [];
+    const effRows = ledgerRows.length > 0 ? ledgerRows : fallbackRows;
+    const ledgerIncomplete = ledgerRows.length === 0 && fallbackRows.length > 0;
     const md = buildMorningReport(plan, ledgerRows, historyRows, {
       version: VERSION,
       nowMs: now,
@@ -3535,19 +3600,21 @@ async function fireMorningReport(): Promise<void> {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, md, "utf8");
     morningDoneKey = doneKey;
-    const used = ledgerRows.filter((r) => r.verdict === "used").length;
-    const idle = ledgerRows.length - used;
-    const totIn = ledgerRows.reduce((s, r) => s + r.input, 0);
+    const used = effRows.filter((r) => r.verdict === "used").length;
+    const idle = effRows.length - used;
+    const totIn = effRows.reduce((s, r) => s + r.input, 0);
     armsLog(
       "night-plan:morning-report",
       withAttr(
-        `отчёт записан: ${file} (окон ${ledgerRows.length}, used ${used}, idle ${idle})`,
+        `отчёт записан: ${file} (окон ${effRows.length}, used ${used}, idle ${idle}` +
+          `${ledgerIncomplete ? "; LEDGER INCOMPLETE — восстановлено из history.csv" : ""})`,
       ),
     );
     nightNotify({
       type: "billing:night-report",
       provider: PROVIDER,
-      title: `Ночь ${plan.nightDate}: использовано окон ${used}/${ledgerRows.length}`,
+      title: `Ночь ${plan.nightDate}: использовано окон ${used}/${effRows.length}` +
+        `${ledgerIncomplete ? " (LEDGER INCOMPLETE)" : ""}`,
       body: `Простаивало: ${idle}. Input за ночь: ${totIn}. auto-rearm: ${
         nightStats.nightDate === plan.nightDate ? nightStats.rearm : 0
       }. Полный отчёт: ${file}`,
@@ -3605,10 +3672,30 @@ async function nightPlanLedgerRow(payload: unknown): Promise<void> {
       cacheRead: p?.prevWindowCacheRead ?? 0,
       armPhase: armRec === null ? "none" : (armRec.phase ?? "armed"),
       verdict: calls > 0 ? "used" : "idle",
+      // Spec 015-fix: идемпотентность + диагностика.
+      resetCount: typeof p?.resetCount === "number" ? p.resetCount : -1,
+      prevWindowStartedAt:
+        typeof p?.prevWindowStartedAt === "number"
+          ? p.prevWindowStartedAt
+          : startedAt,
     };
-    await appendLedger(row);
+    const status = await appendLedger(row);
+    if (status === "error") {
+      armsLog(
+        "night-plan:ledger-error",
+        withAttr(
+          `строка книги не записана (reset ${isoLocal(new Date(resetAt))}, nightDate ${plan.nightDate}) — сброс и доставка НЕ затронуты, см. warn выше`,
+        ),
+      );
+    }
   } catch (err) {
     console.warn("pi-billing-window: night ledger append failed:", err);
+    armsLog(
+      "night-plan:ledger-error",
+      withAttr(
+        `сбор строки книги не удался: ${String((err as Error)?.message ?? err).slice(0, 160)}`,
+      ),
+    );
   }
 }
 
@@ -3730,6 +3817,75 @@ function registerNightPlan(pi: ExtensionAPI): void {
           return;
         }
 
+        // Spec 016: /night-plan create — генератор meta-prompt-а для новой
+        // сессии (адаптация задач к проекту + backlog + команды запуска).
+        // Ничего не взводит и не запускает: пишет только файл-артефакт.
+        if (sub === "create") {
+          const createUsage =
+            "night plan: формат /night-plan create [HH:MM-HH:MM] <цель ночи>";
+          let cFrom = "22:00";
+          let cTo = "08:00";
+          const rest = argv.slice(1);
+          if (rest.length > 0 && /^\d{1,2}:\d{2}-\d{1,2}:\d{2}$/.test(rest[0])) {
+            const parts = rest[0].split("-");
+            cFrom = parts[0];
+            cTo = parts[1];
+            rest.shift();
+          }
+          const goal = rest.join(" ").trim();
+          if (goal.length === 0) {
+            ctx.ui.notify(createUsage, "error");
+            return;
+          }
+          const cFromMin = parseHHMM(cFrom);
+          const cToMin = parseHHMM(cTo);
+          if (cFromMin === null || cToMin === null || cFromMin === cToMin) {
+            ctx.ui.notify(
+              `night plan: неверный интервал ${cFrom}-${cTo} (нужно HH:MM-HH:MM, from != to)`,
+              "error",
+            );
+            return;
+          }
+          cFrom = fmtHHMM(cFromMin);
+          cTo = fmtHHMM(cToMin);
+
+          const cwd = historyMetaOf(ctx).project;
+          const date = new Date().toLocaleDateString("sv-SE"); // YYYY-MM-DD (local)
+          const backlogPath = suggestBacklogPath(cwd, date);
+          const prompt = buildNightCreatePrompt({
+            cwd,
+            goal,
+            fromLocal: cFrom,
+            toLocal: cTo,
+            date,
+            backlogPath,
+          });
+          try {
+            const outDir = getNightsDir();
+            fs.mkdirSync(outDir, { recursive: true });
+            const outFile = path.join(outDir, `create-prompt-${date}.md`);
+            const tmp = outFile + ".tmp." + process.pid;
+            fs.writeFileSync(tmp, prompt, "utf8");
+            fs.renameSync(tmp, outFile);
+            armsLog(
+              "night-plan:create",
+              withAttr(`goal='${goal.slice(0, 80)}' -> ${outFile}`),
+            );
+            ctx.ui.notify(
+              `night plan: meta-prompt для ночного прогона записан:\n${outFile}\n` +
+                `Открой файл, скопируй содержимое в НОВУЮ сессию агента — она подготовит backlog ` +
+                `(${backlogPath}) и выведет команды запуска. Сам runner не запущен.`,
+              "info",
+            );
+          } catch (err) {
+            ctx.ui.notify(
+              `night plan: не удалось записать meta-prompt: ${String((err as Error)?.message ?? err).slice(0, 120)}`,
+              "error",
+            );
+          }
+          return;
+        }
+
         // Создание/обновление плана на текущую ночь.
         let fromLocal = "22:00";
         let toLocal = "08:00";
@@ -3754,7 +3910,7 @@ function registerNightPlan(pi: ExtensionAPI): void {
           }
           ctx.ui.notify(
             `night plan: неизвестный аргумент '${tok}'. Формат: ` +
-              "/night-plan [HH:MM-HH:MM] [repeat=N] [backlog=<path>] | off | status",
+              "/night-plan [HH:MM-HH:MM] [repeat=N] [backlog=<path>] | off | status | create [HH:MM-HH:MM] <цель>",
             "error",
           );
           return;
@@ -3833,6 +3989,272 @@ function registerNightPlan(pi: ExtensionAPI): void {
   });
 }
 
+// --- Spec 015: /night-run production wiring ---------------------------------
+
+/**
+ * Delivery одной задачи через существующие owner/session гейты
+ * (design §2.4, §5). Гейты решают «можно ли доставить сейчас», НИКОГДА не
+ * «выполнена ли задача» (PASS/FAIL — только по маркеру в ответе).
+ * Typed errors: OWNER_BUSY / SWITCH_NEEDED — cursor не двигается.
+ */
+async function nightRunDeliver(prompt: string): Promise<void> {
+  // Owner-busy: jsonl владельца менялся недавно — вероятно, чужой/родитель-
+  // ский разговор в ходу; задача НЕ считается выполненной.
+  if (!ownerQuiet(ownerKey, resetGraceMs)) {
+    throw new Error("OWNER_BUSY: owner jsonl busy");
+  }
+  // Switch-needed: refs указывают на другую сессию — доставка ушла бы в
+  // чужой разговор (spec 009); runner ждёт переключения, cursor стоит.
+  if (
+    ownerKey !== null &&
+    lastSessionStartKey !== null &&
+    lastSessionStartKey !== ownerKey
+  ) {
+    throw new Error("SWITCH_NEEDED: refs point to a foreign session");
+  }
+  const p = piApi;
+  if (!p || piApiEpoch !== sessionEpoch) {
+    throw new Error("SWITCH_NEEDED: piApi stale");
+  }
+  const sendTime = Date.now();
+  await p.sendUserMessage(prompt);
+  // Доставка подтверждается записью в jsonl владельца (verifyDelivered).
+  // Проба — однострочный маркер из шаблона промпта (есть в КАЖДОЙ задаче,
+  // записи строго новее sendTime — ложных срабатываний на старых нет).
+  const probe = "TASK_RESULT: PASS";
+  if (!(verifyDeliveredOverride ?? verifyDelivered)(ownerKey, sendTime, probe)) {
+    throw new Error("night-run deliver: entry not found in owner jsonl (misroute)");
+  }
+}
+
+/**
+ * Один шаг драйвера очереди: dispatch текущей задачи, если runner в
+ * running и userStop не стоит. Никогда не бросает — все исходы в armslog.
+ * Вызывается ТОЛЬКО как: явный /night-run resume, PASS-цепочка внутри
+ * окна, re-drive на billing:window_reset. Фонового таймера НЕТ.
+ */
+async function nightRunTick(): Promise<void> {
+  const st = readNightRunState();
+  if (!st || st.status !== "running" || st.userStop) return;
+  try {
+    const outcome = await dispatchCurrentTask(nightRunDeliver);
+    if (outcome.type === "dispatched") {
+      armsLog(
+        "night-run:dispatch",
+        withAttr(`task=${outcome.task} отправлена, awaiting-result`),
+      );
+    }
+  } catch (err) {
+    armsLog(
+      "night-run:dispatch-error",
+      withAttr(String((err as Error)?.message ?? err).slice(0, 200)),
+    );
+  }
+}
+
+/** Текст последнего assistant-сообщения сессии (для маркера задачи). */
+function lastAssistantText(ctx: ExtensionContext | null): string {
+  try {
+    const entries = ctx?.sessionManager?.getEntries?.() as
+      | Array<{
+          type?: string;
+          message?: { role?: string; content?: unknown };
+        }>
+      | undefined;
+    if (!Array.isArray(entries)) return "";
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i];
+      if (e?.type !== "message" || !e.message) continue;
+      if (e.message.role !== "assistant") continue;
+      const c = e.message.content;
+      if (typeof c === "string") return c;
+      if (Array.isArray(c)) {
+        const texts = c
+          .filter(
+            (p) =>
+              typeof p === "object" &&
+              p !== null &&
+              (p as { type?: string }).type === "text",
+          )
+          .map((p) => String((p as { text?: string }).text ?? ""));
+        if (texts.length > 0) return texts.join("\n");
+      }
+    }
+  } catch {
+    // stale ctx / нет доступа — пустой текст (неоднозначный результат).
+  }
+  return "";
+}
+
+/**
+ * Наблюдатель результата (design §6): после ответа провайдера, если
+ * runner в awaiting-result, ищем явный маркер TASK_RESULT: PASS|FAIL в
+ * последнем assistant-ответе. Обычный текст без маркера — НЕ PASS
+ * (неоднозначный результат не продвигает cursor). PASS → цепочка: сразу
+ * dispatch следующей задачи того же окна.
+ */
+async function nightRunObserveResult(ctx: ExtensionContext | null): Promise<void> {
+  const st = readNightRunState();
+  if (!st || st.status !== "awaiting-result" || st.userStop) return;
+  const marker = extractTaskResult(lastAssistantText(ctx));
+  if (marker === null) return; // неоднозначно — ничего не двигаем
+  const after = await applyTaskResult(marker);
+  if (marker === "PASS" && after !== null && after.status === "running") {
+    await nightRunTick(); // PASS-цепочка: следующая задача без ожидания reset
+  }
+}
+
+/**
+ * Re-drive на сбросе окна (естественный ночной heartbeat): провайдер
+ * вернул лимит. Возобновляет только runner, запущенный явным действием
+ * пользователя (state существует); userStop блокирует всё.
+ *   running           → dispatch текущей задачи
+ *   awaiting-result   → recovery (bounded re-ask, НЕ автоматический PASS)
+ *   paused + 429      → resume + dispatch той же задачи (FR-015-4 «resume later»)
+ */
+function nightRunRedriveOnReset(): void {
+  void (async () => {
+    try {
+      const st = readNightRunState();
+      if (!st || st.userStop) return;
+      if (st.status === "paused" && st.lastResult === "429") {
+        if (!(await resumeRunner())) return;
+      } else if (st.status === "awaiting-result") {
+        if ((await import("./nightrun.js")).recoverFromAwaitingResult() === null) return;
+      } else if (st.status !== "running") {
+        return;
+      }
+      await nightRunTick();
+    } catch (err) {
+      armsLog(
+        "night-run:redrive-error",
+        withAttr(String((err as Error)?.message ?? err).slice(0, 200)),
+      );
+    }
+  })();
+}
+
+/**
+ * /night-run — backlog runner (spec 015, FR-015-6). Выполняет задачи из
+ * Markdown backlog последовательно. Отдельная команда и отдельное состояние
+ * (pi-billing-window-nightrun.json); /night-plan не запускает runner сам.
+ *   /night-run status   — статус runner-а (ничего не меняет)
+ *   /night-run resume   — инициализировать из плана / продолжить текущую задачу
+ *   /night-run pause    — приостановить (paused + transition)
+ *   /night-run skip     — явный skip текущей задачи (с причиной в журнале)
+ *   /night-run stop     — user stop (сильнее auto-continuation, auto-rearm
+ *                          плана его НЕ сбрасывает)
+ */
+function registerNightRun(pi: ExtensionAPI): void {
+  pi.registerCommand("night-run", {
+    description:
+      "Backlog runner: /night-run status | resume | pause | skip | stop. Выполняет задачи из backlog ночного плана последовательно.",
+    handler: async (args, ctx) => {
+      try {
+        const argv = String(args ?? "")
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean);
+        const sub = argv[0]?.toLowerCase();
+
+        if (sub === "status" || !sub) {
+          const status = getRunnerStatus();
+          if (!status.state) {
+            ctx.ui.notify(
+              "night-run: runner не инициализирован. Создай план с backlog через /night-plan, затем /night-run resume.",
+              "info",
+            );
+            return;
+          }
+          const st = status.state;
+          ctx.ui.notify(
+            `night-run: план ${st.plan}, статус ${st.status}\n` +
+              `задача ${st.currentTask}/${status.taskCount}, попытка ${st.attempt}/${st.maxRetries}\n` +
+              `lastResult: ${st.lastResult ?? "—"}; userStop: ${st.userStop ? "да" : "нет"}\n` +
+              `backlog: ${st.backlog}`,
+            "info",
+          );
+          return;
+        }
+
+        if (sub === "resume") {
+          let st = getRunnerStatus().state;
+          if (!st) {
+            // Нет state — инициализируем runner из активного плана с backlog.
+            const ok = await initRunnerFromPlan();
+            if (!ok) {
+              ctx.ui.notify(
+                "night-run: не удалось инициализировать (нет активного плана, истёк, нет backlog или backlog невалиден)",
+                "error",
+              );
+              return;
+            }
+            st = getRunnerStatus().state;
+            ctx.ui.notify(
+              `night-run: runner инициализирован из плана (задача ${st?.currentTask ?? 1}). Повтори /night-run resume для запуска.`,
+              "info",
+            );
+            return;
+          }
+          const resumed = await resumeRunner();
+          if (!resumed) {
+            ctx.ui.notify(
+              "night-run: resume заблокирован (userStop активен или терминальный статус)",
+              "error",
+            );
+            return;
+          }
+          ctx.ui.notify(
+            `night-run: продолжаю с задачи ${st.currentTask}`,
+            "info",
+          );
+          // Явное действие пользователя: dispatch текущей задачи сейчас.
+          void nightRunTick();
+          return;
+        }
+
+        if (sub === "pause") {
+          const ok = await pauseRunner();
+          ctx.ui.notify(
+            ok ? "night-run: paused" : "night-run: pause no-op (не в running/awaiting-result)",
+            ok ? "info" : "warning",
+          );
+          return;
+        }
+
+        if (sub === "stop") {
+          const ok = await stopRunner();
+          ctx.ui.notify(
+            ok
+              ? "night-run: stopped (userStop установлен, авто-продолжение заблокировано)"
+              : "night-run: stop no-op (runner не инициализирован)",
+            ok ? "info" : "warning",
+          );
+          return;
+        }
+
+        if (sub === "skip") {
+          const ok = await skipCurrentTask();
+          ctx.ui.notify(
+            ok
+              ? "night-run: текущая задача пропущена (skip записан в журнал переходов)"
+              : "night-run: skip не выполнен (терминальный статус или backlog невалиден)",
+            ok ? "info" : "error",
+          );
+          return;
+        }
+
+        ctx.ui.notify(
+          `night-run: неизвестная подкоманда '${sub}'. Формат: /night-run status | resume | pause | skip | stop`,
+          "error",
+        );
+      } catch (err) {
+        console.warn("pi-billing-window: /night-run failed:", err);
+      }
+    },
+  });
+}
+
 // --- Extension entrypoint -----------------------------------------------------
 
 export default function (pi: ExtensionAPI): void {
@@ -3875,6 +4297,8 @@ export default function (pi: ExtensionAPI): void {
   registerSelfReload(pi);
   // Spec 014: ночной план — новый контракт поверх cont-after-reset.
   registerNightPlan(pi);
+  // Spec 015: /night-run — backlog runner.
+  registerNightRun(pi);
 
   // Touch renderStatusBar so the import is retained for downstream tools
   // and linters that flag unused imports. The function is also exposed for

@@ -247,6 +247,37 @@ def main():
         ws2 = billing_report.split_windows(mixed2)
         check(len(ws2) == 2, "split_windows: reset increment after None row splits windows")
 
+        # ---- 8. night report: ledger source, explicit pricing, and fallback ----
+        night_rows = [
+            row_dict(now_ms - 5000, kind="window_reset", reset=2),
+            row_dict(now_ms - 4000, kind="call", reset=2),
+            row_dict(now_ms - 3000, kind="window_reset", reset=3),
+            row_dict(now_ms - 2000, kind="call", reset=3),
+        ]
+        for r in night_rows:
+            r["input"] = 100 if r["kind"] == "call" else 0
+            r["output"] = 10 if r["kind"] == "call" else 0
+            r["cache_read"] = 1000 if r["kind"] == "call" else 0
+        ledger = [{
+            "reset_at": now_ms - 5000, "calls": 1, "input": 100,
+            "output": 10, "cache_read": 1000, "arm_phase": "armed", "verdict": "used",
+        }]
+        nmd = billing_report.render_night_report(
+            night_rows, ledger, True, "2026-10-25", "2026-10-25", (1.0, 2.0, 0.5)
+        )
+        check("Source: ledger.csv" in nmd, "night report: ledger source shown")
+        check("Credits (explicit price" in nmd and "620.000000" in nmd,
+              "night report: explicit credits calculated")
+        check("LEDGER INCOMPLETE" not in nmd, "night report: complete ledger has no incomplete banner")
+
+        fmd = billing_report.render_night_report(
+            night_rows, [], False, "2026-10-25", "2026-10-25", None
+        )
+        check("LEDGER INCOMPLETE" in fmd, "night report: absent ledger is marked incomplete")
+        check("Source: history.csv + armslog" in fmd, "night report: fallback source shown")
+        check("Credits: unavailable" in fmd, "night report: no invented live price")
+        check("Windows: 2" in fmd, "night report: fallback reset windows counted")
+
     finally:
         import shutil
 

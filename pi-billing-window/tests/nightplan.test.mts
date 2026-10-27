@@ -36,6 +36,8 @@ import {
   readHistoryRows,
   sumTokensInRange,
   buildMorningReport,
+  fallbackWindowsFromHistory,
+  type HistoryAggRow,
 } from "../src/nightplan.ts";
 import {
   setPaths as historySetPaths,
@@ -170,25 +172,34 @@ assert(readPlan() === null, "plan: чужая схема -> null");
 
 // --- 6. Ledger roundtrip --------------------------------------------------------
 
+const LR_RESET_AT = 1792954464056; // фиксированный resetAt для идемпотентности-тестов
+
 function ledgerRow(overrides: Partial<LedgerRow> = {}): LedgerRow {
   return {
     tsIso: "2026-10-25T23:30:00+03:00",
     epochMs: Date.now(),
     nightDate: "2026-10-25",
-    resetAt: Date.now() - 1000,
+    resetAt: LR_RESET_AT,
     callsInWindow: 4,
     input: 1_500_000,
     output: 200_000,
     cacheRead: 3_000_000,
     armPhase: "armed",
     verdict: "used",
+    resetCount: 7,
+    prevWindowStartedAt: LR_RESET_AT - 7_200_000,
     ...overrides,
   };
 }
 
 assert(readLedger().length === 0, "ledger: нет файла -> []");
-assert(await appendLedger(ledgerRow()), "ledger: append -> true");
-assert(await appendLedger(ledgerRow({ callsInWindow: 0, input: 0, output: 0, cacheRead: 0, armPhase: "none", verdict: "idle", nightDate: "2026-10-26" })), "ledger: вторая append -> true");
+assert((await appendLedger(ledgerRow())) === "appended", "ledger: append -> appended");
+assert(
+  (await appendLedger(
+    ledgerRow({ callsInWindow: 0, input: 0, output: 0, cacheRead: 0, armPhase: "none", verdict: "idle", nightDate: "2026-10-26" }),
+  )) === "appended",
+  "ledger: вторая append -> appended",
+);
 const all = readLedger();
 assert(all.length === 2, "ledger: readLedger -> обе строки");
 assert(all[0].verdict === "used" && all[0].armPhase === "armed", "ledger: строка 1 поля verdict/armPhase");
@@ -196,6 +207,27 @@ assert(all[1].verdict === "idle" && all[1].armPhase === "none", "ledger: стр�
 assert(readLedger("2026-10-25").length === 1, "ledger: фильтр по nightDate");
 assert(readFileSync(join(getNightsDir(), "ledger.csv"), "utf8").includes("ts_iso,epoch_ms"), "ledger: header записан");
 assert(readFileSync(join(getNightsDir(), "ledger.csv"), "utf8").charCodeAt(0) === 0xfeff, "ledger: BOM на месте (Excel-паттерн)");
+assert(
+  readFileSync(join(getNightsDir(), "ledger.csv"), "utf8").includes("reset_count,prev_window_started_at"),
+  "ledger: новые колонки reset_count/prev_window_started_at в header",
+);
+assert(
+  all[0].resetCount === 7 && all[0].prevWindowStartedAt > 0,
+  "ledger: roundtrip reset_count/prev_window_started_at",
+);
+
+// Спец 015-fix: идемпотентность — тот же (nightDate, resetAt, resetCount)
+// не даёт вторую строку (EventBus + direct пути одного сброса).
+assert(
+  (await appendLedger(ledgerRow({ epochMs: Date.now() + 5 }))) === "duplicate",
+  "ledger: повтор той же строки -> duplicate",
+);
+assert(readLedger().length === 2, "ledger: дубль не создал третью строку");
+assert(
+  (await appendLedger(ledgerRow({ resetAt: LR_RESET_AT - 5000, resetCount: 8 }))) === "appended",
+  "ledger: другой resetAt/resetCount -> appended",
+);
+assert(readLedger().length === 3, "ledger: третья (уникальная) строка записана");
 
 // --- 7. history.csv parser + суммы ----------------------------------------------
 
@@ -261,6 +293,41 @@ writeFileSync(
   const mdEmpty = buildMorningReport(makePlan(), [], [], { version: "014.2026-10-25" });
   assert(mdEmpty.includes("окон в книге нет"), "report: пустая книга -- честная пометка");
   assert(mdEmpty.includes("окна: 0") === false, "report: пустая книга не рисует нулевую таблицу итогов окон");
+}
+
+// --- 8b. Spec 015-fix: fallback окон из history + LEDGER INCOMPLETE --------------
+
+{
+  const plan = makePlan({ createdAt: base, expiresAt: base + 12 * 3600_000 });
+  const hr: HistoryAggRow[] = [
+    { epochMs: base + 500, kind: "call", input: 100, output: 10, cacheRead: 1000 },
+    { epochMs: base + 1500, kind: "call", input: 200, output: 20, cacheRead: 2000 },
+    { epochMs: base + 3000, kind: "window_reset", input: 0, output: 0, cacheRead: 0 },
+    { epochMs: base + 4000, kind: "call", input: 50, output: 5, cacheRead: 500 },
+    { epochMs: base + 7000, kind: "window_reset", input: 0, output: 0, cacheRead: 0 },
+  ];
+  const fb = fallbackWindowsFromHistory(plan, hr);
+  assert(fb.length === 2, "fallback: два окна из window_reset-строк");
+  assert(fb[0].callsInWindow === 2 && fb[0].verdict === "used", "fallback: окно 1 used с 2 вызовами");
+  assert(fb[0].armPhase === "unknown" && fb[0].resetCount === -1, "fallback: armPhase unknown / resetCount -1");
+  assert(fb[1].callsInWindow === 1 && fb[1].verdict === "used", "fallback: окно 2 used с 1 вызовом");
+  assert(fb[1].prevWindowStartedAt === base + 3000, "fallback: prevWindowStartedAt = предыдущий reset");
+  const md = buildMorningReport(plan, [], hr, { version: "014.2026-10-25", nowMs: base + 11 * 3600_000 });
+  assert(md.includes("LEDGER INCOMPLETE"), "report-fallback: баннер LEDGER INCOMPLETE");
+  assert(md.includes("восстановлено из history.csv"), "report-fallback: пометка восстановления в итогах");
+  assert(md.includes("- вызовов за ночь: 3"), "report-fallback: вызовы не нулевые (3)");
+  assert(md.includes("- окон: 2"), "report-fallback: окна не нулевые (2)");
+  assert(md.includes("| unknown |"), "report-fallback: arm unknown в таблице");
+  // окно вне интервала плана не попадает в fallback
+  const fb2 = fallbackWindowsFromHistory(plan, [
+    ...hr,
+    { epochMs: base + 13 * 3600_000, kind: "window_reset", input: 0, output: 0, cacheRead: 0 },
+  ]);
+  assert(fb2.length === 2, "fallback: reset за expiresAt игнорируется");
+  // пустой ledger + пустая history → по-прежнему честное «окон нет»
+  const md2 = buildMorningReport(plan, [], [], { version: "x" });
+  assert(md2.includes("окон в книге нет"), "report-fallback: без history — честное «нет окон»");
+  assert(!md2.includes("LEDGER INCOMPLETE"), "report-fallback: без history нет ложного баннера");
 }
 
 // --- 9. reportPathFor / getNightsDir --------------------------------------------

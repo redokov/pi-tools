@@ -46,6 +46,7 @@ import piBillingWindowFactory, {
 } from "../src/index.ts";
 import {
   writeStateSync,
+  readStateSync,
   mutateState,
   setPaths as stateSetPaths,
   resetPaths as stateResetPaths,
@@ -672,6 +673,149 @@ async function testBrokenArmsUninsured(): Promise<void> {
   }
 }
 
+// --- 2b. Spec 015-fix: сброс при МЁРТВОЙ подписке (session replacement) --------
+
+/**
+ * Боевой сценарий ночи 25→26.10: сессию вытесняет чужой session_start,
+ * session_shutdown снимает ВСЕ billing-подписки, blocked-путь их не
+ * возвращает — а сброс продолжается (watchdog/sync живы). До фикса ledger
+ * молча терялся; теперь прямой путь (buildEmitFn) пишет строку книги
+ * независимо от подписки, идемпотентность отсекает дубль.
+ */
+async function testLedgerAfterReplacement(): Promise<void> {
+  const s = await startScenario("pbi-np-repl-");
+  try {
+    const ctx = makeCtx(s.sessionFile);
+    const { from, to } = intervalAroundNow(2, 2);
+    await commandOf(s, "night-plan")(`${from}-${to}`, ctx);
+    const plan = readPlan();
+    assert(plan !== null, "repl: план создан");
+
+    // Сброс #1 при живой подписке: подписчик + прямой путь → ровно 1 строка.
+    seedExpiredWindow(2, { input: 1_000, output: 100, cacheRead: 5_000 });
+    await __fireWatchdogForTests();
+    await sleep(150);
+    assert(
+      readLedger(plan!.nightDate).length === 1,
+      "repl: сброс #1 — одна строка (EventBus+direct без дубля)",
+    );
+
+    // Session replacement: shutdown снимает подписки (в проде их дальше
+    // не возвращает ownerBlocked-путь — ранний return до subscribe).
+    await shutdown(s);
+
+    // Сброс #2 при мёртвой подписке — прямой путь обязан записать строку.
+    seedExpiredWindow(4, { input: 2_000, output: 200, cacheRead: 6_000 });
+    await __fireWatchdogForTests();
+    await sleep(150);
+    const rows = readLedger(plan!.nightDate);
+    assert(rows.length === 2, `repl: сброс #2 записан прямым путём (got ${rows.length})`);
+    const second = rows[rows.length - 1];
+    assert(second.callsInWindow === 4, "repl: строка #2 несёт вызовы окна");
+    assert(second.resetCount === 2, "repl: строка #2 несёт resetCount");
+    assert(second.prevWindowStartedAt > 0, "repl: строка #2 несёт prevWindowStartedAt");
+  } finally {
+    cleanup(s);
+  }
+}
+
+// --- 2c. Spec 015-fix: ошибка ledger не ломает reset ----------------------------
+
+async function testLedgerErrorDoesNotBreakReset(): Promise<void> {
+  const s = await startScenario("pbi-np-lerr-");
+  try {
+    const ctx = makeCtx(s.sessionFile);
+    // nightsDir указывает на ФАЙЛ → mkdirSync в withLedgerLock падает
+    // → appendLedger = "error". План/лок не трогаем — план запишется.
+    const blocker = join(s.tmp, "blocker-file");
+    writeFileSync(blocker, "x", "utf8");
+    npSetPaths(join(s.tmp, "nightplan.json"), join(s.tmp, "nightplan.lock"), blocker);
+    const { from, to } = intervalAroundNow(2, 2);
+    await commandOf(s, "night-plan")(`${from}-${to}`, ctx);
+    const plan = readPlan();
+    assert(plan !== null, "lerr: план создан (путь плана не задет)");
+
+    seedExpiredWindow(3, { input: 1_500, output: 150, cacheRead: 4_000 });
+    await __fireWatchdogForTests();
+    await sleep(200);
+
+    // Reset успешен — окно свежее, счётчик вырос (ledger не должен ломать).
+    const st = readStateSync();
+    assert(
+      st !== null && Date.now() - st.windowStartedAt < 10_000,
+      "lerr: reset прошёл — окно свежее",
+    );
+    assert(st?.resetCount === 2, "lerr: resetCount вырос (2)");
+    // Ошибка книги — явная строка в armslog.
+    assert(
+      linesWith(readFileSync(join(s.tmp, "armslog.log"), "utf8"), "night-plan:ledger-error")
+        .length >= 1,
+      "lerr: armslog night-plan:ledger-error",
+    );
+    assert(!existsSync(join(blocker, "ledger.csv")), "lerr: файл книги не создан (блокировка)");
+  } finally {
+    cleanup(s);
+  }
+}
+
+// --- 2d. Spec 015-fix: утренний отчёт не врёт «0 окон» без ledger ---------------
+
+async function testMorningFallbackLedgerIncomplete(): Promise<void> {
+  const s = await startScenario("pbi-np-mfbi-");
+  setNightPlanMorningGraceForTests(48 * 60 * 60 * 1000);
+  try {
+    const ctx = makeCtx(s.sessionFile);
+    const { from, to } = intervalAroundNow(5, 1);
+    await commandOf(s, "night-plan")(`${from}-${to}`, ctx);
+    const plan = readPlan();
+    assert(plan !== null, "mfbi: план создан");
+
+    // История: сбросы и вызовы есть, книга пуста (подписка была мертва).
+    const c = Date.now() - 10_000;
+    const oldPlan: NightPlan = { ...plan!, createdAt: c, expiresAt: Date.now() + 60_000 };
+    assert(await writePlan(oldPlan), "mfbi: план с диапазоном истории записан");
+    await appendHistory(
+      { kind: "call", project: "P", session: "s", usage: { input: 700, output: 70, cacheRead: 7_000 } },
+      c + 1_000,
+    );
+    await appendHistory(
+      { kind: "window_reset", project: "P", session: "s", callsInWindow: 1, resetCount: 2, note: "auto" },
+      c + 2_000,
+    );
+    await appendHistory(
+      { kind: "call", project: "P", session: "s", usage: { input: 300, output: 30, cacheRead: 3_000 } },
+      c + 3_000,
+    );
+    await appendHistory(
+      { kind: "window_reset", project: "P", session: "s", callsInWindow: 1, resetCount: 3, note: "auto" },
+      c + 4_000,
+    );
+    assert(readLedger(oldPlan.nightDate).length === 0, "mfbi: книга пуста (мёртвая подписка)");
+    await __fireMorningForTests();
+    const file = reportPathFor(oldPlan.nightDate);
+    assert(existsSync(file), "mfbi: отчёт записан");
+    const md = readFileSync(file, "utf8");
+
+    assert(md.includes("LEDGER INCOMPLETE"), "mfbi: баннер LEDGER INCOMPLETE");
+    assert(md.includes("восстановлено из history.csv"), "mfbi: окна восстановлены из history");
+    assert(md.includes("- окон: 2"), "mfbi: два окна, а не «0»");
+    assert(md.includes("- вызовов за ночь:") && !md.includes("- вызовов за ночь: 0"), "mfbi: fallback сохраняет ненулевые вызовы");
+    const log = readFileSync(join(s.tmp, "armslog.log"), "utf8");
+    assert(
+      linesWith(log, "night-plan:morning-report").some((l) => l.includes("LEDGER INCOMPLETE")),
+      "mfbi: armslog помечает LEDGER INCOMPLETE",
+    );
+    const rep = s.notifies.find((n) => n.type === "billing:night-report");
+    assert(
+      rep !== undefined && rep.title.includes("2/2") && rep.title.includes("LEDGER INCOMPLETE"),
+      "mfbi: notify считает окна из fallback (2/2 INCOMPLETE)",
+    );
+  } finally {
+    setNightPlanEscalateForTests(10 * 60_000, 30 * 60_000);
+    cleanup(s);
+  }
+}
+
 // --- runner -------------------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -681,7 +825,10 @@ async function main(): Promise<void> {
   console.log("\n=== Night plan e2e tests (spec 014) ===");
   await testAutoRearmAfterExternalDisarm();
   await testLedgerUsedIdle();
+  await testLedgerAfterReplacement();
+  await testLedgerErrorDoesNotBreakReset();
   await testMorningReport();
+  await testMorningFallbackLedgerIncomplete();
   await testPlanOff();
   await testExpiredPlanIgnored();
   await testBrokenArmsUninsured();

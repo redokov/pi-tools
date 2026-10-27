@@ -95,6 +95,8 @@ type State = {
 | `/settimer <duration>` | Установить **оставшееся** время до reset (синхронизация с личным кабинетом wormsoft). Форматы: `60` (минуты), `90m`, `2h`, `1h30m`. `0` = немедленный reset. Ограничено 2 ч. |
 | `/cont-after-reset [N\|off]` | Автопродолжение после сброса; `N` (1..99) — на N срабатываний, `off` — снять. См. раздел 8a. |
 | `/night-plan [HH:MM-HH:MM\|off\|status] [repeat=N] [backlog=<path>]` | Ночной план: внешний контракт страховки ночной сессии (spec 014). См. раздел 8c. |
+| `/night-plan create [HH:MM-HH:MM] <цель ночи>` | Генератор meta-prompt-а: готовый промт для новой сессии — она составит backlog и выведет команды запуска (spec 016). См. 8e. |
+| `/night-run status\|resume\|pause\|skip\|stop` | Исполнитель ночного backlog-а: последовательный прогон задач из `backlog=<path>` плана (spec 015). См. раздел 8d. |
 
 ---
 
@@ -436,6 +438,74 @@ helper-скрипт проекта (`scripts/arm_cont_after_reset.py` в TabDocL
   24.10: утренний отчёт сразу видит «ночь работала на старом коде»).
 
 Спека: `.ai/sdd/specs/014-night-plan/` (requirements/design/tasks).
+
+---
+
+## 8d. Ночной backlog-runner (`/night-run`, spec 015)
+
+`/night-plan` — страховка окна, `/night-run` — исполнитель очереди. План с
+`backlog=<path>` хранит только ссылку; runner запускается отдельной командой
+и живёт в собственном состоянии
+`~/.pi/agent/pi-billing-window-nightrun.json` (+ `.lock`), отдельном от плана,
+дневного state и arms.
+
+- **Backlog-формат** (UTF-8 Markdown): явные секции `## Task N` + обязательная
+  `## Acceptance` к каждой; номера строго последовательные. Парсер отвергает
+  дубли/пропуски/oversized (файл > 2 МБ, задача > 64 КБ, prompt > 16 КБ) и
+  фиксирует SHA256-hash — подмена файла инвалидирует курсор.
+- **Последовательное выполнение**: в каждый момент — ровно одна задача.
+  Prompt = задача + acceptance + требование закончить ответ явным маркером
+  `TASK_RESULT: PASS` / `TASK_RESULT: FAIL`. Обычный текст ассистента без
+  маркера — НЕ PASS (неоднозначный результат не двигает курсор).
+- **Контракт результата**: `PASS` (→ следующая задача, последняя →
+  `completed`), `FAIL` (bounded retry, по умолчанию 2 попытки, исчерпание →
+  `failed`), `429` (→ paused, задача сохраняется, re-drive на новом окне),
+  `OWNER_BUSY` / `SWITCH_NEEDED` (delivery-диагностика — задача не считается
+  выполненной), `STOPPED`, `BOUNDARY_BLOCKED`.
+- **Граница 08:00**: после `toLocal` плана (или его истечения) новые dispatch
+  запрещены — причина `after-boundary` в журнале.
+- **Драйвер**: фонового таймера нет. Dispatch происходит по: явному
+  `/night-run resume`, PASS-цепочке внутри окна, re-drive на
+  `billing:window_reset` (в т.ч. возобновление после 429 и recovery из
+  `awaiting-result`). До dispatch состояние durable-пишется как
+  `awaiting-result` — рестарт восстанавливает ту же задачу и никогда не
+  считает её автоматически PASS.
+- **Команды**: `status` (ничего не меняет), `resume` (первый вызов без state —
+  инициализация из плана, повторный — запуск/продолжение), `pause`, `skip`
+  (явный, с причиной в журнале), `stop` — user stop: сильнее любого
+  авто-продолжения, перевзвод `/night-plan` его НЕ сбрасывает.
+- **Журнал переходов** `~/.pi/agent/pi-billing-window-nights/nightrun-transitions.jsonl`:
+  timestamp/plan/task/from→to/action/reason — все простои объяснимы
+  (`429`, `owner-busy`, `after-boundary`, `user-stop`, …).
+
+Спека: `.ai/sdd/specs/015-night-backlog-runner/` (requirements/design/tasks).
+
+---
+
+## 8e. `/night-plan create` — генератор ночного прогона (spec 016)
+
+Ручная подготовка backlog-а требует помнить формат spec 015, лимиты, маркер
+`TASK_RESULT` и последовательность запуска. `create` закрывает этот разрыв:
+
+- **`/night-plan create <цель ночи>`** — генерирует meta-prompt и пишет его в
+  `~/.pi/agent/pi-billing-window-nights/create-prompt-<date>.md`; notify
+  показывает путь. Опционально свой интервал: `create 23:00-07:00 <цель>`.
+- Пользователь копирует содержимое файла в **новую сессию** агента. Промт
+  инструктирует агента: изучить проект, составить задачи под цель, записать
+  backlog в `<cwd>/.ai/night/backlog-<date>.md` (строгий формат spec 015,
+  лимиты, `TASK_RESULT: PASS|FAIL` в каждой Acceptance, правила ночной
+  безопасности) и вывести в конце точные команды запуска:
+  ```text
+  /night-plan 22:00-08:00 backlog=<путь>
+  /night-run resume
+  /night-run resume
+  ```
+- Команды выполняет пользователь в сессии-владельце; сам агент runner не
+  запускает.
+- `create` ничего не взводит: план, runner state и сообщения не трогает,
+  пишет только файл-артефакт.
+
+Спека: `.ai/sdd/specs/016-night-plan-create/` (requirements/design/tasks).
 
 ---
 

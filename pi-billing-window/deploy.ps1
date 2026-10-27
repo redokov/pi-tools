@@ -40,6 +40,11 @@ $files = @(
     "watchdog.ts",
     "firelease.ts",
     "nightplan.ts",  # spec 014: ночной план (auto-rearm, ledger, утренний отчёт)
+    "nightbacklog.ts",  # spec 015: backlog parser (/night-run)
+    "nightcreate.ts",  # spec 016: /night-plan create meta-prompt builder
+    "nightrun-state.ts",  # spec 015: durable runner state
+    "nightrun-log.ts",  # spec 015: transition log
+    "nightrun.ts",  # spec 015: /night-run backlog runner
     "package.json"
 )
 

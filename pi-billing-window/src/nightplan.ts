@@ -61,8 +61,13 @@ export type LedgerRow = {
   input: number;
   output: number;
   cacheRead: number;
-  armPhase: "armed" | "pending" | "none";
+  /** "unknown" — только у fallback-строк, восстановленных из history.csv. */
+  armPhase: "armed" | "pending" | "none" | "unknown";
   verdict: "used" | "idle";
+  /** Spec 015-fix: идемпотентность + диагностика (−1 = неизвестен). */
+  resetCount: number;
+  /** Spec 015-fix: windowStartedAt ПРЕДЫДУЩЕГО (завершившегося) окна. */
+  prevWindowStartedAt: number;
 };
 
 /** Агрегируемая строка history.csv для отчёта (токены вызовов). */
@@ -415,7 +420,7 @@ export async function clearPlan(): Promise<boolean> {
 
 const LEDGER_HEADER =
   "ts_iso,epoch_ms,night_date,reset_at,calls_in_window,input,output," +
-  "cache_read,arm_phase,verdict";
+  "cache_read,arm_phase,verdict,reset_count,prev_window_started_at";
 
 function ledgerFile(): string {
   return path.join(nightsDir, "ledger.csv");
@@ -437,8 +442,13 @@ function ledgerRowToLine(row: LedgerRow): string {
     row.cacheRead,
     row.armPhase,
     row.verdict,
+    row.resetCount,
+    row.prevWindowStartedAt,
   ].join(",");
 }
+
+/** Статус дописывания строки книги (Spec 015-fix). */
+export type LedgerAppendStatus = "appended" | "duplicate" | "error";
 
 async function withLedgerLock<T>(fn: () => T): Promise<T> {
   fs.mkdirSync(nightsDir, { recursive: true });
@@ -461,24 +471,42 @@ async function withLedgerLock<T>(fn: () => T): Promise<T> {
 /**
  * Дописать строку ночной книги (FR-014-4). Каталог nights/ и header
  * создаются при первой записи (BOM -- Excel на Windows, паттерн history.ts).
- * Никогда не бросает; false при неудаче (warn).
+ * Спец 015-fix: ИДЕМПОТЕНТНОСТЬ по (nightDate, resetAt, resetCount) — проверка
+ * дубля выполняется ПОД локом (после того, как конкурентная запись commit'нулась),
+ * поэтому параллельные EventBus- и direct-пути одного сброса дают ровно одну
+ * строку. Никогда не бросает; "error" при неудаче (warn).
  */
-export async function appendLedger(row: LedgerRow): Promise<boolean> {
+export async function appendLedger(row: LedgerRow): Promise<LedgerAppendStatus> {
   try {
+    let status: LedgerAppendStatus = "appended";
     await withLedgerLock(() => {
       const file = ledgerFile();
       if (!fs.existsSync(file)) {
         fs.writeFileSync(file, "\uFEFF" + LEDGER_HEADER + "\n", "utf8");
       }
+      // Дедуп под локом: (nightDate, resetAt, resetCount) уже в книге?
+      const raw = fs.readFileSync(file, "utf8");
+      for (const line of raw.split("\n")) {
+        const cols = line.replace(/^\uFEFF/, "").trimEnd().split(",");
+        if (cols.length < 10 || cols[0] === "ts_iso") continue;
+        if (
+          cols[2] === row.nightDate &&
+          Number(cols[3]) === row.resetAt &&
+          (cols.length < 11 || Number(cols[10]) === row.resetCount)
+        ) {
+          status = "duplicate";
+          return;
+        }
+      }
       fs.appendFileSync(file, ledgerRowToLine(row) + "\n", "utf8");
     });
-    return true;
+    return status;
   } catch (err) {
     console.warn(
       "pi-billing-window: appendLedger failed:",
       String((err as Error)?.message ?? err).slice(0, 160),
     );
-    return false;
+    return "error";
   }
 }
 
@@ -506,7 +534,7 @@ export function readLedger(nightDate?: string): LedgerRow[] {
       const armPhase = cols[8];
       const verdict = cols[9];
       if (!Number.isFinite(epochMs) || !Number.isFinite(resetAt)) continue;
-      if (armPhase !== "armed" && armPhase !== "pending" && armPhase !== "none") {
+      if (armPhase !== "armed" && armPhase !== "pending" && armPhase !== "none" && armPhase !== "unknown") {
         continue;
       }
       if (verdict !== "used" && verdict !== "idle") continue;
@@ -521,6 +549,10 @@ export function readLedger(nightDate?: string): LedgerRow[] {
         cacheRead: Number.isFinite(cacheRead) ? cacheRead : 0,
         armPhase,
         verdict,
+        // Спец 015-fix: новые колонки опциональны (старые строки без них).
+        resetCount: cols.length >= 11 && Number.isFinite(Number(cols[10])) ? Number(cols[10]) : -1,
+        prevWindowStartedAt:
+          cols.length >= 12 && Number.isFinite(Number(cols[11])) ? Number(cols[11]) : 0,
       };
       if (nightDate === undefined || row.nightDate === nightDate) {
         rows.push(row);
@@ -632,6 +664,54 @@ export function sumTokensInRange(
   return { input, output, cacheRead };
 }
 
+/**
+ * Spec 015-fix (FR-015-R6): восстановить окна ночи из history.csv, когда
+ * книга (ledger.csv) пуста — сбросы были, но строки книги не записались
+ * (инцидент 25→26.10: подписка ledger умирает на session replacement).
+ * Чистая функция: окно №i = вызовы в [prevReset | plan.createdAt, reset_i).
+ * armPhase "unknown" — историю arm'а из history не восстановить.
+ */
+export function fallbackWindowsFromHistory(
+  plan: NightPlan,
+  rows: HistoryAggRow[],
+): LedgerRow[] {
+  const resets = rows
+    .filter(
+      (r) =>
+        r.kind === "window_reset" &&
+        r.epochMs >= plan.createdAt &&
+        r.epochMs < plan.expiresAt,
+    )
+    .map((r) => r.epochMs)
+    .sort((a, b) => a - b);
+  const out: LedgerRow[] = [];
+  for (let i = 0; i < resets.length; i++) {
+    // A reset row describes the window that just ended: [previous reset,
+    // resetAt), matching prevWindowCalls in State and buildMorningReport.
+    // The first reset closes the interval from plan creation, so calls before
+    // the first boundary are not lost in the morning total.
+    const lower = i === 0 ? plan.createdAt : resets[i - 1];
+    const calls = rows.filter(
+      (r) => r.kind === "call" && r.epochMs >= lower && r.epochMs < resets[i],
+    ).length;
+    out.push({
+      tsIso: isoLocal(new Date(resets[i])),
+      epochMs: resets[i],
+      nightDate: plan.nightDate,
+      resetAt: resets[i],
+      callsInWindow: calls,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      armPhase: "unknown",
+      verdict: calls > 0 ? "used" : "idle",
+      resetCount: -1,
+      prevWindowStartedAt: lower,
+    });
+  }
+  return out;
+}
+
 // ---- Morning report (FR-014-5, чистая функция) ----
 
 export type MorningReportOpts = {
@@ -666,7 +746,15 @@ export function buildMorningReport(
   opts: MorningReportOpts,
 ): string {
   const nowMs = opts.nowMs ?? Date.now();
-  const sorted = [...ledgerRows].sort((a, b) => a.resetAt - b.resetAt);
+  const ledgerSorted = [...ledgerRows].sort((a, b) => a.resetAt - b.resetAt);
+  // Spec 015-fix: книга пуста, но сбросы в history есть — восстанавливаем
+  // окна и честно помечаем отчёт, вместо ложных «0 окон / 0 вызовов».
+  const fallback =
+    ledgerSorted.length === 0
+      ? fallbackWindowsFromHistory(plan, historyRows)
+      : [];
+  const sorted = ledgerSorted.length > 0 ? ledgerSorted : fallback;
+  const ledgerIncomplete = ledgerSorted.length === 0 && fallback.length > 0;
   const lines: string[] = [];
   lines.push(`# Ночной отчёт — ${plan.nightDate} (${plan.fromLocal}–${plan.toLocal})`);
   lines.push("");
@@ -690,6 +778,12 @@ export function buildMorningReport(
     lines.push(" окон в книге нет — сбросов в интервале плана не зафиксировано.");
     lines.push("");
   } else {
+    if (ledgerIncomplete) {
+      lines.push(
+        "⚠ LEDGER INCOMPLETE: книга ночи (ledger.csv) пуста — данные восстановлены из history.csv и armslog",
+      );
+      lines.push("");
+    }
     lines.push(
       "| # | reset | вызовы | input | output | cache_read | arm | verdict | причина |",
     );
@@ -710,7 +804,9 @@ export function buildMorningReport(
           ? ""
           : row.armPhase === "none"
             ? "no-arm (не был застрахован на момент сброса)"
-            : "delivery: см. armslog";
+            : row.armPhase === "unknown"
+              ? "arm неизвестен (окно восстановлено из history)"
+              : "delivery: см. armslog";
       lines.push(
         `| ${i + 1} | ${hhmmss(row.resetAt)} | ${row.callsInWindow} | ` +
           `${tok.input} | ${tok.output} | ${tok.cacheRead} | ${row.armPhase} | ` +
@@ -722,7 +818,9 @@ export function buildMorningReport(
 
   lines.push("## Итоги ночи");
   lines.push("");
-  lines.push(`- окон: ${sorted.length} (использовано: ${usedCount}, простаивало: ${idleCount})`);
+  lines.push(
+    `- окон: ${sorted.length}${ledgerIncomplete ? " (восстановлено из history.csv)" : ""} (использовано: ${usedCount}, простаивало: ${idleCount})`,
+  );
   lines.push(`- вызовов за ночь: ${totCalls}`);
   lines.push(
     `- токены ночи: input ${totInput}, output ${totOutput}, cache_read ${totCacheRead}`,

@@ -38,6 +38,13 @@ export type State = {
   prevWindowInput?: number;
   prevWindowOutput?: number;
   prevWindowCacheRead?: number;
+  /**
+   * Spec 015-fix: момент НАЧАЛА окна, которое только что закончилось
+   * (старое windowStartedAt на момент reset). Нужно строке ночной книги:
+   * payload подписчика/прямого пути несёт его как windowStartedAt
+   * ПРЕДЫДУЩЕГО окна (fresh-состояние уже указывает на новое окно).
+   */
+  prevWindowStartedAt?: number;
 };
 
 let stateFile = path.join(os.homedir(), ".pi", "agent", "pi-billing-window.json");

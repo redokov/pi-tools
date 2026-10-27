@@ -64,6 +64,8 @@ export async function checkAndReset(
           prevWindowInput: state.windowInput ?? 0,
           prevWindowOutput: state.windowOutput ?? 0,
           prevWindowCacheRead: state.windowCacheRead ?? 0,
+          // Spec 015-fix: начало завершившегося окна — в payload ledger.
+          prevWindowStartedAt: state.windowStartedAt,
         };
 
         didReset = true;
