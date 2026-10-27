@@ -47,9 +47,20 @@ for (const k of Object.keys(fileEnv)) {
 }
 
 const PORT = parseInt(process.argv[2] || process.env.PORT || '7681', 10);
-const DEFAULT_SHELL_CMD = process.argv[3] || (process.env.APPDATA
+let DEFAULT_SHELL_CMD = process.argv[3] || (process.env.APPDATA
   ? process.env.APPDATA + '\\npm\\pi.cmd'
   : 'pi');
+// Self-heal: if the configured shell command is a file path that does not exist,
+// fall back to the standard pi launcher in ~/.pi/agent/bin.
+if (/\\|\//.test(DEFAULT_SHELL_CMD) && !fs.existsSync(DEFAULT_SHELL_CMD)) {
+  const candidate = path.join(os.homedir(), '.pi', 'agent', 'bin', 'pi.cmd');
+  if (fs.existsSync(candidate)) {
+    console.log(`WARN: shell command "${DEFAULT_SHELL_CMD}" not found, falling back to ${candidate}`);
+    DEFAULT_SHELL_CMD = candidate;
+  } else {
+    console.log(`WARN: shell command "${DEFAULT_SHELL_CMD}" does not exist; pty.spawn will likely fail`);
+  }
+}
 const PROJECTS_ROOT = process.argv[4] || 'C:\\MyProjects';
 const IDLE_TIMEOUT_MS = (parseInt(process.argv[5], 10) || 120) * 1000;
 const NOTIFY_TOKEN = process.env.PI_REMOTE_NOTIFY_TOKEN || '';
