@@ -11,6 +11,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import lockfile from "proper-lockfile";
+// Spec 017: type-only импорт (без runtime-цикла ping.ts <-> state.ts).
+import type { PingState } from "./ping.js";
 
 export type State = {
   provider: string;
@@ -22,6 +24,8 @@ export type State = {
   firstCallEmittedAt?: number;
   /** Timestamp of the most recent 429 (limit exhausted) from the provider. */
   last429At?: number;
+  /** Spec 017 (boundary-ping): подсостояние пинг-зонда (tolerant, optional). */
+  ping?: PingState;
   /**
    * Spec 014 (FR-014-4): аккумулируемые токены ТЕКУЩЕГО окна (пишутся на
    * каждом after_provider_response, обнуляются на reset).

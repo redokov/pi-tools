@@ -67,6 +67,27 @@ export type NotifyPayload = {
   title: string;
   body: string;
   timestamp: number;
+} | {
+  /** Spec 017 (FR-017-4): 429-ping corrected the window anchor (info). */
+  type: "billing:ping-429-reanchor";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
+} | {
+  /** Spec 017 (FR-017-4): 429-ping retry cap reached, active probing stopped. */
+  type: "billing:ping-429-cap";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
+} | {
+  /** Spec 017 (FR-017-5): ping transport broken, blind legacy reset in effect. */
+  type: "billing:ping-infra-fallback";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
 };
 
 export type NotifyOptions = {

@@ -194,6 +194,9 @@ function makeState(over: Partial<State> = {}): State {
     lastResetAt: 0,
     resetCount: 0,
     callsInWindow: 0,
+    // Spec 017: wake-тесты этого сьюта остаются на legacy-пути (ping off =
+    // бит-в-бит поведение до spec 017); пинг покрыт tests/ping.test.mts.
+    ping: { disabled: true },
     ...over,
   };
 }

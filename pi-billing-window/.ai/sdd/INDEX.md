@@ -18,3 +18,7 @@
 | `011-arm-gone-notify-misroute-gating` | review:done | requirements.md, design.md, tasks.md, review.md |
 | `012-absolute-wake-scheduler` | implementation:done | requirements.md, design.md, tasks.md |
 | `013-history-nul-repair` | implementation:done | requirements.md, design.md, tasks.md |
+| `014-night-plan` | implementation:done | requirements.md, design.md, tasks.md |
+| `015-night-backlog-runner` | implementation:done | requirements.md, design.md, tasks.md |
+| `016-night-plan-create` | implementation:done | design.md, requirements.md, tasks.md (+ reports/) |
+| `017-boundary-ping` | review:done | requirements.md, design.md, tasks.md, review.md |

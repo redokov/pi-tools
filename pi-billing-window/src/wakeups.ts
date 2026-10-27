@@ -132,6 +132,24 @@ export function appendAnchorPoint(
   return { ...table, points: kept };
 }
 
+/**
+ * Spec 017 (boundary-ping): вставить произвольную retry-точку (10-мин
+ * unknown-anchor / 2-мин infra) с epsilon-дедупликацией и сортировкой.
+ * Retry-точки -- обычные точки: планировщик, safety-net и burned-TTL
+ * работают с ними без изменений. Чистая функция, без I/O.
+ */
+export function insertRetryPoint(
+  table: WakeTable,
+  ts: number,
+  epsilonMs: number = WAKE_APPEND_EPSILON_MS,
+): WakeTable {
+  if (table.points.some((p) => Math.abs(p - ts) < epsilonMs)) {
+    return table;
+  }
+  const points = [...table.points, ts].sort((a, b) => a - b);
+  return { ...table, points };
+}
+
 // ---- Persistence (lock + tmp/rename, state.ts pattern) ----
 
 let wakeFile = path.join(os.homedir(), ".pi", "agent", "pi-billing-window-wakeups.json");

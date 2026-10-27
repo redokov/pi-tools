@@ -66,6 +66,9 @@ export async function checkAndReset(
           prevWindowCacheRead: state.windowCacheRead ?? 0,
           // Spec 015-fix: начало завершившегося окна — в payload ledger.
           prevWindowStartedAt: state.windowStartedAt,
+          // Spec 017: подсостояние пинга переживает reset (dedup-маркер
+          // ping.lastBoundary и кэш mode/model не должны теряться).
+          ping: state.ping,
         };
 
         didReset = true;

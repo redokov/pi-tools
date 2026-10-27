@@ -519,6 +519,9 @@ helper-скрипт проекта (`scripts/arm_cont_after_reset.py` в TabDocL
 | Авто-reset | `window_reset` (note=`auto`) |
 | `/billing-reset` | `manual_reset` |
 | `/settimer` | `window_reset` (note=`settimer 0`) или `settimer` (note=`sync …`) |
+| Пинг-зонд (авто) | `ping` — note=`wake HH:MM ok` / `probe … ok` / `… infra: …`, usage и модель пинга |
+| Пинг-зонд (ручной) | `ping` — note=`manual` |
+| 429 на пинг-зонде | `429` — note=`ping probe` (окно ещё живое) |
 
 Проект — колонка `project` (полный cwd сессии), агент в той же папке различается колонкой `session`. Формат — **13 колонок**, последняя — `model`: `ts_iso,epoch_ms,kind,project,session,calls_in_window,reset_count,input,output,cache_read,cache_write,note,model`. Значение `model` — канонический id модели pi (например, `zai/glm-5.3`); для reset/settimer-строк и строк, записанных до миграции, — пустая. Файл старого 12-колоночного формата мигрирует автоматически: при первом append под локом заменяется только строка заголовка (tmp-файл + rename, идемпотентно), данные не трогаются. Запись под локом (безопасно для нескольких процессов), UTF-8 + BOM (кириллица в Excel), ретеншн 30 дней (трим на старте сессии). Сбой истории никогда не влияет на счёт/сбросы/уведомления.
 
@@ -531,6 +534,58 @@ python scripts/billing_report.py --days 0 --out report.md     # в файл
 ```
 
 Скрипт восстанавливает окна по инкрементам `reset_count` и показывает: суммарный burn, разрез по моделям (`## By model`: модель × calls/input/output/cacheR/cacheW/total, сортировка по total по убыванию; строки без модели — группа `(no model)`; старый CSV без колонки `model` читается как есть — все call-строки попадут в `(no model)`), окна каждого проекта (старт, вызовы, токены, «сколько минут прожило до исчерпания»), пиковые минуты.
+
+---
+
+## 8f. Boundary-ping: пинг-зонд границ окна (spec 017)
+
+Провайдер wormsoft якорит новое 2-часовое окно **лениво**: оно стартует только
+от первого запроса после восстановления лимита. Поэтому на каждой wake-границе
+(spec 012) расширение само отправляет дешёвый 1-токенный completion-запрос
+напрямую (мимо пайплайна pi, без транскрипта):
+
+- **200** → окно реально перевернулось: сам пинг **якорит новое окно у
+  провайдера на предсказанный момент** → верифицированный reset →
+  `billing:window_reset`. Подписчики (`cont-after-reset`, night-run) больше не
+  срабатывают «в стену 429».
+- **429** → окно ещё живое: reset подавлен, локальный якорь корректируется
+  (re-anchor на `firstCallEmittedAt`), wake-таблица перестраивается от
+  скорректированной границы. Если реального якоря нет (окно держит внешний
+  потребитель ключа) — retry-пинги каждые 10 мин, максимум 12, затем notify.
+- **infra** (сеть/таймаут/401/5xx/нет конфига) — не сигнал об окне: retry через
+  2 мин, после 3 подряд — слепой legacy-reset + notify. Пинг никогда не
+  блокирует reset навсегда.
+- **Burned-head** (машина спала через границу): после тихого purge — один
+  probe-пинг; 200 → верифицированный reset (сетка восстанавливается без
+  ручного `/settimer`), слепой reset по-прежнему запрещён (spec 012).
+
+Транспорт: `POST {baseUrl}/chat/completions` (baseUrl — `models.json`,
+ключ — `auth.json`), модель **`openai/gpt-oss:20b`** (5 000/4 000 кр за М —
+самая дешёвая без бейджа «на пенсии»; фолбэк `wormsoft/agent/low`),
+`max_tokens=2`, таймаут 30 с, 429 не ретраится. Режим стрима `stream:false` с
+авто-фолбэком на `stream:true`+abort; рабочий режим и модель кэшируются в
+`state.ping`. Стоимость пинга ≈ 0.06 кредита из 5 000 000.
+
+Dedup между процессами — через маркер `ping.lastBoundary` в общем state: один
+пинг на границу в обычном случае; смерть пингующего в полёте автоматически
+покрывается соседним процессом (без firelease-аренды). Пинг не инкрементит
+`callsInWindow`, не эмитит `llm:first_call` и не подтверждает
+cont-after-reset (флаг не съедается фоновым вызовом).
+
+Команды:
+- **`/ping-wormsoft`** — ручной диагностический пинг: статус/латентность/
+  токены; состояние окна не трогает (без reset, якорей и `last429At`).
+- **`/billing-ping on|off|status`** — управление зондом (дефолт **on**);
+  `off` = точное поведение до spec 017 (слепой reset на границах).
+- `/billing-status` показывает `ping=on/off` с последним результатом.
+
+Наблюдаемость: history `kind="ping"` (auto/manual, с usage) и `kind="429"`
+(note=`ping probe`); armslog `ping:ok / ping:429-reanchor /
+ping:429-unknown-anchor / ping:429-cap / ping:infra / ping:infra-fallback /
+ping:manual`; notify `billing:ping-429-reanchor / -cap / -infra-fallback`;
+EventBus-событие `billing:ping`.
+
+Спека: `.ai/sdd/specs/017-boundary-ping/` (requirements/design/tasks).
 
 ---
 

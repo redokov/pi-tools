@@ -45,6 +45,7 @@ $files = @(
     "nightrun-state.ts",  # spec 015: durable runner state
     "nightrun-log.ts",  # spec 015: transition log
     "nightrun.ts",  # spec 015: /night-run backlog runner
+    "ping.ts",  # spec 017: boundary-ping (пинг-зонд границ окна)
     "package.json"
 )
 

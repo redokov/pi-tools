@@ -89,6 +89,14 @@ import {
   RETRY_AFTER_FIRE_MS,
 } from "./arms.js";
 import { armsLog, setArmsLogPath } from "./armslog.js";
+// Spec 017 (boundary-ping): пинг-зонд границ окна.
+import {
+  manualPing,
+  pingBoundaryFlow,
+  readPingState,
+  setPingDisabled,
+  PING_MODEL,
+} from "./ping.js";
 import {
   acquireFireLease,
   releaseFireLease,
@@ -151,7 +159,7 @@ const WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
  * трогает), показывается в /billing-status и в шапке утреннего отчёта --
  * защита от повторения deploy-разрыва 24.10 («ночь работала на коде N»).
  */
-export const VERSION = "014.2026-10-25";
+export const VERSION = "017.2026-10-27";
 
 /**
  * Build a fresh State for a brand-new window.
@@ -2087,20 +2095,48 @@ async function onWakeFire(): Promise<void> {
     if (table !== null && table.points.length > 0) {
       if (now > table.points[0] + WAKE_BURNED_TTL_MS) {
         // Burned head: quiet purge, no shot into the past (FR-012-10).
+        const burnedPoint = table.points[0];
         await mutateWakeTable((cur) =>
           cur === null ? { next: null } : { next: dropBurnedPoints(cur, Date.now()) },
         );
+        // Spec 017 (FR-017-8): probe-ping на сгоревшей голове — окно, скорее
+        // всего, перевернулось во сне: 200 → верифицированный reset (сетка
+        // восстанавливается без ручного /settimer); 429/infra → штатные пути
+        // spec 017. Слепой reset запрещён (blindOnInfra=false): spec 012
+        // «не стрелять в прошлое» сохраняется и для infra-путей.
+        await pingBoundaryFlow({
+          firedPoint: burnedPoint,
+          note: `probe ${wakeNoteOf(burnedPoint)}`,
+          emit: buildEmitFn(),
+          meta: historyMetaOf(currentCtx),
+          blindOnInfra: false,
+        });
       } else {
         const firedPoint = table.points[0];
         await mutateWakeTable((cur) => {
           if (cur === null || cur.points.length === 0) return { next: null };
+          // Spec 017: consume-guard — параллельный процесс, уже съевший голову
+          // (общий файл), больше НЕ съедает следующую точку: потребляем только
+          // если голова всё ещё наша.
+          if (cur.points[0] !== firedPoint) return { next: null };
           return { next: { ...cur, points: cur.points.slice(1) } };
         });
-        await checkAndReset(
-          buildEmitFn(),
-          historyMetaOf(currentCtx),
-          wakeNoteOf(firedPoint),
-        );
+        // Spec 017 (FR-017-1): граница проходит через пинг-зонд. "legacy"
+        // (пинг выключен / state нет) — слепой checkAndReset как до фичи.
+        const outcome = await pingBoundaryFlow({
+          firedPoint,
+          note: wakeNoteOf(firedPoint),
+          emit: buildEmitFn(),
+          meta: historyMetaOf(currentCtx),
+          blindOnInfra: true,
+        });
+        if (outcome === "legacy") {
+          await checkAndReset(
+            buildEmitFn(),
+            historyMetaOf(currentCtx),
+            wakeNoteOf(firedPoint),
+          );
+        }
       }
     }
     ensureWakeTimer();
@@ -2908,10 +2944,96 @@ function registerBillingStatus(pi: ExtensionAPI): void {
       const hhStr = String(hh).padStart(2, "0");
       const mmStr = String(m).padStart(2, "0");
       // Spec 014 (FR-014-6): version stamp в /billing-status.
+      // Spec 017 (FR-017-12): строка пинг-зонда в /billing-status.
+      const p = s.ping ?? {};
+      const pingOn = p.disabled !== true;
+      let pingInfo = `ping=${pingOn ? "on" : "off"}`;
+      if (pingOn) {
+        if (p.lastAt !== undefined) {
+          const d = new Date(p.lastAt);
+          pingInfo += ` (${p.lastStatus ?? "?"} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}, ${p.mode ?? "?"})`;
+        } else {
+          pingInfo += ` (ещё не было, ${p.model ?? PING_MODEL})`;
+        }
+      }
       ctx.ui.notify(
-        `${s.provider}: до reset ${hhStr}:${mmStr} ч:мин (calls=${s.callsInWindow}, resets=${s.resetCount}) v=${VERSION}`,
+        `${s.provider}: до reset ${hhStr}:${mmStr} ч:мин (calls=${s.callsInWindow}, resets=${s.resetCount}) ${pingInfo} v=${VERSION}`,
         "info",
       );
+    },
+  });
+}
+
+/**
+ * /ping-wormsoft -- spec 017 (FR-017-9): ручной диагностический пинг.
+ * НЕ трогает состояние окна: без reset, без якорей, без last429At;
+ * пишет history kind="ping" note="manual" и кэширует рабочий mode/model.
+ */
+function registerPingWormsoft(pi: ExtensionAPI): void {
+  pi.registerCommand("ping-wormsoft", {
+    description: "Ручной пинг wormsoft: проверить лимит (диагностика)",
+    handler: async (_args, ctx) => {
+      const res = await manualPing(historyMetaOf(ctx));
+      if (res.kind === "ok") {
+        const u = res.usage;
+        const tok = u
+          ? `, ${u.input ?? 0}+${u.output ?? 0} ток`
+          : "";
+        ctx.ui.notify(
+          `Пинг wormsoft: 200 OK — лимит есть, окно переворачивалось/активно. ${res.latencyMs} мс${tok} (${res.model}, ${res.mode})`,
+          "info",
+        );
+      } else if (res.kind === "limit") {
+        ctx.ui.notify(
+          `Пинг wormsoft: 429 — лимит текущего окна исчерпан (${res.latencyMs} мс)`,
+          "info",
+        );
+      } else {
+        ctx.ui.notify(
+          `Пинг wormsoft: ошибка транспорта — ${res.error}`,
+          "info",
+        );
+      }
+    },
+  });
+}
+
+/**
+ * /billing-ping -- spec 017 (FR-017-10): on|off|status для пинг-зонда.
+ * off = точное legacy-поведение слепого reset на границах.
+ */
+function registerBillingPing(pi: ExtensionAPI): void {
+  pi.registerCommand("billing-ping", {
+    description: "Пинг-зонд границ окна: on | off | status",
+    handler: async (args, ctx) => {
+      const arg = String(args ?? "").trim().toLowerCase();
+      if (arg === "on" || arg === "off") {
+        await setPingDisabled(arg === "off");
+        ctx.ui.notify(
+          arg === "off"
+            ? "Пинг-зонд ВЫКЛЮЧЕН: границы окна сбрасываются вслепую (поведение до spec 017)"
+            : "Пинг-зонд включён: reset границ подтверждается пингом",
+          "info",
+        );
+        return;
+      }
+      const p = readPingState();
+      const parts: string[] = [
+        p.disabled === true
+          ? "пинг-зонд: ВЫКЛЮЧЕН (слепой reset на границах)"
+          : "пинг-зонд: включён",
+      ];
+      if (p.mode !== undefined) parts.push(`режим ${p.mode}`);
+      parts.push(`модель ${p.model ?? PING_MODEL}`);
+      if (p.lastAt !== undefined) {
+        const d = new Date(p.lastAt);
+        parts.push(
+          `последний: ${p.lastStatus ?? "?"} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")} (${p.lastDetail ?? ""})`,
+        );
+      }
+      if ((p.retryAttempt ?? 0) > 0) parts.push(`429-retry попытка ${p.retryAttempt}`);
+      if ((p.infraStreak ?? 0) > 0) parts.push(`infra подряд: ${p.infraStreak}`);
+      ctx.ui.notify(parts.join("; "), "info");
     },
   });
 }
@@ -4295,6 +4417,9 @@ export default function (pi: ExtensionAPI): void {
   registerSettimer(pi);
   registerContAfterReset(pi);
   registerSelfReload(pi);
+  // Spec 017: пинг-зонд границ окна.
+  registerPingWormsoft(pi);
+  registerBillingPing(pi);
   // Spec 014: ночной план — новый контракт поверх cont-after-reset.
   registerNightPlan(pi);
   // Spec 015: /night-run — backlog runner.
