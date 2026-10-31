@@ -38,7 +38,17 @@ export async function checkAndReset(
       }
 
       const now = Date.now();
-      const elapsed = now - state.windowStartedAt;
+      // Lazy provider anchor (2026-10 drift fix): the real window starts at
+      // the FIRST credit spend of the window (firstCallEmittedAt), not at the
+      // reset moment. A window with a recorded first call cannot expire
+      // before firstCallEmittedAt + windowMs -- this is what stops the
+      // early "auto" resets that desynced the plugin from the provider's
+      // billing clock (one "reset -> first call" gap per cycle).
+      const windowStart = Math.max(
+        state.windowStartedAt,
+        state.firstCallEmittedAt ?? state.windowStartedAt,
+      );
+      const elapsed = now - windowStart;
 
       if (elapsed >= state.windowMs) {
         // Dedup: if another process reset very recently, do not emit again.

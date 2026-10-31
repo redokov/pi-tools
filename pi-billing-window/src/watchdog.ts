@@ -11,12 +11,28 @@
 let handle: ReturnType<typeof setTimeout> | null = null;
 let scheduledFireAt: number | null = null;
 
-/** Compute the moment the window resets (windowStartedAt + windowMs). */
+/** Compute the moment the window resets.
+ *
+ * The provider's window is a LAZY anchor: the real 2h slot starts at the
+ * FIRST credit spend of the window (state.firstCallEmittedAt), not at the
+ * reset moment (windowStartedAt). When a first call is recorded, the
+ * boundary follows it: fireAt = max(windowStartedAt, firstCallEmittedAt) +
+ * windowMs. Without a first call yet (idle window), the reset moment is
+ * used as before. This is what keeps the watchdog from firing (120 - N)
+ * minutes early after /settimer N and from drifting one "reset -> first
+ * call" gap per cycle (the 2026-10 drift investigation).
+ */
 export function computeFireAt(state: {
   windowStartedAt: number;
   windowMs: number;
+  /** Lazy provider anchor: first call of the current window, if any. */
+  firstCallEmittedAt?: number;
 }): number {
-  return state.windowStartedAt + state.windowMs;
+  const start = Math.max(
+    state.windowStartedAt,
+    state.firstCallEmittedAt ?? state.windowStartedAt,
+  );
+  return start + state.windowMs;
 }
 
 /**

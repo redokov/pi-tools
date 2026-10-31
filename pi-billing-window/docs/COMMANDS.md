@@ -78,15 +78,17 @@
 
 **`durationMs = 0` — немедленный reset** (зеркалит `/billing-reset`):
 1. `mutateState`: `windowStartedAt = now`, `lastResetAt = now`, `resetCount++`, `callsInWindow = 0`, `firstCallEmittedAt = undefined`.
-2. Эмитит `billing:window_reset` со свежим state **напрямую** (в обход `checkAndReset`, чей дедуп подавил бы событие — `lastResetAt` только что обновлён).
-3. `notify("Таймер: окно сброшено (свежие 2 часа)", "info")`.
+2. Очищает wake-таблицу (spec 012 FR-012-5): следующая точка — от следующего якоря первого вызова.
+3. Эмитит `billing:window_reset` со свежим state **напрямую** (в обход `checkAndReset`, чей дедуп подавил бы событие — `lastResetAt` только что обновлён).
+4. `notify("Таймер: окно сброшено (свежие 2 часа)", "info")`.
 
 **`durationMs > 0` — синхронизация отсчёта** (с личным кабинетом wormsoft):
-1. Пересчитывает `windowStartedAt = now - (windowMs - durationMs)`.
-2. `mutateState`: новый `windowStartedAt`, `resetCount++`, `callsInWindow = 0`, `firstCallEmittedAt = undefined`. **`lastResetAt` не трогается** — иначе дедуп `checkAndReset` подавил бы будущий авто-reset на границе окна.
-3. Эмита нет (reset ещё не произошёл).
-4. `notify("Таймер установлен: HH:MM:SS до reset", "info")`.
-5. Если TUI — `forceUpdateStatus(ctx)`.
+1. Пересчитывает `targetStartedAt = now - (windowMs - durationMs)`.
+2. `mutateState`: новый `windowStartedAt = targetStartedAt`, `resetCount++`, `callsInWindow = 0`, **`firstCallEmittedAt = targetStartedAt`** (fix дрейфа 2026-10: синхронизация пользователя — истина; без этого следующий реальный вызов пере-якорил бы окно на себя и граница «уплывала» на (2ч − N) минут). **`lastResetAt` не трогается** — иначе дедуп `checkAndReset` подавил бы будущий авто-reset на границе окна.
+3. Пересобирает wake-таблицу от `targetStartedAt` (spec 012 FR-012-5): первая точка = `now + N + 2 мин`, хвост = +2ч × k, `source="settimer"`.
+4. Эмита нет (reset ещё не произошёл).
+5. `notify("Таймер установлен: HH:MM:SS до reset", "info")`.
+6. Если TUI — `forceUpdateStatus(ctx)`.
 
 **Сообщения:**
 

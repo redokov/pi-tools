@@ -409,6 +409,10 @@ async function main(): Promise<void> {
   }
 
   // 6. checkAndReset resets callsInWindow to 0
+  // 2026-10 drift fix: the window boundary follows the LAZY anchor
+  // (firstCallEmittedAt) -- a window whose first call came 1h after the
+  // reset moment must NOT reset at windowStartedAt + windowMs (that was
+  // the drift bug: one "reset -> first call" gap lost per cycle).
   cleanState();
   {
     const emit = createMockEmit();
@@ -419,6 +423,31 @@ async function main(): Promise<void> {
         lastResetAt: 0,
         callsInWindow: 17,
         firstCallEmittedAt: now - 60 * 60 * 1000,
+      }),
+    }));
+    const result = await checkAndReset(emit.emit);
+    const after = readStateSync();
+    assert(
+      result === false && after?.callsInWindow === 17 && after?.resetCount === 0,
+      "reset: lazy anchor 1h late -> NO reset at windowStartedAt + 2h",
+    );
+    assert(
+      after?.firstCallEmittedAt === now - 60 * 60 * 1000,
+      "reset: lazy anchor preserved when window not expired",
+    );
+  }
+  // 6b. Same state but the first call sits at the window start: the
+  // anchor equals windowStartedAt, the 2h boundary HAS passed -> reset.
+  cleanState();
+  {
+    const emit = createMockEmit();
+    const now = Date.now();
+    await mutateState(() => ({
+      next: makeState({
+        windowStartedAt: now - (2 * 60 * 60 * 1000 + 1000),
+        lastResetAt: 0,
+        callsInWindow: 17,
+        firstCallEmittedAt: now - (2 * 60 * 60 * 1000 + 1000),
       }),
     }));
     await checkAndReset(emit.emit);
@@ -1107,66 +1136,38 @@ async function main(): Promise<void> {
 
   console.log("\n=== UI tests ===");
 
-  // 1. renderStatusBar formats H:MM (no seconds) correctly
-  assert(
-    renderStatusBar(5_400_000) === "[осталось: 1:30 м.]",
-    "renderStatusBar: 1h30m -> '[осталось: 1:30 м.]'",
-  );
-  assert(
-    renderStatusBar(2 * 60 * 60 * 1000) === "[осталось: 2:00 м.]",
-    "renderStatusBar: full 2h window renders 2:00",
-  );
-  assert(
-    renderStatusBar(300_000) === "[осталось: 0:05 м.]",
-    "renderStatusBar: 5 minutes renders 0:05",
-  );
-  assert(
-    renderStatusBar(60_000) === "[осталось: 0:01 м.]",
-    "renderStatusBar: 1 minute renders 0:01",
-  );
-  assert(
-    renderStatusBar(3_600_000) === "[осталось: 1:00 м.]",
-    "renderStatusBar: exactly 1 hour -> 1:00",
-  );
+  // renderStatusBar now renders the ABSOLUTE reset moment (epoch ms) as
+  // "[обновится в ЧЧ:ММ]" (24h local time, zero-padded). Helper: local-time
+  // epoch for a fixed wall-clock moment.
+  const at = (h: number, m: number) =>
+    new Date(2026, 9, 31, h, m, 0, 0).getTime();
 
-  // 2. renderStatusBar shows "0:00" when remaining is 0 or negative
+  // 1. renderStatusBar formats the absolute reset time correctly
   assert(
-    renderStatusBar(0) === "[осталось: 0:00 м.]",
-    "renderStatusBar: remaining=0 -> 0:00",
+    renderStatusBar(at(17, 30)) === "[обновится в 17:30]",
+    "renderStatusBar: 17:30 -> '[обновится в 17:30]'",
   );
   assert(
-    renderStatusBar(-1000) === "[осталось: 0:00 м.]",
-    "renderStatusBar: negative remaining -> 0:00",
+    renderStatusBar(at(8, 5)) === "[обновится в 08:05]",
+    "renderStatusBar: zero-padded 08:05",
   );
   assert(
-    renderStatusBar(-99_999_999) === "[осталось: 0:00 м.]",
-    "renderStatusBar: large negative -> 0:00",
-  );
-
-  // 3. renderStatusBar formats hours correctly when >= 1h
-  assert(
-    renderStatusBar(3_661_000) === "[осталось: 1:01 м.]",
-    "renderStatusBar: 1h1m1s -> 1:01 (seconds dropped)",
-  );
-  // Hours not capped (e.g. > 24h)
-  assert(
-    renderStatusBar(25 * 60 * 60 * 1000) === "[осталось: 25:00 м.]",
-    "renderStatusBar: 25h renders as 25:00 (no cap)",
-  );
-
-  // 4. renderStatusBar formats correctly when < 1 minute
-  assert(
-    renderStatusBar(30_000) === "[осталось: 0:00 м.]",
-    "renderStatusBar: 30 seconds -> 0:00 (rounds down to whole minutes)",
+    renderStatusBar(at(0, 0)) === "[обновится в 00:00]",
+    "renderStatusBar: midnight -> 00:00",
   );
   assert(
-    renderStatusBar(1_000) === "[осталось: 0:00 м.]",
-    "renderStatusBar: 1 second -> 0:00 (rounds down)",
+    renderStatusBar(at(23, 59)) === "[обновится в 23:59]",
+    "renderStatusBar: 23:59 (24h clock, no am/pm)",
   );
-  // 59min59s -> 0:59 (still 59 whole minutes)
   assert(
-    renderStatusBar(59 * 60_000 + 59_000) === "[осталось: 0:59 м.]",
-    "renderStatusBar: 59min59s -> 0:59",
+    renderStatusBar(at(9, 7)) === "[обновится в 09:07]",
+    "renderStatusBar: both parts zero-padded",
+  );
+  // Seconds are dropped: a reset at 17:30:45 still renders 17:30.
+  assert(
+    renderStatusBar(new Date(2026, 9, 31, 17, 30, 45, 0).getTime()) ===
+      "[обновится в 17:30]",
+    "renderStatusBar: seconds dropped (17:30:45 -> 17:30)",
   );
 
   // 5. startStatusUpdater: stop function clears status (wormsoft provider)
@@ -1195,7 +1196,7 @@ async function main(): Promise<void> {
         (c) =>
           c.key === "billing-window" &&
           typeof c.text === "string" &&
-          c.text.startsWith("[осталось: "),
+          c.text.startsWith("[обновится в "),
       ),
       "ui: forceUpdate pushes the status line (wormsoft provider)",
     );

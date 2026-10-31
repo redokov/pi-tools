@@ -67,6 +67,10 @@ import {
   resetPaths as historyResetPaths,
 } from "../src/history.ts";
 import {
+  setWakePaths as wakeSetPaths,
+  resetPaths as wakeResetPaths,
+} from "../src/wakeups.ts";
+import {
   hasWatchdog,
   pendingFireAt,
   computeFireAt,
@@ -278,6 +282,9 @@ async function expireWindow(): Promise<void> {
       next: {
         ...cur,
         windowStartedAt: Date.now() - WINDOW_MS - 1000,
+        // 2026-10 drift fix: the boundary follows the lazy anchor
+        // (firstCallEmittedAt) -- drop it too, or the window stays alive.
+        firstCallEmittedAt: undefined,
       },
     };
   });
@@ -288,6 +295,9 @@ function applyPaths(tmp: string): void {
   armsSetPaths(join(tmp, "arms.json"), join(tmp, "arms.lock"));
   historySetPaths(join(tmp, "history.csv"), join(tmp, "history.lock"));
   setArmsLogPath(join(tmp, "armslog.log"));
+  // /settimer now rebuilds the wake table (2026-10 drift fix) -- redirect
+  // the wake paths too, or the test would mutate the LIVE wakeups.json.
+  wakeSetPaths(join(tmp, "wakeups.json"), join(tmp, "wakeups.lock"));
 }
 
 function cleanupPaths(tmp: string): void {
@@ -295,6 +305,7 @@ function cleanupPaths(tmp: string): void {
   stateResetPaths();
   armsResetPaths();
   historyResetPaths();
+  wakeResetPaths();
 }
 
 function handlerOf(
@@ -589,9 +600,17 @@ async function testOneShotConfirmClearsFlag(): Promise<void> {
       hasWatchdog(),
       "confirm: watchdog жив (ТЗ: всегда взведён при живом state)",
     );
+    // 2026-10 drift fix: the boundary follows the lazy anchor -- the
+    // confirm call itself anchored the fresh window (firstCallEmittedAt).
+    const expectedFireAt =
+      st === null
+        ? null
+        : Math.max(
+            st.windowStartedAt,
+            st.firstCallEmittedAt ?? st.windowStartedAt,
+          ) + st.windowMs;
     assert(
-      pendingFireAt() ===
-        (st === null ? null : st.windowStartedAt + st.windowMs),
+      pendingFireAt() === expectedFireAt,
       "confirm: watchdog смотрит на новую границу окна, не на reset+grace",
     );
 
@@ -651,7 +670,15 @@ async function testRepeatTwoRearmsWatchdog(): Promise<void> {
       "repeat: флаг перевзведён (repeat=1, phase=armed)",
     );
     const st = readStateSync();
-    const boundary = st === null ? null : st.windowStartedAt + st.windowMs;
+    // 2026-10 drift fix: the boundary follows the lazy anchor
+    // (firstCallEmittedAt) -- the confirm call anchored the fresh window.
+    const boundary =
+      st === null
+        ? null
+        : Math.max(
+            st.windowStartedAt,
+            st.firstCallEmittedAt ?? st.windowStartedAt,
+          ) + st.windowMs;
     assert(
       hasWatchdog() && pendingFireAt() === boundary,
       "repeat: watchdog смотрит на новую границу окна (≈ lastResetAt+2ч)",

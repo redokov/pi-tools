@@ -1,9 +1,13 @@
 /**
  * ui.ts -- status bar widget for billing window.
  *
- * Persistent widget in the TUI footer showing a live countdown of the
- * 2-hour billing window. Updates every intervalMs (default 30 s) via
- * ctx.ui.setStatus(key, text).
+ * Persistent widget in the TUI footer showing the ABSOLUTE TIME of the
+ * next billing-window reset, e.g. "[обновится в 17:30]". Pushed via
+ * ctx.ui.setStatus(key, text). Updated every intervalMs (default 30 s).
+ *
+ * The time is deterministic (windowStartedAt + windowMs) so the widget does
+ * NOT tick down: it shows the next reset moment in local time and is only
+ * refreshed periodically (and on every window_reset event).
  *
  * Module-level state (currentInterval, currentCtx, currentKey) is shared so
  * that stopStatusUpdater() can tear everything down from anywhere -- and so
@@ -24,36 +28,38 @@ let currentCtx: any = null;
 let currentKey: string | null = null;
 
 /**
- * Format remaining milliseconds into the status bar text.
+ * Format the next reset moment into the status bar text.
  *
- *   remainingMs <= 0  -> "[осталось: 0:00 м.]"
- *   otherwise         -> "[осталось: H:MM м.]"  (no leading zero on hours)
+ *   resetAt -> "[обновится в ЧЧ:ММ]"   (24h clock, zero-padded HH:MM)
  *
- * Hours are not capped: if the window is somehow > 24h, H reflects the
- * real count (e.g. "25:00"). Minutes are zero-padded to two digits.
- * Seconds are dropped (rounded down to whole minutes).
+ * E.g. "[обновится в 17:30]". Uses local wall-clock time of the reset
+ * boundary (windowStartedAt + windowMs).
  */
-export function renderStatusBar(remainingMs: number): string {
-  if (remainingMs <= 0) {
-    return "[осталось: 0:00 м.]";
-  }
-
-  const totalMinutes = Math.floor(remainingMs / 60_000);
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-
-  const mm = String(minutes).padStart(2, "0");
-
-  return `[осталось: ${hours}:${mm} м.]`;
+export function renderStatusBar(resetAt: number): string {
+  const d = new Date(resetAt);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `[обновится в ${hh}:${mm}]`;
 }
 
 /**
- * Compute remaining ms from the current state, or null if no state exists.
+ * Compute the reset boundary from the current state, or null if no state
+ * exists.
+ *
+ * Lazy provider anchor (2026-10 drift fix): the real window starts at the
+ * FIRST credit spend of the window (firstCallEmittedAt), not at the reset
+ * moment. The indicator shows max(windowStartedAt, firstCallEmittedAt) +
+ * windowMs -- the provider's real boundary, so "обновится в ЧЧ:ММ" matches
+ * the wormsoft dashboard instead of drifting a gap per cycle.
  */
-function computeRemainingMs(): number | null {
+function computeResetAt(): number | null {
   const state = readStateSync();
   if (state === null) return null;
-  return state.windowStartedAt + state.windowMs - Date.now();
+  const start = Math.max(
+    state.windowStartedAt,
+    state.firstCallEmittedAt ?? state.windowStartedAt,
+  );
+  return start + state.windowMs;
 }
 
 /**
@@ -78,13 +84,13 @@ function applyStatus(ctx: any, key: string, provider?: string): void {
     return;
   }
 
-  const remaining = computeRemainingMs();
-  if (remaining === null) {
+  const resetAt = computeResetAt();
+  if (resetAt === null) {
     ctx.ui.setStatus(key, undefined);
   } else {
     // If this conversation has an active cont-after-reset flag, surface it in
     // the timer widget so the user can see it is armed.
-    const base = renderStatusBar(remaining);
+    const base = renderStatusBar(resetAt);
     const text = isContAfterResetArmed() ? `${base} [cont-after-reset]` : base;
     ctx.ui.setStatus(key, text);
   }

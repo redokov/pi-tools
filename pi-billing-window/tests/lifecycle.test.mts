@@ -58,6 +58,10 @@ import {
   setPaths as historySetPaths,
   resetPaths as historyResetPaths,
 } from "../src/history.ts";
+import {
+  setWakePaths as wakeSetPaths,
+  resetPaths as wakeResetPaths,
+} from "../src/wakeups.ts";
 
 // --- tiny assert harness (same style as tests/test.mts) ----------------------
 
@@ -188,6 +192,11 @@ async function expireWindow(): Promise<void> {
       next: {
         ...cur,
         windowStartedAt: Date.now() - WINDOW_MS - 1000,
+        // 2026-10 drift fix: the boundary follows the lazy anchor
+        // (firstCallEmittedAt). Backdating only windowStartedAt is no
+        // longer enough to expire a window whose first call just
+        // happened -- drop the anchor too ("no call in this window yet").
+        firstCallEmittedAt: undefined,
       },
     };
   });
@@ -215,6 +224,9 @@ function applyPaths(tmp: string): void {
   armsSetPaths(join(tmp, "arms.json"), join(tmp, "arms.lock"));
   historySetPaths(join(tmp, "history.csv"), join(tmp, "history.lock"));
   setArmsLogPath(join(tmp, "armslog.log"));
+  // /settimer now rebuilds the wake table (2026-10 drift fix) -- redirect
+  // the wake paths too, or the test would mutate the LIVE wakeups.json.
+  wakeSetPaths(join(tmp, "wakeups.json"), join(tmp, "wakeups.lock"));
 }
 
 function cleanupPaths(tmp: string): void {
@@ -222,6 +234,7 @@ function cleanupPaths(tmp: string): void {
   stateResetPaths();
   armsResetPaths();
   historyResetPaths();
+  wakeResetPaths();
 }
 
 /** First registered handler for an event (factory registers each once). */

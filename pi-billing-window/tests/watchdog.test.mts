@@ -39,6 +39,19 @@ async function main(): Promise<void> {
     assert(fireAt === 3000, "computeFireAt adds windowStartedAt + windowMs");
   }
 
+  // ---- computeFireAt: lazy anchor wins (2026-10 drift fix) ----
+  {
+    const fireAt = computeFireAt({
+      windowStartedAt: 1000,
+      windowMs: 2000,
+      firstCallEmittedAt: 1500,
+    });
+    assert(
+      fireAt === 3500,
+      "computeFireAt: firstCallEmittedAt later than window start moves the boundary",
+    );
+  }
+
   // ---- armWatchdog: cb fires at scheduled moment ----
   {
     const fired = { v: false };

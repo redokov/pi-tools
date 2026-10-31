@@ -54,7 +54,10 @@ import {
   nextDuePoint,
   dropBurnedPoints,
   appendAnchorPoint,
+  computeTableFromAnchor,
   WAKE_BURNED_TTL_MS,
+  WAKE_MARGIN_MS,
+  WAKE_DEPTH,
   setWakePaths,
 } from "./wakeups.js";
 import {
@@ -159,7 +162,7 @@ const WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
  * трогает), показывается в /billing-status и в шапке утреннего отчёта --
  * защита от повторения deploy-разрыва 24.10 («ночь работала на коде N»).
  */
-export const VERSION = "017.2026-10-27";
+export const VERSION = "018.2026-10-31";
 
 /**
  * Build a fresh State for a brand-new window.
@@ -2177,6 +2180,8 @@ async function wakeSyncTick(): Promise<void> {
  * Listener for our own "billing:window_reset" channel. We push a friendly
  * notification in TUI mode; in other modes (rpc, print) we silently skip --
  * notify() would just clutter logs there.
+ * On reset we also force the status-bar widget to refresh so it shows the
+ * new absolute next-reset time immediately.
  */
 function handleWindowReset(_payload: unknown): void {
   // Spec 012 (T4): a reset just happened -- re-arm the scheduler from the
@@ -2194,6 +2199,8 @@ function handleWindowReset(_payload: unknown): void {
   } catch {
     // ignore -- ctx may be torn down
   }
+  // Refresh the timer widget with the new reset boundary (absolute time).
+  forceUpdateStatus(ctx);
 }
 
 /**
@@ -2540,8 +2547,9 @@ async function onSessionStart(
   // table (survives restarts; the watchdog stays session-scoped).
   ensureWakeTimer();
 
-  // Start the status-bar updater (live countdown) in TUI mode only.
-  // startStatusUpdater itself returns a no-op stopper outside of TUI.
+  // Start the status-bar updater (shows the absolute next-reset time) in
+  // TUI mode only. startStatusUpdater itself returns a no-op stopper outside
+  // of TUI.
   if (stopStatusFn) {
     try {
       stopStatusFn();
@@ -2567,8 +2575,8 @@ async function onSessionStart(
       // will pick up and turn into a notify().
       await checkAndReset(buildEmitFn(), historyMetaOf(ctx));
     }
-    // Refresh the status bar after a possible reset so the fresh countdown
-    // is visible right away.
+    // Refresh the status bar after a possible reset so the footer shows
+    // the new absolute next-reset time right away.
     forceUpdateStatus(ctx);
     // Trim history rows older than RETENTION_DAYS (cheap: file is tiny).
     void trimHistory();
@@ -2937,12 +2945,6 @@ function registerBillingStatus(pi: ExtensionAPI): void {
         );
         return;
       }
-      const remain = Math.max(0, s.windowMs - (Date.now() - s.windowStartedAt));
-      const mm = Math.ceil(remain / 60_000);
-      const hh = Math.floor(mm / 60);
-      const m = mm % 60;
-      const hhStr = String(hh).padStart(2, "0");
-      const mmStr = String(m).padStart(2, "0");
       // Spec 014 (FR-014-6): version stamp в /billing-status.
       // Spec 017 (FR-017-12): строка пинг-зонда в /billing-status.
       const p = s.ping ?? {};
@@ -2956,8 +2958,12 @@ function registerBillingStatus(pi: ExtensionAPI): void {
           pingInfo += ` (ещё не было, ${p.model ?? PING_MODEL})`;
         }
       }
+      const resetAt = s.windowStartedAt + s.windowMs;
+      const d = new Date(resetAt);
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
       ctx.ui.notify(
-        `${s.provider}: до reset ${hhStr}:${mmStr} ч:мин (calls=${s.callsInWindow}, resets=${s.resetCount}) ${pingInfo} v=${VERSION}`,
+        `${s.provider}: обновится в ${hh}:${mm} (calls=${s.callsInWindow}, resets=${s.resetCount}) ${pingInfo} v=${VERSION}`,
         "info",
       );
     },
@@ -3102,6 +3108,14 @@ function registerBillingReset(pi: ExtensionAPI): void {
       });
       ctx.ui.notify("Окно сброшено вручную", "info");
 
+      // Spec 012 (FR-012-5): a manual reset clears the wake grid -- the next
+      // wake point comes from the next firstCall anchor (or the boundary
+      // ping). Stale old-grid points must not fire later.
+      await mutateWakeTable(() => ({
+        next: { version: 1, points: [], updatedAt: Date.now(), source: "settimer" },
+      }));
+      ensureWakeTimer();
+
       // Refresh the status bar so the user sees the new countdown
       // immediately.
       if (ctx.mode === "tui") {
@@ -3232,11 +3246,25 @@ function registerSettimer(pi: ExtensionAPI): void {
           resetCount: fresh?.resetCount,
           note: "settimer 0",
         });
+        // Spec 012 (FR-012-5): a manual reset clears the wake grid -- the
+        // next wake point comes from the next firstCall anchor (or the
+        // boundary ping). Stale old-grid points must not fire later.
+        await mutateWakeTable(() => ({
+          next: { version: 1, points: [], updatedAt: Date.now(), source: "settimer" },
+        }));
       } else {
         // Sync the countdown to the given remaining time: pick a
         // windowStartedAt that leaves durationMs of life in the window.
         // We deliberately do NOT touch lastResetAt here, so a future
         // auto-reset is not suppressed by checkAndReset()'s dedup logic.
+        //
+        // 2026-10 drift fix: the user's sync is GROUND TRUTH for the provider
+        // boundary, so the lazy anchor (firstCallEmittedAt) is set to the
+        // same targetStartedAt. checkAndReset / watchdog / indicator all
+        // compute the boundary as max(windowStartedAt, firstCallEmittedAt) +
+        // windowMs -- without this, the next real call would re-anchor at
+        // its own timestamp and override the user's correction, and the
+        // plugin would keep resetting (2h - N) minutes early.
         const targetStartedAt = now - (windowMs - durationMs);
         await mutateState((cur) => {
           if (cur === null) {
@@ -3248,7 +3276,7 @@ function registerSettimer(pi: ExtensionAPI): void {
                 lastResetAt: 0,
                 resetCount: 1,
                 callsInWindow: 0,
-                firstCallEmittedAt: undefined,
+                firstCallEmittedAt: targetStartedAt,
               },
             };
           }
@@ -3258,7 +3286,7 @@ function registerSettimer(pi: ExtensionAPI): void {
               windowStartedAt: targetStartedAt,
               resetCount: cur.resetCount + 1,
               callsInWindow: 0,
-              firstCallEmittedAt: undefined,
+              firstCallEmittedAt: targetStartedAt,
             },
           };
         });
@@ -3273,10 +3301,26 @@ function registerSettimer(pi: ExtensionAPI): void {
           resetCount: fresh2?.resetCount,
           note: `sync ${formatDuration(durationMs)}`,
         });
+        // Spec 012 (FR-012-5, 2026-10 drift fix): rebuild the wake grid from
+        // the user-synced anchor -- first point = now + N + margin, tail =
+        // +windowMs steps (same full grid as an auto anchor, R2). Without
+        // the rebuild the wake points kept firing on the OLD grid, (2h - N)
+        // minutes away from the synced boundary.
+        await mutateWakeTable(() => ({
+          next: computeTableFromAnchor(
+            targetStartedAt,
+            windowMs,
+            WAKE_MARGIN_MS,
+            WAKE_DEPTH,
+            "settimer",
+          ),
+        }));
       }
 
       // The watchdog must track the (possibly moved) window boundary: resync
       // after the state mutation in BOTH branches (0 = reset, sync = shift).
+      // The wake scheduler is re-armed from the rebuilt/cleared table too.
+      ensureWakeTimer();
       syncWatchdog();
 
       ctx.ui.notify(
