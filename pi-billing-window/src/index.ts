@@ -65,7 +65,9 @@ import {
   startStatusUpdater,
   stopStatusUpdater,
   forceUpdate as forceUpdateStatus,
+  refreshStatusContext,
 } from "./ui.js";
+import { uidiag } from "./uidiag.js";
 import { parseDuration, formatDuration } from "./parser.js";
 import { sendNotify, type NotifyPayload } from "./notifier.js";
 import {
@@ -162,7 +164,7 @@ const WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
  * трогает), показывается в /billing-status и в шапке утреннего отчёта --
  * защита от повторения deploy-разрыва 24.10 («ночь работала на коде N»).
  */
-export const VERSION = "018.2026-10-31";
+export const VERSION = "018.2026-11-02";
 
 /**
  * Build a fresh State for a brand-new window.
@@ -977,16 +979,23 @@ function lastAssistantUsage(ctx: ExtensionContext | null): HistoryUsage | null {
 }
 
 /**
- * Safe `ctx.mode === "tui"` check: the `mode` getter throws on a stale
- * ctx (session replaced / reloaded while a timer was in flight), so the
- * plain comparison can kill the whole process via uncaughtException.
+ * Safe `ctx.mode === "tui"` check (spec 018, FR-018-5b/c, design §4.4):
+ * the `mode` getter throws on a stale ctx (session replaced / reloaded
+ * while a timer was in flight), so the plain comparison can kill the
+ * whole process via uncaughtException. A THROWING (stale) ctx is not
+ * swallowed silently here -- it leaves a uidiag trace so a post-mortem
+ * sees WHICH quiet path bailed on a dead ctx (incident 2026-11-02).
+ * Non-tui stays quiet (the norm for rpc/print processes, D-006).
+ *
+ * Note: the old silent ctxIsTui helper is gone -- its only two call sites
+ * (refreshMarker, handleWindowReset) are exactly the paths replaced here.
  */
-function ctxIsTui(ctx: ExtensionContext | null): boolean {
+function isTuiOrDiag(ctx: ExtensionContext | null, reason: string): boolean {
   if (!ctx) return false;
   try {
     return ctx.mode === "tui";
   } catch {
-    // Stale ctx after session replacement or reload -- treat as non-TUI.
+    uidiag(`${reason}:stale-ctx`);
     return false;
   }
 }
@@ -994,10 +1003,11 @@ function ctxIsTui(ctx: ExtensionContext | null): boolean {
 /** Force a footer refresh so the armed indicator appears/disappears promptly. */
 function refreshMarker(): void {
   const ctx = currentCtx;
-  if (!ctxIsTui(ctx)) return;
-  try {
-    forceUpdateStatus(ctx);
-  } catch {}
+  // Spec 018 (FR-018-5c): stale ctx leaves a `marker:stale-ctx` trace
+  // instead of a fully silent return; forceUpdateStatus is non-throwing
+  // now (ui.ts D-004), so the old dead try/catch is gone.
+  if (!isTuiOrDiag(ctx, "marker")) return;
+  forceUpdateStatus(ctx);
 }
 
 function stopRetryInterval(): void {
@@ -2190,7 +2200,9 @@ function handleWindowReset(_payload: unknown): void {
   ensureWakeTimer();
   const ctx = currentCtx;
   if (!ctx) return;
-  if (!ctxIsTui(ctx)) return;
+  // Spec 018 (FR-018-5b): a stale ctx (session replaced) used to vanish
+  // here silently -- now it leaves a `window-reset:stale-ctx` uidiag trace.
+  if (!isTuiOrDiag(ctx, "window-reset")) return;
   try {
     ctx.ui.notify(
       "wormsoft: 2-часовой лимит сброшен, свежий слот доступен",
@@ -2558,9 +2570,11 @@ async function onSessionStart(
   }
   stopStatusFn = startStatusUpdater(ctx);
 
-  // Push the current status immediately so the footer reflects the
-  // persisted window state right after startup.
-  forceUpdateStatus(ctx);
+  // Spec 018 (FR-018-4c): immediately (re-)bind the updater to this live
+  // ctx and apply the status. Replaces the bare forceUpdateStatus(ctx):
+  // after a session replacement the old updater may still hold the DEAD
+  // ctx -- refreshStatusContext swaps the binding, forceUpdate could not.
+  refreshStatusContext(ctx);
 
   // Initialize state / reset an expired window. Non-fatal: if this throws,
   // the timers above are already running, so the countdown and reset
@@ -2868,9 +2882,13 @@ async function onAfterProviderResponse(
   // Refresh the status bar so the callsInWindow counter and any freshly
   // started countdown reflect the new state without waiting for the
   // 30-second ui.ts interval.
-  if (ctx.mode === "tui") {
-    forceUpdateStatus(ctx);
-  }
+  // Spec 018 (FR-018-4a + FR-018-5d): replaces the unprotected
+  // `if (ctx.mode === "tui") forceUpdateStatus(ctx)` -- a stale ctx threw
+  // HERE and killed the handler before `await checkAndReset(...)` below:
+  // cosmetics broke the reset logic (incident 2026-11-02).
+  // refreshStatusContext never throws: live tui ctx -> same applyStatus,
+  // changed ctx -> re-bind (self-heal), stale/non-tui -> quiet.
+  refreshStatusContext(ctx);
 
   // A long-running call could have crossed the window boundary. checkAndReset
   // is idempotent and dedups via lastResetAt, so calling it here is safe and
@@ -2897,7 +2915,10 @@ function onModelSelect(
 ): void {
   // Keep the live ctx fresh so emit/notify find a valid bus context.
   currentCtx = ctx;
-  forceUpdateStatus(ctx, undefined, event?.model?.provider);
+  // Spec 018 (FR-018-4b): refreshStatusContext also re-binds the ui.ts
+  // updater if it still holds a dead ctx; provider passed explicitly
+  // (ctx.model may not be refreshed yet at handler time).
+  refreshStatusContext(ctx, event?.model?.provider);
 }
 
 /**

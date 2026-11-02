@@ -32,6 +32,7 @@ $files = @(
     "reset.ts",      # spec 012: переименован из ticker.ts
     "wakeups.ts",    # spec 012: абсолютные wake-точки
     "ui.ts",
+    "uidiag.ts",  # spec 018: JSON-lines диагностика отказов виджета
     "parser.ts",
     "notifier.ts",
     "history.ts",

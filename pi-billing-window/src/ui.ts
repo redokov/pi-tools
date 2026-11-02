@@ -17,15 +17,48 @@
 
 import { readStateSync } from "./state.js";
 import { isArmed as isContAfterResetArmed } from "./arms.js";
+import { uidiag } from "./uidiag.js";
 
 const DEFAULT_KEY = "billing-window";
 // 30 s: README/TZ promise a ~30 s refresh, and a 5-min cadence reads as a
 // "frozen" countdown to the user. Cheap enough (one tiny file read per tick).
 const DEFAULT_INTERVAL_MS = 30_000;
 
+/**
+ * Spec 018 (FR-018-1): machine-readable outcome of a status push. Every
+ * (previously silent) bail branch and any failure gets a code so callers
+ * (tests, the tick fail-streak FR-018-6, the refresh machinery FR-018-3)
+ * can react without guessing.
+ *
+ * - "ok"            -- status text set;
+ * - "cleared"       -- line removed via setStatus(key, undefined) because the
+ *                      provider is not wormsoft (the visibility rule applied
+ *                      successfully -- by design, NOT a failure, D-006);
+ * - "bail:no-ctx"   -- no ctx at all;
+ * - "bail:no-ui"    -- ctx present but ctx.ui/setStatus missing;
+ * - "bail:provider" -- reserved for the provider bail (currently folded into
+ *                      "cleared" -- kept in the union per FR-018-1);
+ * - "bail:no-state" -- no persisted window state yet (transient, no log);
+ * - "error"         -- touching ctx THREW (stale ctx) -- assigned by the
+ *                      applyStatusSafe wrapper, the single try/catch owner.
+ */
+export type StatusOutcome =
+  | "ok"
+  | "cleared"
+  | "bail:no-ctx"
+  | "bail:no-ui"
+  | "bail:provider"
+  | "bail:no-state"
+  | "error";
+
 let currentInterval: NodeJS.Timeout | null = null;
 let currentCtx: any = null;
 let currentKey: string | null = null;
+
+// Spec 018 (FR-018-6): consecutive failed ticks of the current updater
+// episode. First failure of an episode logs `tick:error` via uidiag; a
+// successful tick resets it. Reset on stop/start of the updater.
+let tickFailStreak = 0;
 
 /**
  * Format the next reset moment into the status bar text.
@@ -66,12 +99,21 @@ function computeResetAt(): number | null {
  * Push the current status (or clear it) to the given ctx.
  * Defensive: silently bails if ctx or ctx.ui is missing or invalid.
  *
+ * Spec 018 (FR-018-1): returns a StatusOutcome code instead of void. The
+ * branch logic/order is unchanged -- every branch just returns its code.
+ * IMPORTANT: an exception thrown while TOUCHING ctx (stale ctx after
+ * session replacement) PROPAGATES out of here; the single try/catch owner
+ * is applyStatusSafe (D-004 / design §3.2).
+ *
  * Visibility rule: the status line is only shown when the active model
  * belongs to the wormsoft provider. For any other provider (or when no
  * model is selected) the line is cleared via setStatus(key, undefined).
  */
-function applyStatus(ctx: any, key: string, provider?: string): void {
-  if (!ctx || !ctx.ui || typeof ctx.ui.setStatus !== "function") return;
+function applyStatus(ctx: any, key: string, provider?: string): StatusOutcome {
+  if (!ctx) return "bail:no-ctx";
+  if (!ctx.ui || typeof ctx.ui.setStatus !== "function") {
+    return "bail:no-ui";
+  }
 
   // Visibility rule: the status line is only shown when the active model
   // belongs to the wormsoft provider. `provider` may be passed explicitly
@@ -81,31 +123,90 @@ function applyStatus(ctx: any, key: string, provider?: string): void {
   const effectiveProvider = provider ?? ctx.model?.provider;
   if (effectiveProvider !== "wormsoft") {
     ctx.ui.setStatus(key, undefined);
-    return;
+    return "cleared";
   }
 
   const resetAt = computeResetAt();
   if (resetAt === null) {
     ctx.ui.setStatus(key, undefined);
-  } else {
-    // If this conversation has an active cont-after-reset flag, surface it in
-    // the timer widget so the user can see it is armed.
-    const base = renderStatusBar(resetAt);
-    const text = isContAfterResetArmed() ? `${base} [cont-after-reset]` : base;
-    ctx.ui.setStatus(key, text);
+    return "bail:no-state";
+  }
+  // If this conversation has an active cont-after-reset flag, surface it in
+  // the timer widget so the user can see it is armed.
+  const base = renderStatusBar(resetAt);
+  const text = isContAfterResetArmed() ? `${base} [cont-after-reset]` : base;
+  ctx.ui.setStatus(key, text);
+  return "ok";
+}
+
+/**
+ * Spec 018 (FR-018-5a, design §3.2): the SINGLE try/catch around applyStatus.
+ * `reason` encodes the calling PATH (tick / force / refresh) so the uidiag
+ * line says WHO failed. Never throws; returns "error" on a stale ctx.
+ */
+function applyStatusSafe(
+  ctx: any,
+  key: string,
+  reason: string,
+  provider?: string,
+): StatusOutcome {
+  try {
+    return applyStatus(ctx, key, provider);
+  } catch (err) {
+    uidiag(
+      `${reason}:error`,
+      err instanceof Error ? err.message : String(err),
+    );
+    return "error";
   }
 }
 
 /**
  * One-shot status push. Useful for commands like /billing-status that want
  * to refresh the footer immediately without waiting for the next tick.
+ *
+ * Spec 018 (D-004): NEVER THROWS anymore -- delegates to applyStatusSafe, so
+ * every one of the ~10 call sites in index.ts is protected by this single
+ * point. Positional signature (ctx, key?, provider?) is unchanged.
  */
 export function forceUpdate(
   ctx: any,
   key: string = DEFAULT_KEY,
   provider?: string,
-): void {
-  applyStatus(ctx, key, provider);
+): StatusOutcome {
+  return applyStatusSafe(ctx, key, "force", provider);
+}
+
+/**
+ * Spec 018 (FR-018-3, D-005): self-heal the updater's ctx binding.
+ *
+ * Called from event handlers in index.ts (after_provider_response,
+ * model_select, session_start) with the LIVE ctx of the current session:
+ *
+ * - ctx is a live tui ctx DIFFERENT from the updater's currentCtx ->
+ *   swap currentCtx (the interval keeps running; the next tick -- or the
+ *   immediate apply below -- revives the widget; no stop/start needed);
+ * - same ctx -> idempotent immediate apply;
+ * - ctx is dead (reading ctx.mode throws) -> uidiag("refresh:stale-ctx")
+ *   and a quiet return (nothing to heal; the next event brings a live ctx);
+ * - non-tui process -> quiet return (the norm, D-006).
+ */
+export function refreshStatusContext(ctx: any, provider?: string): void {
+  if (!ctx) return;
+  let isTui: boolean;
+  try {
+    isTui = ctx.mode === "tui";
+  } catch {
+    uidiag("refresh:stale-ctx");
+    return;
+  }
+  if (!isTui) return;
+  if (ctx !== currentCtx) {
+    // Swap the binding transparently: currentKey/currentInterval stay --
+    // the interval is alive and the nearest tick picks the new ctx up.
+    currentCtx = ctx;
+  }
+  applyStatusSafe(ctx, currentKey ?? DEFAULT_KEY, "refresh", provider);
 }
 
 /**
@@ -136,19 +237,26 @@ export function startStatusUpdater(
 
   currentCtx = ctx;
   currentKey = key;
+  // Fresh updater -> fresh failure episode (design §3.4).
+  tickFailStreak = 0;
 
   currentInterval = setInterval(() => {
-    if (currentCtx && currentKey) {
-      try {
-        applyStatus(currentCtx, currentKey);
-      } catch (err) {
-        // Spec 007 (live /reload crash): the session was replaced
-        // (ctx.reload / restart) and the captured ctx went stale -- reading
-        // ctx.ui throws via assertActive() and the uncaught exception KILLED
-        // pi. The status bar is cosmetic: skip the tick silently. The
-        // extension reload re-creates the updater for the new session.
-        return;
+    // Spec 018 (D-005): the tick NEVER re-binds ctx itself (it has no live
+    // ctx to bind -- refreshStatusContext from event handlers does that).
+    // It stays a cheap always-ticking probe: a stale ctx throws instantly,
+    // applyStatusSafe swallows it, and the first failure of an episode
+    // leaves a `tick:error` uidiag trace (FR-018-6) instead of the old
+    // forever-silent catch (spec 007's fix kept pi alive but hid the
+    // freeze -- spec 018 makes the failure visible and healable).
+    if (!currentCtx || !currentKey) return; // updater stopped
+    const outcome = applyStatusSafe(currentCtx, currentKey, "tick");
+    if (outcome === "error") {
+      tickFailStreak++;
+      if (tickFailStreak === 1) {
+        uidiag("tick:error", `streak start, key=${currentKey}`);
       }
+    } else {
+      tickFailStreak = 0;
     }
   }, intervalMs);
   currentInterval.unref();
@@ -170,6 +278,7 @@ export function startStatusUpdater(
     }
     if (currentCtx === capturedCtx) currentCtx = null;
     if (currentKey === capturedKey) currentKey = null;
+    tickFailStreak = 0; // spec 018 (FR-018-6): a stopped episode ends
   };
 }
 
@@ -191,6 +300,15 @@ export function stopStatusUpdater(): void {
   }
   currentCtx = null;
   currentKey = null;
+  tickFailStreak = 0; // spec 018 (FR-018-6): a stopped episode ends
+}
+
+/**
+ * Spec 018 (FR-018-6): test probe -- the current updater's consecutive
+ * failed-tick count. Never throws; reads module state only.
+ */
+export function getTickFailStreakForTests(): number {
+  return tickFailStreak;
 }
 
 /**

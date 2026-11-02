@@ -47,7 +47,15 @@ import {
   startStatusUpdater,
   stopStatusUpdater,
   forceUpdate,
+  refreshStatusContext,
+  hasRefForTests,
+  getTickFailStreakForTests,
 } from "../src/ui.ts";
+import {
+  uidiag,
+  setUidiagPathForTests,
+  resetUidiagPathForTests,
+} from "../src/uidiag.ts";
 import {
   parseDuration,
   formatDuration,
@@ -1804,6 +1812,326 @@ async function main(): Promise<void> {
     }
   }
 
+  // ---- Spec 018: ui resilience --------------------------------------------
+
+  console.log("\n=== Spec 018: ui resilience ===");
+
+  // All spec 018 tests redirect the uidiag log into the tmpdir (the
+  // state.ts setPaths pattern) so nothing ever touches the product file
+  // under ~/.pi/agent. setUidiagPathForTests also resets the episode
+  // rate-limit state -- every test starts a fresh episode on its own file.
+  const countLines = (p: string): number => {
+    try {
+      return fs
+        .readFileSync(p, "utf8")
+        .split("\n")
+        .filter((l) => l.length > 0).length;
+    } catch {
+      return 0;
+    }
+  };
+  const sleep = (ms: number): Promise<void> =>
+    new Promise<void>((r) => setTimeout(r, ms));
+
+  // 1. uidiag writes a JSON line with ts/pid/reason/detail
+  {
+    const f = join(tmpDir, "uidiag-1.log");
+    setUidiagPathForTests(f);
+    uidiag("test:reason", "some detail");
+    const rec = JSON.parse(fs.readFileSync(f, "utf8").trim());
+    assert(
+      typeof rec.ts === "string" && /^\d{4}-\d{2}-\d{2}T/.test(rec.ts),
+      "uidiag: line has ts (ISO8601)",
+    );
+    assert(rec.pid === process.pid, "uidiag: line has this process' pid");
+    assert(rec.reason === "test:reason", "uidiag: line has reason");
+    assert(rec.detail === "some detail", "uidiag: line has detail");
+  }
+
+  // 2. uidiag episode rate-limit: same reason twice -> one line; a new
+  //    reason starts a new episode; returning to the old reason logs again.
+  {
+    const f = join(tmpDir, "uidiag-2.log");
+    setUidiagPathForTests(f);
+    uidiag("tick:error", "first");
+    uidiag("tick:error", "suppressed repeat");
+    assert(countLines(f) === 1, "uidiag: consecutive same reason -> 1 line (rate-limit)");
+    uidiag("force:error", "new episode");
+    assert(countLines(f) === 2, "uidiag: different reason -> new episode line");
+    uidiag("tick:error", "reason returns");
+    assert(
+      countLines(f) === 3,
+      "uidiag: returning to a previous reason starts a new episode",
+    );
+  }
+
+  // 3. uidiag cap: seeding 401 lines + 1 write -> trimmed to the last 200
+  {
+    const f = join(tmpDir, "uidiag-3.log");
+    setUidiagPathForTests(f);
+    const seed = Array.from({ length: 401 }, (_, i) => `{"i":${i}}`);
+    fs.writeFileSync(f, seed.join("\n") + "\n", "utf8");
+    uidiag("cap:test");
+    assert(
+      countLines(f) === 200,
+      "uidiag: cap -- >400 lines trimmed to the last 200",
+    );
+    const last = fs.readFileSync(f, "utf8").trim().split("\n").pop();
+    assert(
+      last !== undefined && JSON.parse(last).reason === "cap:test",
+      "uidiag: cap keeps the newest (just-written) line",
+    );
+  }
+
+  // 4. uidiag fs failure is swallowed silently (never throws)
+  {
+    setUidiagPathForTests(join(tmpDir, "no-such-dir", "uidiag.log"));
+    let threw = false;
+    try {
+      uidiag("fs:fail", "x");
+    } catch {
+      threw = true;
+    }
+    assert(!threw, "uidiag: fs failure swallowed (never throws)");
+  }
+
+  // 5. applyStatus outcome codes. applyStatus is private -- forceUpdate
+  //    delegates to it through applyStatusSafe and returns the same
+  //    StatusOutcome codes (reason "force"). None of these paths throw,
+  //    so no uidiag noise is produced here.
+  {
+    const mkCtx = (opts: { provider?: string; noUi?: boolean }) => {
+      const calls: Array<{ key: string; text: string | undefined }> = [];
+      const ctx: any = {
+        mode: "tui",
+        model:
+          opts.provider === undefined ? undefined : { provider: opts.provider },
+        ui: opts.noUi
+          ? {}
+          : {
+              setStatus(key: string, text: string | undefined) {
+                calls.push({ key, text });
+              },
+            },
+      };
+      return { ctx, calls };
+    };
+
+    cleanState();
+    writeStateSync(makeState({ windowStartedAt: Date.now() - 60_000 }));
+
+    const a = mkCtx({ provider: "wormsoft" });
+    assert(
+      forceUpdate(a.ctx) === "ok",
+      "applyStatus: wormsoft + state -> 'ok'",
+    );
+    assert(
+      typeof a.calls[0]?.text === "string" &&
+        a.calls[0].text.startsWith("[обновится в "),
+      "applyStatus: 'ok' pushes the status text",
+    );
+
+    const b = mkCtx({ provider: "anthropic" });
+    assert(
+      forceUpdate(b.ctx) === "cleared",
+      "applyStatus: non-wormsoft provider -> 'cleared'",
+    );
+    assert(
+      b.calls[0]?.text === undefined,
+      "applyStatus: 'cleared' pushes setStatus(key, undefined)",
+    );
+
+    const c = mkCtx({ provider: "wormsoft", noUi: true });
+    assert(
+      forceUpdate(c.ctx) === "bail:no-ui",
+      "applyStatus: ctx without ui.setStatus -> 'bail:no-ui'",
+    );
+
+    cleanState();
+    const d = mkCtx({ provider: "wormsoft" });
+    assert(
+      forceUpdate(d.ctx) === "bail:no-state",
+      "applyStatus: no state file -> 'bail:no-state'",
+    );
+    assert(
+      d.calls[0]?.text === undefined,
+      "applyStatus: 'bail:no-state' clears the line (transient state)",
+    );
+
+    assert(
+      forceUpdate(null) === "bail:no-ctx",
+      "applyStatus: null ctx -> 'bail:no-ctx'",
+    );
+  }
+
+  // 6. forceUpdate never throws on a stale ctx and leaves a force:error trace
+  {
+    const f = join(tmpDir, "uidiag-6.log");
+    setUidiagPathForTests(f);
+    const staleCtx: any = {
+      mode: "tui",
+      get ui() {
+        throw new Error("stale ctx after session replacement");
+      },
+    };
+    let threw = false;
+    let outcome: unknown = "not-called";
+    try {
+      outcome = forceUpdate(staleCtx);
+    } catch {
+      threw = true;
+    }
+    assert(!threw, "forceUpdate: never throws on a stale ctx");
+    assert(outcome === "error", "forceUpdate: stale ctx -> 'error'");
+    assert(
+      fs.readFileSync(f, "utf8").includes("force:error"),
+      "forceUpdate: stale ctx leaves 'force:error' in uidiag",
+    );
+  }
+
+  // 7. Incident reproduction (2026-11-02): a live updater whose ctx goes
+  //    stale freezes forever; refreshStatusContext with a live ctx swaps
+  //    the binding and the very next tick revives the widget.
+  {
+    const f = join(tmpDir, "uidiag-7.log");
+    setUidiagPathForTests(f);
+    cleanState();
+    writeStateSync(makeState());
+
+    const calls1: Array<{ key: string; text: string | undefined }> = [];
+    const calls2: Array<{ key: string; text: string | undefined }> = [];
+    let dead = false;
+    const ctx1: any = {
+      mode: "tui",
+      model: { provider: "wormsoft" },
+      get ui() {
+        if (dead) throw new Error("stale ctx (simulated replacement)");
+        return {
+          setStatus(key: string, text: string | undefined) {
+            calls1.push({ key, text });
+          },
+        };
+      },
+    };
+    const ctx2: any = {
+      mode: "tui",
+      model: { provider: "wormsoft" },
+      ui: {
+        setStatus(key: string, text: string | undefined) {
+          calls2.push({ key, text });
+        },
+      },
+    };
+
+    const stop = startStatusUpdater(ctx1, { intervalMs: 10 });
+    await sleep(35); // live ticks on ctx1
+    dead = true; // "session replacement": ctx1 goes stale
+    await sleep(35); // failing ticks -> streak grows, one tick:error line
+    assert(
+      getTickFailStreakForTests() > 0,
+      "tick: stale ctx grows the fail streak (streak > 0)",
+    );
+    assert(
+      fs.readFileSync(f, "utf8").includes("tick:error"),
+      "tick: first failure of an episode leaves 'tick:error' in uidiag",
+    );
+
+    refreshStatusContext(ctx2); // self-heal: re-bind to the live ctx
+    assert(
+      calls2.some((c) => typeof c.text === "string"),
+      "refresh: swap applies the status to the new ctx immediately",
+    );
+    await sleep(35); // revived ticks now write to ctx2
+    assert(
+      getTickFailStreakForTests() === 0,
+      "refresh: successful tick resets the streak to 0",
+    );
+    const before2 = calls2.length;
+    await sleep(35);
+    assert(
+      calls2.length > before2,
+      "refresh: revived interval keeps ticking on the new ctx (incident reproduction)",
+    );
+    stop();
+  }
+
+  // 8. refreshStatusContext: stale ctx leaves a trace, non-tui stays quiet
+  {
+    const f = join(tmpDir, "uidiag-8.log");
+    setUidiagPathForTests(f);
+    const staleModeCtx: any = {
+      get mode() {
+        throw new Error("stale ctx");
+      },
+    };
+    let threw = false;
+    try {
+      refreshStatusContext(staleModeCtx);
+    } catch {
+      threw = true;
+    }
+    assert(!threw, "refresh: stale ctx (throwing mode) does not throw");
+    assert(
+      fs.readFileSync(f, "utf8").includes("refresh:stale-ctx"),
+      "refresh: stale ctx leaves 'refresh:stale-ctx' in uidiag",
+    );
+    const before = countLines(f);
+    refreshStatusContext({ mode: "rpc" });
+    assert(
+      countLines(f) === before,
+      "refresh: non-tui ctx is quiet (no uidiag line)",
+    );
+  }
+
+  // 9. refreshStatusContext is idempotent for the same ctx: every call just
+  //    applies the status; the interval binding is untouched.
+  {
+    cleanState();
+    writeStateSync(makeState());
+    const calls: Array<{ key: string; text: string | undefined }> = [];
+    const ctx: any = {
+      mode: "tui",
+      model: { provider: "wormsoft" },
+      ui: {
+        setStatus(key: string, text: string | undefined) {
+          calls.push({ key, text });
+        },
+      },
+    };
+    const stop = startStatusUpdater(ctx, { intervalMs: 15 });
+    const before = calls.length;
+    refreshStatusContext(ctx);
+    refreshStatusContext(ctx);
+    assert(
+      calls.length === before + 2,
+      "refresh: same ctx -> one apply per call (idempotent, no restart)",
+    );
+    await sleep(40);
+    assert(
+      calls.length > before + 2,
+      "refresh: same ctx -> interval keeps ticking on the same ctx (binding unchanged)",
+    );
+    stop();
+  }
+
+  // 10. spec 003 regression: the updater interval stays unref'd
+  {
+    const ctx: any = {
+      mode: "tui",
+      ui: { setStatus: () => {} },
+    };
+    const stop = startStatusUpdater(ctx, { intervalMs: 60_000 });
+    assert(
+      hasRefForTests() === false,
+      "spec 003 regression: updater interval stays unref'd (hasRef false)",
+    );
+    stop();
+    assert(
+      hasRefForTests() === null,
+      "spec 003 regression: hasRefForTests null after stop",
+    );
+  }
+
   // ---- Done ----
   cleanState();
   rmSync(tmpDir, { recursive: true, force: true });
@@ -1811,6 +2139,7 @@ async function main(): Promise<void> {
   historyResetPaths();
   armsResetPaths();
   wakeResetPaths();
+  resetUidiagPathForTests();
   restoreMock();
 
   console.log("\n========================================");

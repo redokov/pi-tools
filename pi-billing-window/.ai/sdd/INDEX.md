@@ -22,3 +22,4 @@
 | `015-night-backlog-runner` | implementation:done | requirements.md, design.md, tasks.md |
 | `016-night-plan-create` | implementation:done | design.md, requirements.md, tasks.md (+ reports/) |
 | `017-boundary-ping` | review:done | requirements.md, design.md, tasks.md, review.md |
+| `018-status-indicator-resilience` | review:done | requirements.md, design.md, tasks.md, review.md |
