@@ -23,4 +23,4 @@
 | `016-night-plan-create` | implementation:done | design.md, requirements.md, tasks.md (+ reports/) |
 | `017-boundary-ping` | review:done | requirements.md, design.md, tasks.md, review.md |
 | `018-status-indicator-resilience` | review:done | requirements.md, design.md, tasks.md, review.md |
-| `019-night-sentry-ping-heal` | implementation:done | requirements.md, design.md, tasks.md, report.md (инцидент 2026-11-10→11) |
+| `019-night-sentry-ping-heal` | review:done | requirements.md, design.md, tasks.md, report.md, review.md (инцидент 2026-11-10→11) |
