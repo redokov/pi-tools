@@ -14,6 +14,16 @@ import lockfile from "proper-lockfile";
 // Spec 017: type-only импорт (без runtime-цикла ping.ts <-> state.ts).
 import type { PingState } from "./ping.js";
 
+/** Spec 019 (ночной дозор): отметки времени дедупа оповещений (NFR-019-4). */
+export type SentryState = {
+  /** Последнее оповещение «ночь без страховки» (дедуп 1/ч, FR-019-1). */
+  lastNoArmNotifyAt?: number;
+  /** Последняя ночная добавка к arm-gone (дедуп на событие, FR-019-2). */
+  lastArmGoneNightNotifyAt?: number;
+  /** Последняя эскалация серии infra-отказов пинга (дедуп 6 ч, FR-019-4). */
+  lastInfraNotifyAt?: number;
+};
+
 export type State = {
   provider: string;
   windowStartedAt: number;
@@ -26,6 +36,8 @@ export type State = {
   last429At?: number;
   /** Spec 017 (boundary-ping): подсостояние пинг-зонда (tolerant, optional). */
   ping?: PingState;
+  /** Spec 019 (ночной дозор): отметки дедупа оповещений (tolerant, optional). */
+  sentry?: SentryState;
   /**
    * Spec 014 (FR-014-4): аккумулируемые токены ТЕКУЩЕГО окна (пишутся на
    * каждом after_provider_response, обнуляются на reset).

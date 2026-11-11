@@ -88,6 +88,20 @@ export type NotifyPayload = {
   title: string;
   body: string;
   timestamp: number;
+} | {
+  /** Spec 019 (FR-019-4): длинная серия infra-отказов пинга — эскалация. */
+  type: "billing:ping-infra-streak";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
+} | {
+  /** Spec 019 (FR-019-1): ночь работает без взвода и плана — дозор. */
+  type: "billing:night-no-arm";
+  provider: string;
+  title: string;
+  body: string;
+  timestamp: number;
 };
 
 export type NotifyOptions = {

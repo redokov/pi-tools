@@ -47,6 +47,7 @@ $files = @(
     "nightrun-log.ts",  # spec 015: transition log
     "nightrun.ts",  # spec 015: /night-run backlog runner
     "ping.ts",  # spec 017: boundary-ping (пинг-зонд границ окна)
+    "nightsentry.ts",  # spec 019: ночной дозор + сводка /night-check
     "package.json"
 )
 

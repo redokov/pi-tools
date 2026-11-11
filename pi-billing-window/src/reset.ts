@@ -79,6 +79,9 @@ export async function checkAndReset(
           // Spec 017: подсостояние пинга переживает reset (dedup-маркер
           // ping.lastBoundary и кэш mode/model не должны теряться).
           ping: state.ping,
+          // Spec 019: отметки дедупа ночного дозора переживают reset
+          // (sentry.lastInfraNotifyAt и др. не должны теряться).
+          sentry: state.sentry,
         };
 
         didReset = true;

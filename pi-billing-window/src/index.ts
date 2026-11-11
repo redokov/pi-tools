@@ -131,9 +131,18 @@ import {
   fallbackWindowsFromHistory,
   reportPathFor,
   getNightsDir,
+  readActivePlan,
   type NightPlan,
   type LedgerRow,
 } from "./nightplan.js";
+// Spec 019 (ночной дозор): предикаты дозора, дедуп и сводка предстарта ночи.
+import {
+  checkNoArmGap,
+  checkArmGoneNightGap,
+  dedupPassed,
+  buildNightCheckReport,
+  SENTRY_DEDUP_MS,
+} from "./nightsentry.js";
 import {
   initRunnerFromPlan,
   resumeRunner,
@@ -164,7 +173,7 @@ const WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
  * трогает), показывается в /billing-status и в шапке утреннего отчёта --
  * защита от повторения deploy-разрыва 24.10 («ночь работала на коде N»).
  */
-export const VERSION = "018.2026-11-02";
+export const VERSION = "019.2026-11-11";
 
 /**
  * Build a fresh State for a brand-new window.
@@ -1226,6 +1235,30 @@ function syncWatchdog(): void {
             `флаг исчез/истёк (sync-poller продолжает жить), kind=${selfArmGoneKind}`,
           ),
         );
+        // Spec 019 (FR-019-2): исчерпание взвода в зоне ночи (или за 2 ч до
+        // неё) — отдельное оповещение: эта ветка обычного notify не шлёт, а
+        // именно она была тихим разрывом инцидента 2026-11-10→11
+        // (confirmed-exhausted в 19:10, ночь стартовала в 22:34 без взвода).
+        if (
+          checkArmGoneNightGap({
+            nowMs: Date.now(),
+            reason: selfArmGoneKind,
+          }) !== null
+        ) {
+          armsLog(
+            "night-sentry",
+            withAttr(
+              `arm-gone kind=${selfArmGoneKind} в зоне ночи — оповещение (FR-019-2)`,
+            ),
+          );
+          void sendNotify({
+            type: "billing:night-no-arm",
+            provider: PROVIDER,
+            title: "страховка исчерпана — ночь без автопродолжения",
+            body: `Флаг cont-after-reset сгорел (${selfArmGoneKind}) в зоне ночи. Ночной прогон останется без автопродолжений: при 429 сессия до утра не возобновится. Перевзведи /cont-after-reset N или зарегистрируй /night-plan [HH:MM-HH:MM] repeat=N.`,
+            timestamp: Date.now(),
+          });
+        }
         selfArmGoneKind = null;
       } else {
         // Spec 011 (D1, FR-011-1): флаг сгорел без нашего участия —
@@ -1258,6 +1291,12 @@ function syncWatchdog(): void {
           reason = "external-removal";
           bodyText =
             "запись исчезла из arms.json (внешнее изменение). Для продолжения взведите снова: /cont-after-reset N";
+        }
+        // Spec 019 (FR-019-2): ночной контекст — дополнение к существующему
+        // arm-gone-notify (не глушим его, не дублируем вторым тостом).
+        if (checkArmGoneNightGap({ nowMs: Date.now(), reason }) !== null) {
+          bodyText +=
+            " ВНИМАНИЕ: это в зоне ночи — прогон останется без автопродолжения до перевзвода (/cont-after-reset N или /night-plan).";
         }
         armsLog(
           "arm-gone",
@@ -2727,6 +2766,9 @@ async function onAfterProviderResponse(
         withAttr(`задача ${nr429.currentTask} сохранена, runner в paused (429)`),
       );
     }
+    // Spec 019 (FR-019-1): 429 ночью — самый опасный момент дозора (именно
+    // здесь погибла ночь 2026-11-10→11); проверяем «ночь без страховки».
+    void nightSentryTick();
     return;
   }
 
@@ -2863,6 +2905,10 @@ async function onAfterProviderResponse(
       windowStartedAt: before?.windowStartedAt ?? timestamp,
     });
   }
+
+  // Spec 019 (FR-019-1): дозор — на каждом успешном ночном ответе тоже
+  // (429-ветка выше проверяет свой случай; дедуп общий в state.sentry).
+  void nightSentryTick();
 
   // History: one row per successful call with real token usage when the
   // provider reports it. Fire-and-forget; never throws.
@@ -3568,6 +3614,57 @@ function bumpNightStats(plan: NightPlan, kind: "rearm" | "uninsured"): void {
  * интервал идёт, key — это plan.key или carry-ключ (§8). null — нет/чужой.
  * O(1) файловое чтение; используется инвариантом и гашением arm-gone.
  */
+/**
+ * Spec 019 (FR-019-1): ночной дозор — на каждом ответе провайдера ночью
+ * (включая 429) проверить «ночь работает, а взвода нет и плана нет» и
+ * оповестить с дедупом 1/ч (state.sentry.lastNoArmNotifyAt). Passive
+ * observer: никогда не бросает. Инцидент 2026-11-10→11: сессия ночного
+ * прогона погибла от 429 в 22:38, взвода не было — молчание до утра.
+ */
+async function nightSentryTick(): Promise<void> {
+  try {
+    const st = readStateSync();
+    if (st === null) return;
+    const now = Date.now();
+    const key = armsGetKey();
+    const plan = activePlanForKey(key);
+    const gap = checkNoArmGap({
+      nowMs: now,
+      armed: armsIsArmed(now),
+      planActive: plan !== null,
+    });
+    if (gap === null) return;
+    if (!dedupPassed(st.sentry?.lastNoArmNotifyAt, now, SENTRY_DEDUP_MS)) {
+      return;
+    }
+    await mutateState((cur) =>
+      cur === null
+        ? { next: null }
+        : {
+            next: {
+              ...cur,
+              sentry: { ...cur.sentry, lastNoArmNotifyAt: now },
+            },
+          },
+    );
+    armsLog(
+      "night-sentry",
+      withAttr(
+        "ночь без страховки (нет взвода и плана) — оповещение (FR-019-1)",
+      ),
+    );
+    void sendNotify({
+      type: "billing:night-no-arm",
+      provider: PROVIDER,
+      title: "ночь работает без автопродолжения",
+      body: "Ночные вызовы модели идут, но флаг cont-after-reset не взведён и план ночи не зарегистрирован: при исчерпании лимита (429) сессия до утра не возобновится. Взведи /cont-after-reset N или зарегистрируй /night-plan [HH:MM-HH:MM] repeat=N.",
+      timestamp: now,
+    });
+  } catch {
+    // passive observer (NFR-019-1)
+  }
+}
+
 function activePlanForKey(key: string | null): NightPlan | null {
   if (key === null) return null;
   const plan = readPlan();
@@ -3588,10 +3685,10 @@ function activePlanForKey(key: string | null): NightPlan | null {
  */
 async function nightPlanTick(): Promise<void> {
   try {
-    const plan = readPlan();
+    // Spec 019 (FR-019-6): протухший файл плана убирается здесь же.
+    const plan = await readActivePlan();
     if (plan === null) return;
     const now = Date.now();
-    if (now > plan.expiresAt) return;
     if (!inInterval(now, plan.fromLocal, plan.toLocal)) return;
     const curKey = armsGetKey();
     if (curKey === null) return;
@@ -4332,6 +4429,61 @@ function nightRunRedriveOnReset(): void {
  *   /night-run stop     — user stop (сильнее auto-continuation, auto-rearm
  *                          плана его НЕ сбрасывает)
  */
+/**
+ * /night-check — предстарт ночи (spec 019, FR-019-5): сводка «можно ли
+ * запускать ночной прогон» — остаток окна, взвод автопродолжения, план
+ * ночи, здоровье проверочного запроса и вердикт со списком разрывов.
+ * Чистое чтение (state/arms/plan/ping), ничего не пишет.
+ */
+function registerNightCheck(pi: ExtensionAPI): void {
+  pi.registerCommand("night-check", {
+    description:
+      "Предстарт ночи: остаток окна, взвод автопродолжения, план ночи, здоровье пинга границ и вердикт (spec 019).",
+    handler: async (_args, ctx) => {
+      try {
+        const st = readStateSync();
+        const now = Date.now();
+        const key = armsGetKey();
+        const armRec = key === null ? null : armsGetArmForKey(key, now);
+        const plan = readPlan();
+        const planActive =
+          plan !== null &&
+          now <= plan.expiresAt &&
+          inInterval(now, plan.fromLocal, plan.toLocal) &&
+          (key === plan.key || key === nightPlanCarryKey);
+        const ping = readPingState();
+        const { text } = buildNightCheckReport({
+          nowMs: now,
+          windowStartedAt: st?.windowStartedAt ?? now,
+          windowMs: st?.windowMs ?? WINDOW_MS,
+          callsInWindow: st?.callsInWindow ?? 0,
+          windowInput: st?.windowInput,
+          windowOutput: st?.windowOutput,
+          windowCacheRead: st?.windowCacheRead,
+          armed: armRec !== null,
+          armRepeatLeft: armRec?.repeat,
+          armExpiresAt: armRec?.expiresAt,
+          planActive,
+          planFrom: plan?.fromLocal,
+          planTo: plan?.toLocal,
+          planRepeat: plan?.repeat,
+          planExpiredFile: plan !== null && now > plan.expiresAt,
+          pingModel: ping.model,
+          pingStatus: ping.lastStatus,
+          pingStreak: ping.infraStreak,
+          pingDetail: ping.lastDetail,
+        });
+        ctx.ui.notify(text, "info");
+      } catch (err) {
+        ctx.ui.notify(
+          `night-check failed: ${String((err as Error)?.message ?? err)}`,
+          "error",
+        );
+      }
+    },
+  });
+}
+
 function registerNightRun(pi: ExtensionAPI): void {
   pi.registerCommand("night-run", {
     description:
@@ -4487,6 +4639,8 @@ export default function (pi: ExtensionAPI): void {
   registerBillingPing(pi);
   // Spec 014: ночной план — новый контракт поверх cont-after-reset.
   registerNightPlan(pi);
+  // Spec 019: предстарт ночи — сводка перед запуском ночного прогона.
+  registerNightCheck(pi);
   // Spec 015: /night-run — backlog runner.
   registerNightRun(pi);
 

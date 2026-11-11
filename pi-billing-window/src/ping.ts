@@ -48,6 +48,11 @@ import {
 } from "./wakeups.js";
 import { armsLog } from "./armslog.js";
 import { sendNotify } from "./notifier.js";
+import {
+  PING_STREAK_THRESHOLD,
+  INFRA_ESCALATE_MS,
+  dedupPassed,
+} from "./nightsentry.js";
 
 // ---- Constants ----
 
@@ -58,6 +63,8 @@ const PING_PROVIDER = "wormsoft";
 export const PING_MODEL = "openai/gpt-oss:20b";
 /** Фолбэк-модель при модель-ошибке (400/404/422) на основную (D-002). */
 export const PING_FALLBACK_MODEL = "wormsoft/agent/low";
+/** Макс. живых моделей провайдера в цепочке фолбэков (spec 019 D-002). */
+export const PING_LIVE_FALLBACK_LIMIT = 3;
 /** Таймаут одного запроса (NFR-017-4). */
 export const PING_TIMEOUT_MS = 30_000;
 /** Кап выходных токенов: стоимость пинга и защита от reasoning-хвостов. */
@@ -181,6 +188,75 @@ export function loadPingConfig(): PingConfig | null {
   }
 }
 
+// ---- Live model fallback chain (spec 019, FR-019-3) ----
+
+/** Модель провайдера с ценой для выбора фолбэка (D-002). */
+export type ProviderModelCost = {
+  id: string;
+  inputCost?: number;
+  outputCost?: number;
+};
+
+/**
+ * Толерантное чтение списка моделей провайдера пинга из models.json
+ * (цены -- cost.input/cost.output, для сортировки «самых дешёвых»).
+ * Любая неудача -> [] (infra-путь), никогда не бросает.
+ */
+export function readProviderPingModels(): ProviderModelCost[] {
+  try {
+    const raw = fs.readFileSync(modelsJsonPath, "utf8");
+    const models = JSON.parse(raw) as {
+      providers?: Record<
+        string,
+        {
+          baseUrl?: unknown;
+          models?: {
+            id?: unknown;
+            cost?: { input?: unknown; output?: unknown };
+          }[];
+        }
+      >;
+    };
+    const list = models.providers?.[PING_PROVIDER]?.models;
+    if (!Array.isArray(list)) return [];
+    const out: ProviderModelCost[] = [];
+    for (const m of list) {
+      if (typeof m?.id !== "string" || m.id.length === 0) continue;
+      out.push({
+        id: m.id,
+        inputCost: typeof m.cost?.input === "number" ? m.cost.input : undefined,
+        outputCost:
+          typeof m.cost?.output === "number" ? m.cost.output : undefined,
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Чистый выбор живых фолбэк-моделей: исключить exclude, отсортировать по
+ * цене (input, при равенстве -- output), срез limit. Без цены -- в конец.
+ */
+export function pickFallbackModels(
+  list: ProviderModelCost[],
+  exclude: string[],
+  limit: number = PING_LIVE_FALLBACK_LIMIT,
+): string[] {
+  const bad = new Set(exclude);
+  const candidates = list.filter((m) => !bad.has(m.id));
+  candidates.sort((a, b) => {
+    const ai = a.inputCost ?? Number.POSITIVE_INFINITY;
+    const bi = b.inputCost ?? Number.POSITIVE_INFINITY;
+    if (ai !== bi) return ai - bi;
+    return (a.outputCost ?? Number.POSITIVE_INFINITY) - (
+      b.outputCost ?? Number.POSITIVE_INFINITY
+    );
+  });
+  return candidates.slice(0, limit).map((m) => m.id);
+}
+
 // ---- Transport (FR-017-2, FR-017-3, design §4) ----
 
 /** Injection seam for tests. */
@@ -297,7 +373,9 @@ function parseUsage(u: Record<string, unknown> | undefined): HistoryUsage | unde
 /**
  * Полный пинг с деревом попыток (design §4.3):
  *   1. json + resolvedModel (state.ping.model ?? PING_MODEL)
- *   2. при 400/404/422 на основную модель -- json + PING_FALLBACK_MODEL
+ *   2. при 400/404/422 (модель-ошибка) -- цепочка json-фолбэков:
+ *      PING_FALLBACK_MODEL -> самые дешёвые живые модели провайдера
+ *      из models.json (spec 019 D-002; не зависит от кэша mode/model)
  *   3. при протокольной ошибке (400/404/405/406/415/501) -- sse
  *   4. иначе (401/403/5xx/сеть/таймаут) -- infra
  * Рабочие mode/model кэшируются вызывающим кодом при исходе ok/limit.
@@ -336,14 +414,29 @@ export async function sendPing(
     return finish(a, useMode, primary);
   }
 
-  // 2. Модель-ошибка на основную модель -> фолбэк-модель (только в json-режиме).
+  // 2. Модель-ошибка (400/404/422) -> цепочка фолбэков (spec 019 D-002:
+  // больше НЕ зависит от кэшированных mode/model — инцидент 2026-11-10:
+  // закэшированная мёртвая модель openai/gpt-oss:20b блокировала фолбэк,
+  // 23 раза HTTP 404 за ночь, все сбросы слепые):
+  //     primary -> PING_FALLBACK_MODEL -> живые модели провайдера
+  //     (самые дешёвые из models.json, до PING_LIVE_FALLBACK_LIMIT штук).
+  // Успешный фолбэк закрепляется вызывающим кодом в state.ping.model
+  // (recordAutoResult пишет res.model) — самовосстановление без новых полей.
   const modelErr = a.kind === "status" && [400, 404, 422].includes(a.status);
-  if (modelErr && mode0 === undefined && primary === PING_MODEL) {
-    const a2 = await attempt(cfg, PING_FALLBACK_MODEL, "json", timeoutMs);
-    if (a2.kind === "ok" || a2.kind === "limit") {
-      return finish(a2, "json", PING_FALLBACK_MODEL);
+  if (modelErr) {
+    const exclude = [primary, PING_MODEL];
+    const chain = [PING_FALLBACK_MODEL]
+      .concat(pickFallbackModels(readProviderPingModels(), exclude))
+      .filter((m, i, arr) => !exclude.includes(m) && arr.indexOf(m) === i);
+    let last = a;
+    for (const m of chain) {
+      const aN = await attempt(cfg, m, "json", timeoutMs);
+      if (aN.kind === "ok" || aN.kind === "limit") {
+        return finish(aN, "json", m);
+      }
+      last = aN;
     }
-    a = a2;
+    a = last;
   }
 
   // 3. Протокольная ошибка -> sse-фолбэк (режим ещё не зафиксирован как sse).
@@ -384,7 +477,7 @@ async function recordAutoResult(
   firedPoint: number,
   res: PingResult,
 ): Promise<void> {
-  await mutatePing((ping) => {
+  await mutatePing((ping, state) => {
     const next: PingState = { ...ping, lastAt: Date.now(), lastBoundary: firedPoint };
     if (res.kind === "ok") {
       next.lastStatus = "ok";
@@ -394,6 +487,9 @@ async function recordAutoResult(
       next.infraStreak = 0;
       next.infraNotified = false;
       next.retryAttempt = 0;
+      // Spec 019: серия infra прервалась — эскалация следующей серии
+      // начинается заново с порога PING_STREAK_THRESHOLD.
+      state.sentry = { ...state.sentry, lastInfraNotifyAt: 0 };
     } else if (res.kind === "limit") {
       next.lastStatus = "429";
       next.lastDetail = `${res.latencyMs}ms`;
@@ -401,6 +497,7 @@ async function recordAutoResult(
       next.model = res.model;
       next.infraStreak = 0;
       next.infraNotified = false;
+      state.sentry = { ...state.sentry, lastInfraNotifyAt: 0 };
       // retryAttempt управляется в handlePingLimit (re-anchor сбрасывает).
     } else {
       next.lastStatus = "infra";
@@ -644,6 +741,46 @@ async function handlePingLimit(firedPoint: number): Promise<void> {
 
 // ---- handlePingInfra (FR-017-5, design §5.3) ----
 
+/**
+ * Spec 019 (FR-019-4): эскалация серии infra-отказов проверочного запроса.
+ * streak >= PING_STREAK_THRESHOLD и дедуп INFRA_ESCALATE_MS (6 ч) прошёл —
+ * оповещение + отметка state.sentry.lastInfraNotifyAt. Никогда не бросает.
+ */
+async function maybeEscalateInfraStreak(
+  streak: number,
+  reason: string,
+): Promise<void> {
+  try {
+    if (streak < PING_STREAK_THRESHOLD) return;
+    const st = readStateSync();
+    const last = st?.sentry?.lastInfraNotifyAt;
+    if (!dedupPassed(last, Date.now(), INFRA_ESCALATE_MS)) return;
+    await mutateState((cur) =>
+      cur === null
+        ? { next: null }
+        : {
+            next: {
+              ...cur,
+              sentry: { ...cur.sentry, lastInfraNotifyAt: Date.now() },
+            },
+          },
+    );
+    armsLog(
+      "ping:infra-escalate",
+      `${streak} подряд infra (${reason}) — эскалация: сбросы слепые (spec 019)`,
+    );
+    void pingNotifyImpl({
+      type: "billing:ping-infra-streak",
+      provider: PING_PROVIDER,
+      title: "проверочный запрос окна не работает",
+      body: `${streak} отказов подряд (${reason}). Сбросы окна идут вслепую, без верификации. Проверь модель пинга в state.ping и список моделей провайдера в models.json.`,
+      timestamp: Date.now(),
+    });
+  } catch {
+    // passive observer (NFR-019-1)
+  }
+}
+
 async function handlePingInfra(
   opts: PingFlowOptions,
   reason: string,
@@ -651,6 +788,11 @@ async function handlePingInfra(
   const st = readStateSync();
   const streak = (st?.ping?.infraStreak ?? 0) + 1;
   await mutatePing((ping) => ({ ...ping, infraStreak: streak }));
+
+  // Spec 019 (FR-019-4): эскалация длинной серии — не одна тихая пометка,
+  // а оповещение с периодом INFRA_ESCALATE_MS, пока серия не прервётся
+  // (инцидент 2026-11-10→11: 23 отказа HTTP 404 подряд за ночь, молчание).
+  await maybeEscalateInfraStreak(streak, reason);
 
   if (streak >= PING_INFRA_STREAK_MAX) {
     if (opts.blindOnInfra) {

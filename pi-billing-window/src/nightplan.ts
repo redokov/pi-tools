@@ -28,6 +28,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import lockfile from "proper-lockfile";
 import { getHistoryFile, isoLocal } from "./history.js";
+import { armsLog } from "./armslog.js";
 
 // ---- Types ----
 
@@ -397,6 +398,32 @@ export async function writePlan(plan: NightPlan): Promise<boolean> {
  * Снять план досрочно (/night-plan off). true -- файл был и удалён.
  * Никогда не бросает.
  */
+/**
+ * Spec 019 (FR-019-6): активный план с уборкой протухшего файла.
+ * Читает план; если expiresAt в прошлом — план «не активен», файл-мусор
+ * удаляется под лок (best-effort) с однократной пометкой в armslog.
+ * Инцидент 2026-11-10→11: nightplan.json протух с 31.10 (другой проект) и
+ * сбивал диагностику. Никогда не бросает.
+ */
+export async function readActivePlan(): Promise<NightPlan | null> {
+  const plan = readPlan();
+  if (plan === null) return null;
+  if (Date.now() <= plan.expiresAt) return plan;
+  let removed = false;
+  try {
+    removed = await clearPlan();
+  } catch {
+    // best-effort: не убрали — следующий тик попробует снова
+  }
+  armsLog(
+    "night-plan:expired-cleanup",
+    `план ночи ${plan.nightDate} истёк (${plan.fromLocal}-${plan.toLocal}) — файл ${
+      removed ? "удалён" : "не удалён (лок)"
+    } (spec 019)`,
+  );
+  return null;
+}
+
 export async function clearPlan(): Promise<boolean> {
   try {
     let removed = false;
